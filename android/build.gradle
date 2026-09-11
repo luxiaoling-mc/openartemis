@@ -1,0 +1,19 @@
+// openartemis Android build (top level).
+//
+// 构建目录统一收到仓库根的 build/ 下(Gradle 支持改 buildDirectory):
+//   build/android-gradle/app/outputs/apk/<variant>/openartemis_v<version>.apk
+// 与 CMake 的产物同处一棵 build/ 树(原生库在 build/android-arm64/jniLibs/,
+// 见 app/build.gradle 的 sourceSets),仓库里不再散落 android/**/build。
+plugins {
+    id 'com.android.application' version '8.7.3' apply false
+    id 'com.android.library' version '8.7.3' apply false
+}
+
+// ${rootDir} = <repo>/android  =>  <repo>/build/android-gradle/<module>
+subprojects {
+    layout.buildDirectory.set(file("${rootDir}/../build/android-gradle/${project.name}"))
+}
+
+tasks.register('clean', Delete) {
+    delete "${rootDir}/../build/android-gradle"
+}

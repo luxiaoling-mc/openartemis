@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- ====== 日间模式（浅色）配色 ====== -->
+    <color name="primary">#1565C0</color>
+    <color name="primary_dark">#0D47A1</color>
+    <color name="secondary">#42A5F5</color>
+    <color name="accent">#1E88E5</color>
+
+    <!-- 背景色 - 浅色 -->
+    <color name="bg_dark">#FFFFFF</color>
+    <color name="bg_medium">#F5F5F5</color>
+    <color name="bg_card">#EEEEEE</color>
+    <color name="bg_input">#E0E0E0</color>
+
+    <!-- 文字色 - 深色 -->
+    <color name="text_primary">#1a1a2e</color>
+    <color name="text_secondary">#555577</color>
+    <color name="text_muted">#9999AA</color>
+
+    <!-- 功能色 -->
+    <color name="success">#4CAF50</color>
+    <color name="warning">#FFC107</color>
+    <color name="error">#ff6b6b</color>
+
+    <!-- 路径类型色 -->
+    <color name="path_internal">#4CAF50</color>
+    <color name="path_external">#FF8F00</color>
+    <color name="path_saf">#00897B</color>
+    <color name="path_error">#FF0000</color>
+
+    <!-- 兼容旧引用 -->
+    <color name="black">#FF000000</color>
+    <color name="white">#FFFFFFFF</color>
+</resources>

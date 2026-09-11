@@ -1,0 +1,22 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- 日间主题（浅色模式） -->
+    <style name="Theme.OpenArtemis" parent="Theme.MaterialComponents.DayNight.DarkActionBar.Bridge">
+        <!-- Primary brand color - 蓝色调 -->
+        <item name="colorPrimary">#1565C0</item>
+        <item name="colorPrimaryVariant">#0D47A1</item>
+        <item name="colorOnPrimary">@color/white</item>
+        <!-- Secondary brand color -->
+        <item name="colorSecondary">#42A5F5</item>
+        <item name="colorSecondaryVariant">#1E88E5</item>
+        <item name="colorOnSecondary">@color/white</item>
+        <!-- Background -->
+        <item name="android:colorBackground">#F5F5F5</item>
+        <item name="android:windowBackground">#F5F5F5</item>
+        <!-- Status bar -->
+        <item name="android:statusBarColor">#1565C0</item>
+        <item name="android:navigationBarColor">#FFFFFF</item>
+        <!-- Text -->
+        <item name="android:textColorPrimary">#1a1a2e</item>
+        <item name="android:textColorSecondary">#555577</item>
+    </style>
+</resources>

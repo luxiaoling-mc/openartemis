@@ -1,0 +1,302 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    主启动器界面 - 完全重新设计
+    采用深色主题，底部导航切换 游戏库/历史/设置
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/bg_gradient"
+    android:orientation="vertical">
+
+    <!-- 顶部栏 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="56dp"
+        android:background="@color/bg_dark"
+        android:gravity="center_vertical"
+        android:paddingLeft="16dp"
+        android:paddingRight="16dp"
+        android:elevation="4dp">
+
+        <TextView
+            android:id="@+id/text_app_title"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="@string/app_name"
+            android:textColor="@color/primary"
+            android:textSize="20sp"
+            android:textStyle="bold" />
+
+        <TextView
+            android:id="@+id/text_app_version"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/app_version"
+            android:textColor="@color/text_secondary"
+            android:textSize="12sp" />
+    </LinearLayout>
+
+    <!-- 游戏目录输入栏 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="44dp"
+        android:background="@color/bg_input"
+        android:gravity="center_vertical"
+        android:paddingLeft="12dp"
+        android:paddingRight="12dp"
+        android:paddingTop="4dp"
+        android:paddingBottom="4dp">
+
+        <EditText
+            android:id="@+id/text_gamedir"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:background="@null"
+            android:hint="输入游戏目录路径"
+            android:inputType="text"
+            android:singleLine="true"
+            android:textColor="@color/text_primary"
+            android:textColorHint="@color/text_muted"
+            android:textSize="13sp" />
+
+        <ImageButton
+            android:id="@+id/button_explore"
+            android:layout_width="36dp"
+            android:layout_height="36dp"
+            android:layout_marginLeft="4dp"
+            android:background="@color/bg_card"
+            android:scaleType="center"
+            android:src="@android:drawable/ic_menu_search"
+            android:contentDescription="浏览目录" />
+
+    </LinearLayout>
+
+    <!-- 标签切换栏 -->
+    <LinearLayout
+        android:id="@+id/tab_bar"
+        android:layout_width="match_parent"
+        android:layout_height="42dp"
+        android:background="@color/bg_medium"
+        android:gravity="center"
+        android:padding="4dp">
+
+        <TextView
+            android:id="@+id/tab_recent"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:gravity="center"
+            android:text="最近游玩"
+            android:textColor="@color/text_primary"
+            android:textSize="14sp"
+            android:background="@drawable/btn_secondary"
+            android:padding="8dp" />
+
+        <TextView
+            android:id="@+id/tab_library"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:gravity="center"
+            android:text="游戏库"
+            android:textColor="@color/text_secondary"
+            android:textSize="14sp"
+            android:padding="8dp" />
+
+        <TextView
+            android:id="@+id/tab_settings"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:gravity="center"
+            android:text="设置"
+            android:textColor="@color/text_secondary"
+            android:textSize="14sp"
+            android:padding="8dp" />
+    </LinearLayout>
+
+    <!-- ========== 游戏库面板 ========== -->
+    <LinearLayout
+        android:id="@+id/panel_library"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:orientation="vertical"
+        android:visibility="visible">
+
+        <!-- 标签筛选栏 + 视图切换 -->
+        <LinearLayout
+            android:id="@+id/layout_tag_filter"
+            android:layout_width="match_parent"
+            android:layout_height="36dp"
+            android:background="@color/bg_input"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingLeft="8dp"
+            android:paddingRight="4dp">
+
+            <HorizontalScrollView
+                android:layout_width="0dp"
+                android:layout_height="match_parent"
+                android:layout_weight="1"
+                android:scrollbars="none">
+
+                <LinearLayout
+                    android:id="@+id/tag_filter_container"
+                    android:layout_width="wrap_content"
+                    android:layout_height="match_parent"
+                    android:gravity="center_vertical"
+                    android:orientation="horizontal" />
+            </HorizontalScrollView>
+
+            <ImageButton
+                android:id="@+id/button_view_toggle"
+                android:layout_width="32dp"
+                android:layout_height="32dp"
+                android:layout_marginLeft="4dp"
+                android:background="@color/bg_card"
+                android:scaleType="center"
+                android:src="@drawable/ic_grid"
+                android:contentDescription="切换视图" />
+        </LinearLayout>
+
+        <!-- 列表视图 -->
+        <ListView
+            android:id="@+id/list_game"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:clipToPadding="false"
+            android:divider="@null"
+            android:dividerHeight="0dp"
+            android:padding="6dp"
+            android:visibility="visible" />
+
+        <!-- 网格视图 -->
+        <GridView
+            android:id="@+id/grid_game"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:clipToPadding="false"
+            android:horizontalSpacing="4dp"
+            android:verticalSpacing="4dp"
+            android:numColumns="2"
+            android:padding="6dp"
+            android:stretchMode="columnWidth"
+            android:visibility="gone" />
+
+        <!-- 空状态提示 -->
+        <TextView
+            android:id="@+id/text_empty_library"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:layout_marginTop="40dp"
+            android:text="没有游戏\n在顶部输入游戏目录路径"
+            android:textAlignment="center"
+            android:textColor="@color/text_muted"
+            android:textSize="16sp"
+            android:visibility="gone" />
+    </LinearLayout>
+
+    <!-- ========== 最近游玩面板 ========== -->
+    <LinearLayout
+        android:id="@+id/panel_recent"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:orientation="vertical"
+        android:visibility="gone">
+
+        <!-- 标题栏 + 视图切换 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="36dp"
+            android:background="@color/bg_input"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingLeft="12dp"
+            android:paddingRight="4dp">
+
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="最近游玩"
+                android:textColor="@color/primary"
+                android:textSize="14sp"
+                android:textStyle="bold" />
+
+            <ImageButton
+                android:id="@+id/button_history_view_toggle"
+                android:layout_width="32dp"
+                android:layout_height="32dp"
+                android:background="@color/bg_card"
+                android:scaleType="center"
+                android:src="@drawable/ic_grid"
+                android:contentDescription="切换视图" />
+        </LinearLayout>
+
+        <!-- 列表视图 -->
+        <ListView
+            android:id="@+id/list_history"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:clipToPadding="false"
+            android:divider="@null"
+            android:dividerHeight="0dp"
+            android:padding="6dp"
+            android:visibility="visible" />
+
+        <!-- 网格视图 -->
+        <GridView
+            android:id="@+id/grid_history"
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1"
+            android:clipToPadding="false"
+            android:horizontalSpacing="4dp"
+            android:verticalSpacing="4dp"
+            android:numColumns="2"
+            android:padding="6dp"
+            android:stretchMode="columnWidth"
+            android:visibility="gone" />
+
+        <!-- 空状态提示 -->
+        <TextView
+            android:id="@+id/text_empty_history"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="center"
+            android:text="暂无游戏历史记录"
+            android:textAlignment="center"
+            android:textColor="@color/text_muted"
+            android:textSize="16sp"
+            android:visibility="gone" />
+    </LinearLayout>
+
+    <!-- ========== 设置面板 ========== -->
+    <FrameLayout
+        android:id="@+id/panel_settings"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:visibility="gone">
+
+        <ScrollView
+            android:layout_width="match_parent"
+            android:layout_height="match_parent">
+
+            <include
+                android:id="@+id/layout_gameconfig"
+                layout="@layout/layout_gameconfig" />
+        </ScrollView>
+    </FrameLayout>
+
+</LinearLayout>

@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    历史记录项 - 显示最近游戏
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:id="@+id/layout_history_item"
+    android:layout_width="match_parent"
+    android:layout_height="60dp"
+    android:layout_marginBottom="4dp"
+    android:background="@drawable/card_bg"
+    android:gravity="center_vertical"
+    android:orientation="horizontal"
+    android:padding="6dp">
+
+    <!-- 封面缩略图 -->
+    <FrameLayout
+        android:layout_width="48dp"
+        android:layout_height="48dp"
+        android:background="@drawable/cover_placeholder">
+
+        <ImageView
+            android:id="@+id/image_history_cover"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:scaleType="centerCrop"
+            android:visibility="gone"
+            tools:src="@mipmap/ic_launcher" />
+    </FrameLayout>
+
+    <!-- 信息 -->
+    <LinearLayout
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginLeft="10dp"
+        android:layout_weight="1"
+        android:orientation="vertical">
+
+        <TextView
+            android:id="@+id/text_history_title"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:ellipsize="end"
+            android:maxLines="1"
+            android:textColor="@color/text_primary"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            tools:text="Game Title" />
+
+        <TextView
+            android:id="@+id/text_history_time"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textColor="@color/text_muted"
+            android:textSize="11sp"
+            tools:text="最后游玩: 2024-01-01 12:00" />
+
+        <TextView
+            android:id="@+id/text_history_count"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:textColor="@color/primary"
+            android:textSize="11sp"
+            tools:text="游玩 3 次" />
+    </LinearLayout>
+
+    <!-- 操作按钮 - 水平放置 -->
+    <LinearLayout
+        android:layout_width="wrap_content"
+        android:layout_height="match_parent"
+        android:gravity="center"
+        android:orientation="horizontal"
+        android:padding="4dp">
+
+        <ImageButton
+            android:id="@+id/button_history_play"
+            android:layout_width="36dp"
+            android:layout_height="36dp"
+            android:background="@drawable/btn_primary"
+            android:scaleType="center"
+            android:src="@drawable/ic_play"
+            android:contentDescription="启动" />
+
+        <ImageButton
+            android:id="@+id/button_history_delete"
+            android:layout_width="28dp"
+            android:layout_height="28dp"
+            android:layout_marginLeft="4dp"
+            android:background="@null"
+            android:scaleType="center"
+            android:src="@drawable/ic_delete"
+            android:contentDescription="删除记录" />
+    </LinearLayout>
+
+</LinearLayout>

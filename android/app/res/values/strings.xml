@@ -1,0 +1,46 @@
+<resources>
+    <string name="app_name">openartemis</string>
+    <string name="app_version">v0.1.0</string>
+    <string name="app_about">
+        openartemis 游戏启动器 - 开源 Artemis 视觉小说引擎运行时 \n\n
+        使用说明：\n
+        1. 游戏管理 \n
+           点击游戏卡片查看详情\n
+           长按管理封面\n
+           每个游戏可单独配置参数\n\n
+        2. 数据源 \n
+           单个 root.pfs 包,或含 system.ini 的解包目录\n\n
+        3. 操作手势 \n
+           [单击] 鼠标左键\n
+           [双指] 鼠标右键\n
+           [三指] 呼出菜单\n\n
+        4. 历史记录 \n
+           自动记录最近游玩的游戏\n
+           可查看游玩次数和时间
+    </string>
+    <!-- 新增启动器相关字符串 -->
+    <string name="tab_library">游戏库</string>
+    <string name="tab_history">历史</string>
+    <string name="tab_settings">设置</string>
+    <string name="add_game">添加游戏</string>
+    <string name="empty_library">没有游戏\n点击右下角 + 添加游戏目录</string>
+    <string name="empty_history">暂无游戏历史记录</string>
+    <string name="launch_game">启动游戏</string>
+    <string name="global_settings">全局设置</string>
+    <string name="cover_select">选择封面</string>
+    <string name="cover_clear">清除封面</string>
+    <string name="cover_added">封面已添加</string>
+    <string name="cover_cleared">封面已清除</string>
+    <string name="record_deleted">已删除记录</string>
+    <string name="game_invalid">游戏目录不在当前列表中</string>
+    <string name="warning_invalid_title">警告：游戏目录不完整</string>
+    <string name="warning_read">目录不可读</string>
+    <string name="warning_write">目录不可写</string>
+    <string name="warning_no_data">未找到 root.pfs / system.ini</string>
+    <string name="dialog_confirm_launch">是否仍然启动？</string>
+    <string name="btn_launch">启动</string>
+    <string name="btn_cancel">取消</string>
+    <string name="btn_confirm">确定</string>
+    <string name="path_input_hint">输入游戏目录路径或点击右侧浏览</string>
+    <string name="allow_edit_args">允许编辑启动参数</string>
+</resources>

@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    历史记录网格项 - 用于最近游玩网格视图
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:background="@drawable/card_bg"
+    android:layout_margin="4dp"
+    android:padding="4dp">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical">
+
+        <!-- 封面图 -->
+        <FrameLayout
+            android:id="@+id/hgrid_cover_container"
+            android:layout_width="match_parent"
+            android:layout_height="120dp"
+            android:background="@drawable/cover_placeholder">
+
+            <ImageView
+                android:id="@+id/hgrid_image_cover"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:scaleType="centerCrop"
+                android:visibility="gone"
+                tools:src="@mipmap/ic_launcher" />
+
+            <ImageView
+                android:id="@+id/hgrid_cover_placeholder"
+                android:layout_width="32dp"
+                android:layout_height="32dp"
+                android:layout_gravity="center"
+                android:src="@drawable/ic_cover_add"
+                android:visibility="visible" />
+        </FrameLayout>
+
+        <!-- 游戏信息 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:padding="4dp">
+
+            <TextView
+                android:id="@+id/hgrid_game_title"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:ellipsize="end"
+                android:maxLines="1"
+                android:textColor="@color/text_primary"
+                android:textSize="12sp"
+                android:textStyle="bold"
+                tools:text="Game Title" />
+
+            <TextView
+                android:id="@+id/hgrid_game_time"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:ellipsize="end"
+                android:maxLines="1"
+                android:textColor="@color/text_muted"
+                android:textSize="9sp"
+                tools:text="最后游玩: 2024-01-01 12:00" />
+
+            <TextView
+                android:id="@+id/hgrid_game_count"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textColor="@color/primary"
+                android:textSize="9sp"
+                tools:text="游玩 3 次" />
+        </LinearLayout>
+    </LinearLayout>
+
+</FrameLayout>

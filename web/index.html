@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>openartemis — Artemis 引擎 (WebAssembly)</title>
+    <!--
+      openartemis web shell (research/74 §wasm; adapted from the krkrsdl3
+      emscripten shell: loading screen / log panel / error overlay / archive
+      picker). Linked by src/app/CMakeLists.txt via `--shell-file web/index.html`.
+
+      How it starts the engine: the Emscripten module is linked with
+      -sINVOKE_RUN=0, so main() does NOT run at page load. The page first puts
+      the game data into the virtual filesystem (MEMFS), then calls
+      Module.callMain([...]) once:
+
+        ?pfs=NAME      fetch NAME (relative URL) into /data/NAME, then boot it
+        ?preload=1     fetch filelist.json (["system.ini","system/first.iet",…]),
+                       download every entry under /data, boot /data as a folder
+                       project (same idea as krkrsdl3's wasm shell)
+        ?dir=/data/x   boot a directory already present in MEMFS (preloaded
+                       .data builds / picked folder)
+        ?args=a,b,c    pass raw argv (advanced)
+        (nothing)      show the picker: choose a .pfs file or a game folder
+
+      Saves go to /save (IDBFS -> IndexedDB, see src/app/platform/platform_wasm.cpp)
+      and can be exported/imported as a .zip from the log panel.
+    -->
+    <!-- 线程支持检查:本构建带 pthreads(解码/音频 worker 是真实线程),
+         需要 SharedArrayBuffer -> 页面必须带 COOP/COEP 响应头
+         (web/serve.py 已发)。缺了就直接给出可操作的提示。 -->
+    <script>
+        if (typeof SharedArrayBuffer === 'undefined') {
+            document.write('<div style="position:fixed;top:0;left:0;width:100%;height:100%;background:#0f0f1a;display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:9999;color:#e94560;font-family:sans-serif;padding:2em;text-align:center;">');
+            document.write('<h2 style="margin-bottom:1em;">⚠️ 浏览器未提供 SharedArrayBuffer</h2>');
+            document.write('<p style="color:#999;max-width:620px;line-height:1.7;">');
+            document.write('本构建是多线程 WebAssembly(解码/音频 worker)，需要 SharedArrayBuffer。<br><br>');
+            document.write('请用带 COOP/COEP 响应头的服务器打开本页：<br>');
+            document.write('<code style="display:block;background:#222;padding:8px;margin:8px 0;border-radius:4px;font-size:0.85em;">');
+            document.write('Cross-Origin-Opener-Policy: same-origin<br>');
+            document.write('Cross-Origin-Embedder-Policy: require-corp');
+            document.write('</code>');
+            document.write('仓库自带:<code>python web/serve.py &lt;目录&gt; 8080</code>');
+            document.write('</p></div>');
+        }
+    </script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #0f0f1a;
+            color: #ccc;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            overflow: hidden; height: 100vh; width: 100vw;
+        }
+        #loading {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+            background: linear-gradient(135deg, #0f0f1a 0%, #1a1a2e 50%, #16213e 100%);
+            z-index: 1000; transition: opacity 0.8s ease;
+        }
+        #loading.hidden { opacity: 0; pointer-events: none; }
+        #loading .logo {
+            font-size: 2.5em; font-weight: 800;
+            background: linear-gradient(90deg, #e94560, #ff6b6b);
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+            margin-bottom: 0.3em; letter-spacing: 2px;
+        }
+        #loading .subtitle { color: #666; margin-bottom: 2em; font-size: 0.9em; }
+        #progress-wrap { width: 320px; height: 4px; background: #222; border-radius: 2px; overflow: hidden; }
+        #progress-fill { width: 0%; height: 100%; background: linear-gradient(90deg, #e94560, #ff6b6b); transition: width 0.3s ease; }
+        #status-text { margin-top: 1.2em; font-size: 0.85em; color: #555; min-height: 1.2em; }
+        .spinner {
+            width: 24px; height: 24px; margin-top: 20px;
+            border: 3px solid #333; border-top-color: #e94560;
+            border-radius: 50%; animation: spin 0.8s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        canvas {
+            display: block;
+            position: fixed; top: 0; left: 0;
+            width: 100vw; height: 100vh;
+            object-fit: contain;
+            image-rendering: auto;
+            z-index: 100;
+            pointer-events: auto;
+        }
+        #error-overlay {
+            display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.85); z-index: 2000;
+            flex-direction: column; align-items: center; justify-content: center;
+        }
+        #error-overlay.show { display: flex; }
+        #error-overlay h2 { color: #e94560; margin-bottom: 0.5em; font-size: 1.5em; }
+        #error-overlay p { color: #999; max-width: 560px; text-align: center; line-height: 1.5; }
+        #error-overlay .btn {
+            margin-top: 2em; padding: 0.7em 2em; background: #e94560; color: #fff;
+            border: none; border-radius: 4px; cursor: pointer; font-size: 1em;
+        }
+        #error-overlay .btn:hover { background: #d63850; }
+        /* ---- game picker (shown when no ?pfs/?args is given) ---- */
+        #picker { display: none; flex-direction: column; align-items: center; gap: 14px; margin-top: 1.5em; }
+        #picker.show { display: flex; }
+        #picker .drop {
+            width: 420px; max-width: 86vw; padding: 22px; border: 2px dashed #333;
+            border-radius: 8px; text-align: center; color: #888; font-size: 0.9em; line-height: 1.7;
+        }
+        #picker .drop.hover { border-color: #e94560; color: #ccc; }
+        #picker .row { display: flex; gap: 10px; }
+        #picker button {
+            padding: 0.6em 1.4em; background: #1f1f33; color: #ddd; border: 1px solid #333;
+            border-radius: 4px; cursor: pointer; font-size: 0.9em;
+        }
+        #picker button:hover { background: #2a2a45; border-color: #e94560; }
+        #picker .hint { color: #555; font-size: 0.78em; line-height: 1.6; text-align: center; }
+        code { background: #1c1c2c; padding: 1px 5px; border-radius: 3px; font-size: 0.9em; color: #9ab; }
+    </style>
+</head>
+<body>
+    <div id="loading">
+        <div class="logo">openartemis</div>
+        <div class="subtitle">Artemis visual-novel engine · WebAssembly</div>
+        <div id="progress-wrap"><div id="progress-fill"></div></div>
+        <div id="status-text">Initializing…</div>
+        <div class="spinner" id="spinner"></div>
+        <div id="picker">
+            <div class="drop" id="drop">
+                把游戏数据拖进来<br>
+                <span style="font-size:0.85em">（<code>root.pfs</code> 单文件，或整个解包目录）</span>
+            </div>
+            <div class="row">
+                <button id="btn-file">选择 .pfs 文件</button>
+                <button id="btn-dir">选择游戏目录</button>
+            </div>
+            <div class="hint">
+                也可以直接用 URL 启动：<code>?pfs=root.pfs</code>（服务器同目录）、
+                <code>?preload=1</code>（配 <code>filelist.json</code> 的目录式项目）或
+                <code>?args=/data/root.pfs</code><br>
+                目录方式请选择包含 <code>system.ini</code> 的那一层。
+            </div>
+            <input id="file-input" type="file" accept=".pfs,.bin,.dat,application/octet-stream" style="display:none">
+            <input id="dir-input" type="file" webkitdirectory directory multiple style="display:none">
+        </div>
+    </div>
+    <div id="error-overlay">
+        <h2>启动失败</h2>
+        <p id="error-message">未知错误。请查看日志面板或浏览器控制台。</p>
+        <button class="btn" onclick="location.reload()">重新加载</button>
+    </div>
+    <canvas id="canvas" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas>
+
+    <script>
+        // ── 日志收集器（页面上可直接看引擎输出，快捷键 ` 切换）────────────
+        var logPanel = null, logToggle = null, logVisible = false;
+        function toggleLog(show) {
+            logVisible = show !== undefined ? show : !logVisible;
+            if (logPanel) logPanel.style.display = logVisible ? 'block' : 'none';
+            if (logToggle) logToggle.textContent = logVisible ? '▼ 日志' : '▲ 日志';
+        }
+        function appendLog(level, args) {
+            var text = Array.prototype.join.call(args, ' ');
+            console[level].apply(console, args);
+            if (!logPanel) {
+                logPanel = document.createElement('div');
+                logPanel.id = 'log-panel';
+                logPanel.style.cssText = 'position:fixed;bottom:36px;right:8px;width:520px;max-width:92vw;max-height:300px;overflow-y:auto;background:rgba(0,0,0,0.85);color:#0f0;font-family:monospace;font-size:11px;padding:6px;border-radius:4px;z-index:3000;display:none;';
+                document.body.appendChild(logPanel);
+                logToggle = document.createElement('div');
+                logToggle.id = 'log-toggle';
+                logToggle.style.cssText = 'position:fixed;bottom:8px;right:8px;padding:4px 10px;background:rgba(0,0,0,0.5);color:#666;font-family:monospace;font-size:11px;border-radius:4px;cursor:pointer;z-index:3001;user-select:none;';
+                logToggle.textContent = '📋 日志';
+                logToggle.onclick = function() { toggleLog(); };
+                document.body.appendChild(logToggle);
+            }
+            var entry = document.createElement('div');
+            entry.textContent = '[' + level + '] ' + text;
+            entry.style.color = level === 'error' ? '#e94560' : '#0f0';
+            logPanel.appendChild(entry);
+            logPanel.scrollTop = logPanel.scrollHeight;
+        }
+
+        var statusEl = document.getElementById('status-text');
+        var fillEl = document.getElementById('progress-fill');
+        var loadingEl = document.getElementById('loading');
+        var spinnerEl = document.getElementById('spinner');
+        var pickerEl = document.getElementById('picker');
+        var errorOverlay = document.getElementById('error-overlay');
+        var errorMsgEl = document.getElementById('error-message');
+        var canvasEl = document.getElementById('canvas');
+
+        function updateProgress(msg, pct) {
+            statusEl.textContent = msg || '';
+            if (fillEl && typeof pct === 'number') fillEl.style.width = Math.min(pct, 100) + '%';
+        }
+        function showError(msg) {
+            errorMsgEl.innerHTML = msg || 'Unknown error';
+            errorOverlay.classList.add('show');
+            loadingEl.classList.add('hidden');
+            appendLog('error', [msg]);
+        }
+
+        // ── 音频解锁：浏览器要求用户手势后才能出声（SDL3 内部建 AudioContext）──
+        var _audioContexts = [];
+        var _origAudioContext = (typeof AudioContext !== 'undefined') ? AudioContext : null;
+        function PatchedAudioContext() {
+            var ctx = new _origAudioContext(arguments[0]);
+            _audioContexts.push(ctx);
+            return ctx;
+        }
+        PatchedAudioContext.prototype = _origAudioContext ? _origAudioContext.prototype : {};
+        if (_origAudioContext) {
+            for (var k in _origAudioContext)
+                if (_origAudioContext.hasOwnProperty(k)) PatchedAudioContext[k] = _origAudioContext[k];
+            window.AudioContext = PatchedAudioContext;
+        }
+        function unlockAudio() {
+            for (var i = 0; i < _audioContexts.length; i++) {
+                var ctx = _audioContexts[i];
+                if (ctx && ctx.state === 'suspended' && ctx.resume) ctx.resume();
+            }
+        }
+        document.addEventListener('pointerdown', unlockAudio);
+        document.addEventListener('keydown', function(e) {
+            unlockAudio();
+            if (e.key === '`' || e.key === '~') { toggleLog(); e.preventDefault(); }
+        });
+
+        // ── 全局异常 ────────────────────────────────────────────────────
+        window.addEventListener('error', function(e) {
+            var detail = '';
+            if (e.error) { try { detail = e.error.toString() + (e.error.stack ? '\n' + e.error.stack : ''); } catch(_) {} }
+            if (!detail) detail = e.message || 'Unknown error';
+            appendLog('error', ['Global error:', detail]);
+            showError('未捕获错误: ' + detail.replace(/\n/g, '<br>'));
+        });
+        window.addEventListener('unhandledrejection', function(e) {
+            var detail = '';
+            try { detail = e.reason.toString() + (e.reason.stack ? '\n' + e.reason.stack : ''); } catch(_) {}
+            appendLog('error', ['Unhandled promise rejection:', detail]);
+        });
+
+        // ── 启动参数 ────────────────────────────────────────────────────
+        var urlParams = new URLSearchParams(window.location.search);
+        var pendingArgs = null;         // argv handed to Module.callMain
+        var engineStarted = false;
+
+        function targetPathFor(name) {
+            // Sanitize to a single MEMFS path segment under /data.
+            var base = String(name).replace(/\\/g, '/');
+            base = base.substring(base.lastIndexOf('/') + 1) || 'root.pfs';
+            return '/data/' + base;
+        }
+
+        function writeFileToMemfs(path, bytes) {
+            var parts = path.split('/');
+            parts.pop();
+            var dir = '';
+            for (var d = 0; d < parts.length; d++) {
+                dir += (d ? '/' : '') + parts[d];
+                try { Module.FS.mkdir(dir); } catch (e) {}
+            }
+            try { Module.FS.unlink(path); } catch (e) {}
+            Module.FS.writeFile(path, bytes);
+        }
+
+        async function fetchIntoMemfs(url, path) {
+            updateProgress('下载 ' + url + ' …', 10);
+            var resp = await fetch(url);
+            if (!resp.ok) throw new Error('HTTP ' + resp.status + ' — ' + url);
+            var buf = new Uint8Array(await resp.arrayBuffer());
+            writeFileToMemfs(path, buf);
+            appendLog('log', ['已写入 ' + path + ' (' + buf.length + ' bytes)']);
+        }
+
+        // ?pfs=NAME | ?dir=PATH | ?preload=filelist.json | ?args=…
+        // ?args= 是"追加参数"(如 --frames,120 / --platform,android);没有
+        // 数据源参数时它就是完整 argv。
+        async function prepareFromQuery() {
+            var argsStr = urlParams.get('args');
+            var extra = argsStr ? argsStr.split(',').map(decodeURIComponent) : [];
+            var preload = urlParams.get('preload');
+            if (preload) {
+                // 目录式项目:filelist.json 列出相对路径,逐个下载进 /data,
+                // 然后把 /data 当项目根启动(engine 侧 system.ini 在根上)。
+                var listUrl = (preload === '1' || preload === 'yes') ? 'filelist.json'
+                                                                     : decodeURIComponent(preload);
+                var resp = await fetch(listUrl);
+                if (!resp.ok) throw new Error('HTTP ' + resp.status + ' — ' + listUrl);
+                var list = await resp.json();
+                for (var i = 0; i < list.length; i++) {
+                    var rel = String(list[i]).replace(/\\/g, '/').replace(/^\/+/, '');
+                    updateProgress('下载 ' + rel + ' …', (i / list.length) * 60);
+                    await fetchIntoMemfs(rel, '/data/' + rel);
+                }
+                appendLog('log', ['预载完成：' + list.length + ' 个文件 -> /data']);
+                return ['/data'].concat(extra);
+            }
+            if (extra.length) return extra;
+            var pfs = urlParams.get('pfs');
+            if (pfs) {
+                var path = targetPathFor(decodeURIComponent(pfs));
+                await fetchIntoMemfs(decodeURIComponent(pfs), path);
+                return [path];
+            }
+            var dir = urlParams.get('dir');
+            if (dir) return [decodeURIComponent(dir)];
+            return null;
+        }
+
+        // ── 交互式选择（无 URL 参数时）─────────────────────────────────
+        function showPicker() {
+            spinnerEl.style.display = 'none';
+            pickerEl.classList.add('show');
+            updateProgress('选择游戏数据开始', 0);
+
+            var fileInput = document.getElementById('file-input');
+            var dirInput = document.getElementById('dir-input');
+            document.getElementById('btn-file').onclick = function() { fileInput.click(); };
+            document.getElementById('btn-dir').onclick = function() { dirInput.click(); };
+
+            fileInput.onchange = async function(e) {
+                var f = e.target.files[0];
+                if (!f) return;
+                try {
+                    updateProgress('读取 ' + f.name + ' …', 10);
+                    var path = targetPathFor(f.name);
+                    writeFileToMemfs(path, new Uint8Array(await f.arrayBuffer()));
+                    startEngine([path]);
+                } catch (err) { showError('读取失败: ' + err); }
+            };
+            dirInput.onchange = async function(e) {
+                var files = Array.from(e.target.files || []);
+                if (!files.length) return;
+                try {
+                    // webkitRelativePath = "<chosen dir>/<sub>/<file>"; drop the
+                    // first segment so the game root itself becomes /data.
+                    var root = files[0].webkitRelativePath.split('/')[0];
+                    for (var i = 0; i < files.length; i++) {
+                        var rel = files[i].webkitRelativePath.substring(root.length + 1);
+                        if (!rel) continue;
+                        updateProgress('写入 ' + rel + ' …', (i / files.length) * 60);
+                        writeFileToMemfs('/data/' + rel, new Uint8Array(await files[i].arrayBuffer()));
+                    }
+                    appendLog('log', ['目录写入完成：' + files.length + ' 个文件']);
+                    startEngine(['/data']);
+                } catch (err) { showError('读取目录失败: ' + err); }
+            };
+
+            var drop = document.getElementById('drop');
+            ['dragenter', 'dragover'].forEach(function(t) {
+                drop.addEventListener(t, function(e) { e.preventDefault(); drop.classList.add('hover'); });
+            });
+            ['dragleave', 'drop'].forEach(function(t) {
+                drop.addEventListener(t, function(e) { e.preventDefault(); drop.classList.remove('hover'); });
+            });
+            drop.addEventListener('drop', async function(e) {
+                try {
+                    var items = Array.from(e.dataTransfer.files || []);
+                    if (!items.length) return;
+                    if (items.length === 1) {
+                        var f = items[0];
+                        var path = targetPathFor(f.name);
+                        writeFileToMemfs(path, new Uint8Array(await f.arrayBuffer()));
+                        startEngine([path]);
+                        return;
+                    }
+                    for (var i = 0; i < items.length; i++) {
+                        var rel = items[i].webkitRelativePath || items[i].name;
+                        updateProgress('写入 ' + rel + ' …', (i / items.length) * 60);
+                        writeFileToMemfs('/data/' + rel, new Uint8Array(await items[i].arrayBuffer()));
+                    }
+                    startEngine(['/data']);
+                } catch (err) { showError('拖入失败: ' + err); }
+            });
+        }
+
+        // ── 引擎启动（module ready 之后才允许 callMain）─────────────────
+        var moduleReady = false, pendingStart = null;
+        function startEngine(argv) {
+            appendLog('log', ['启动参数:', JSON.stringify(argv)]);
+            if (!moduleReady) { pendingStart = argv; return; }
+            if (engineStarted) return;
+            engineStarted = true;
+            pickerEl.classList.remove('show');
+            spinnerEl.style.display = 'block';
+            updateProgress('启动引擎…', 90);
+            try {
+                Module.callMain(argv);
+            } catch (err) {
+                showError('引擎启动失败: ' + err);
+            }
+        }
+
+        // ── Emscripten 模块 ────────────────────────────────────────────
+        window.Module = {
+            canvas: canvasEl,
+            arguments: [],
+            print: function() { appendLog('log', arguments); },
+            printErr: function() { appendLog('log', arguments); },
+            setStatus: function(text) {
+                if (!text) { loadingEl.classList.add('hidden'); return; }
+                var m = text.match(/([^(]+)\((\d+(\.\d+)?)\/(\d+)\)/);
+                if (m) updateProgress(m[1].trim(), parseFloat(m[2]) / parseFloat(m[4]) * 100);
+                else updateProgress(text, 80);
+            },
+            onRuntimeInitialized: function() {
+                moduleReady = true;
+                // Boot a query-param start first, otherwise offer the picker.
+                (async function() {
+                    var args = null;
+                    try { args = await prepareFromQuery(); }
+                    catch (err) { showError('游戏数据准备失败: ' + err); return; }
+                    if (args && args.length) startEngine(args);
+                    else showPicker();
+                })();
+                // Periodic IDBFS flush so /save lands in IndexedDB (the engine
+                // also flushes on tab hide / page close, see platform_wasm.cpp).
+                setInterval(function() {
+                    try { if (Module.FS && Module.FS.syncfs) Module.FS.syncfs(false, function(){}); } catch (e) {}
+                }, 5000);
+            },
+            onAbort: function(text) { showError(text || '引擎异常终止。'); }
+        };
+
+        // ── 页面前释放 / 存档落盘 ──────────────────────────────────────
+        window.addEventListener('beforeunload', function() {
+            try { if (Module && Module.FS && Module.FS.syncfs) Module.FS.syncfs(false, function(){}); } catch (e) {}
+        });
+    </script>
+    {{{ SCRIPT }}}
+</body>
+</html>

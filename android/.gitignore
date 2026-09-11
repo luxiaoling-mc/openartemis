@@ -1,0 +1,8 @@
+﻿# Gradle / Android local state (never commit: machine-specific caches)
+.gradle/
+local.properties
+*.iml
+.idea/
+.cxx/
+captures/
+*.hprof

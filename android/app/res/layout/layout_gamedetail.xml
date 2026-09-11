@@ -1,0 +1,307 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    游戏详情对话框 - 完全重新设计
+    展示游戏详细信息、封面、配置参数和启动按钮
+-->
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:clipToPadding="false"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="@color/bg_medium"
+        android:orientation="vertical"
+        android:padding="16dp">
+
+    <!-- 顶部：封面 + 标题 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal">
+
+        <!-- 大封面 -->
+        <FrameLayout
+            android:id="@+id/frame_cover_detail"
+            android:layout_width="100dp"
+            android:layout_height="120dp"
+            android:background="@drawable/cover_placeholder">
+
+            <ImageView
+                android:id="@+id/image_detail_cover"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:scaleType="centerCrop"
+                android:visibility="gone"
+                tools:src="@mipmap/ic_launcher" />
+
+            <ImageButton
+                android:id="@+id/button_add_cover"
+                android:layout_width="40dp"
+                android:layout_height="40dp"
+                android:layout_gravity="center"
+                android:background="@null"
+                android:scaleType="center"
+                android:src="@drawable/ic_cover_add"
+                android:contentDescription="添加封面" />
+        </FrameLayout>
+
+        <!-- 标题和路径 -->
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginLeft="12dp"
+            android:layout_weight="1"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/text_detail_gamename"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:textColor="@color/text_primary"
+                android:textSize="18sp"
+                android:textStyle="bold"
+                tools:text="Game Title" />
+
+            <TextView
+                android:id="@+id/text_detail_gamepath"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:textColor="@color/text_muted"
+                android:textSize="11sp"
+                tools:text="/storage/emulated/0/games/example" />
+
+            <!-- 权限状态 -->
+            <LinearLayout
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:id="@+id/badge_read"
+                    android:layout_width="wrap_content"
+                    android:layout_height="18dp"
+                    android:background="@color/bg_card"
+                    android:gravity="center"
+                    android:paddingLeft="6dp"
+                    android:paddingRight="6dp"
+                    android:text="可读"
+                    android:textColor="@color/success"
+                    android:textSize="10sp" />
+
+                <TextView
+                    android:id="@+id/badge_write"
+                    android:layout_width="wrap_content"
+                    android:layout_height="18dp"
+                    android:layout_marginLeft="4dp"
+                    android:background="@color/bg_card"
+                    android:gravity="center"
+                    android:paddingLeft="6dp"
+                    android:paddingRight="6dp"
+                    android:text="可写"
+                    android:textColor="@color/success"
+                    android:textSize="10sp" />
+
+                <TextView
+                    android:id="@+id/badge_exec"
+                    android:layout_width="wrap_content"
+                    android:layout_height="18dp"
+                    android:layout_marginLeft="4dp"
+                    android:background="@color/bg_card"
+                    android:gravity="center"
+                    android:paddingLeft="6dp"
+                    android:paddingRight="6dp"
+                    android:text="可执行"
+                    android:textColor="@color/primary"
+                    android:textSize="10sp" />
+            </LinearLayout>
+        </LinearLayout>
+    </LinearLayout>
+
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:layout_marginTop="12dp"
+        android:layout_marginBottom="12dp"
+        android:background="@color/bg_card" />
+
+    <!-- 启动参数（放在上方） -->
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="启动参数"
+        android:textColor="@color/text_secondary"
+        android:textSize="12sp" />
+
+    <EditText
+        android:id="@+id/text_detail_gameargs"
+        android:layout_width="match_parent"
+        android:layout_height="44dp"
+        android:layout_marginTop="4dp"
+        android:background="@color/bg_input"
+        android:gravity="start|top"
+        android:inputType="textMultiLine"
+        android:padding="6dp"
+        android:textColor="@color/text_primary"
+        android:textSize="12sp"
+        tools:text="--args" />
+
+    <!-- 启动文件选择（放在下方） -->
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:text="启动文件"
+        android:textColor="@color/text_secondary"
+        android:textSize="12sp" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="36dp"
+        android:layout_marginTop="4dp"
+        android:orientation="horizontal">
+
+        <TextView
+            android:id="@+id/text_detail_startup"
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:background="@color/bg_input"
+            android:gravity="center_vertical"
+            android:paddingLeft="6dp"
+            android:paddingRight="6dp"
+            android:text="data.xp3"
+            android:textColor="@color/text_secondary"
+            android:textSize="11sp"
+            android:ellipsize="middle"
+            android:maxLines="1" />
+
+        <ImageButton
+            android:id="@+id/button_browse_startup"
+            android:layout_width="36dp"
+            android:layout_height="match_parent"
+            android:layout_marginLeft="4dp"
+            android:background="@color/bg_card"
+            android:scaleType="center"
+            android:src="@drawable/ic_folder"
+            android:contentDescription="浏览启动文件" />
+    </LinearLayout>
+
+    <!-- 单人渲染器选择 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="渲染器:"
+            android:textColor="@color/text_secondary"
+            android:textSize="12sp" />
+
+        <RadioGroup
+            android:id="@+id/detail_renderer_group"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginLeft="8dp"
+            android:orientation="horizontal">
+
+            <RadioButton
+                android:id="@+id/detail_render_software"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="software"
+                android:textColor="@color/text_secondary"
+                android:textSize="12sp" />
+
+            <RadioButton
+                android:id="@+id/detail_render_gl"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginLeft="12dp"
+                android:text="gl"
+                android:textColor="@color/text_secondary"
+                android:textSize="12sp" />
+        </RadioGroup>
+    </LinearLayout>
+
+    <!-- 标签 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="标签:"
+            android:textColor="@color/text_secondary"
+            android:textSize="12sp" />
+
+        <EditText
+            android:id="@+id/text_detail_tags"
+            android:layout_width="0dp"
+            android:layout_height="32dp"
+            android:layout_marginLeft="6dp"
+            android:layout_weight="1"
+            android:background="@color/bg_input"
+            android:gravity="center_vertical"
+            android:inputType="text"
+            android:paddingLeft="6dp"
+            android:paddingRight="6dp"
+            android:textColor="@color/text_primary"
+            android:textSize="12sp"
+            android:hint="逗号分隔多个标签"
+            android:textColorHint="@color/text_muted"
+            android:singleLine="true" />
+    </LinearLayout>
+
+    <View
+        android:layout_width="match_parent"
+        android:layout_height="1dp"
+        android:layout_marginTop="12dp"
+        android:layout_marginBottom="12dp"
+        android:background="@color/bg_card" />
+
+    <!-- 操作按钮 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal">
+
+        <Button
+            android:id="@+id/button_detail_run"
+            android:layout_width="0dp"
+            android:layout_height="42dp"
+            android:layout_weight="1"
+            android:background="@drawable/btn_primary"
+            android:text="启动游戏"
+            android:textColor="@color/white"
+            android:textSize="14sp"
+            android:textStyle="bold" />
+
+        <Button
+            android:id="@+id/button_detail_config"
+            android:layout_width="0dp"
+            android:layout_height="42dp"
+            android:layout_marginLeft="8dp"
+            android:layout_weight="1"
+            android:background="@drawable/btn_secondary"
+            android:text="全局设置"
+            android:textColor="@color/text_secondary"
+            android:textSize="14sp" />
+    </LinearLayout>
+
+</LinearLayout>
+</ScrollView>

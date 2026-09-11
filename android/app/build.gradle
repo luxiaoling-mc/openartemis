@@ -1,0 +1,96 @@
+// openartemis Android application module.
+//
+// 原生库由 Gradle 直接驱动 CMake 构建(externalNativeBuild.cmake):AGP 调用
+// NDK 工具链,自动把 libopenartemis.so 打进 APK,并生成
+// build/android-gradle/app/intermediates/cxx/... 下的原生符号表,使
+// Android Studio / lldb 可以附加调试(断点、单步、变量查看)。
+//
+//   cd android && gradlew.bat assembleDebug
+//
+// vcpkg 的 toolchain 通过 CMake 参数注入,再 chainload 到 NDK 的
+// android.toolchain.cmake,因此依赖解析仍走 vcpkg(preset 那套参数等价)。
+// 注意 ANDROID_PLATFORM 必须显式给出,理由见下面 defaultConfig 的注释。
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'org.openartemis'
+    compileSdk 35
+    buildToolsVersion '34.0.0'
+    // 与 CMake preset / ANDROID_NDK_HOME 同一套 NDK(AGP 用它做原生库
+    // strip 等打包期处理)。
+    ndkVersion '28.0.13004108'
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    defaultConfig {
+        applicationId "org.openartemis"
+        minSdk 21
+        targetSdkVersion 35
+        versionCode 1
+        versionName '0.1.0'
+        externalNativeBuild {
+            cmake {
+                // ANDROID_PLATFORM 必须与 vcpkg 的 arm64-android triplet 一致
+                // (该 triplet 里 VCPKG_CMAKE_SYSTEM_VERSION 28):AGP 默认用
+                // minSdk(21) 作为 ANDROID_PLATFORM,依赖按 28 编、App 按 21 链,
+                // 结果 libSDL3.a / libavformat.a 里的 iconv_*/glob/fseeko64
+                // 在 21 的 libc 里不存在 → 链接期 undefined symbol。
+                arguments "-DANDROID_PLATFORM=android-28",
+                        "-DCMAKE_TOOLCHAIN_FILE=${System.getenv('VCPKG_ROOT')}/scripts/buildsystems/vcpkg.cmake",
+                        "-DVCPKG_TARGET_TRIPLET=arm64-android",
+                        "-DVCPKG_CHAINLOAD_TOOLCHAIN_FILE=${System.getenv('ANDROID_NDK_HOME')}/build/cmake/android.toolchain.cmake"
+                abiFilters 'arm64-v8a'
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            debuggable false
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+        debug {
+            minifyEnabled false
+            debuggable true
+        }
+    }
+
+    sourceSets {
+        main {
+            manifest.srcFile 'AndroidManifest.xml'
+            // org.libsdl.app = SDL3 的 Java 胶水(包名必须保持, JNI 符号名是
+            // Java_org_libsdl_app_SDLActivity_*)+ org.openartemis = 本 App。
+            java.srcDirs = ['java']
+            res.srcDirs = ['res']
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            version '3.31.1'
+            buildStagingDirectory '../../build/android'
+            path '../../CMakeLists.txt'
+        }
+    }
+
+    applicationVariants.all { variant ->
+        variant.outputs.all {
+            outputFileName = "openartemis_v${defaultConfig.versionName}.apk"
+        }
+    }
+}
+
+dependencies {
+    implementation 'androidx.appcompat:appcompat:1.4.1'
+    implementation 'com.google.android.material:material:1.5.0'
+    implementation 'androidx.constraintlayout:constraintlayout:2.1.3'
+    testImplementation 'junit:junit:4.13.2'
+    androidTestImplementation 'androidx.test.ext:junit:1.1.3'
+    androidTestImplementation 'androidx.test.espresso:espresso-core:3.4.0'
+}

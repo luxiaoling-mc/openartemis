@@ -1,0 +1,33 @@
+{
+  "name": "openartemis",
+  "version-string": "0.1.0",
+  "description": "C++/SDL3 independent Artemis visual-novel engine runtime",
+  "builtin-baseline": "8e8dfb4ba483886936ded5ca201b500b8d8b0096",
+  "dependencies": [
+    "sdl3",
+    "freetype",
+    "libjpeg-turbo",
+    "libpng",
+    "libvorbis",
+    "libtheora",
+    {
+      "name": "ffmpeg",
+      "default-features": false,
+      "features": [ "avcodec", "avformat" ],
+      "platform": "!wasm32"
+    },
+    "physfs"
+  ],
+  "overrides": [
+    {
+      "name": "ffmpeg",
+      "version": "6.1.1",
+      "port-version": 11
+    },
+    {
+      "name": "physfs",
+      "version": "3.2.0",
+      "port-version": 1
+    }
+  ]
+}

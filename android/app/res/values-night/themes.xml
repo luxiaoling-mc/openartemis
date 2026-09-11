@@ -1,0 +1,22 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- 夜间主题（深色模式 - 黑蓝配色） -->
+    <style name="Theme.OpenArtemis" parent="Theme.MaterialComponents.DayNight.DarkActionBar">
+        <!-- Primary brand color - 深蓝 -->
+        <item name="colorPrimary">#1A237E</item>
+        <item name="colorPrimaryVariant">#0D1B5E</item>
+        <item name="colorOnPrimary">@color/white</item>
+        <!-- Secondary brand color - 亮蓝 -->
+        <item name="colorSecondary">#42A5F5</item>
+        <item name="colorSecondaryVariant">#1E88E5</item>
+        <item name="colorOnSecondary">@color/black</item>
+        <!-- Background - 纯黑 -->
+        <item name="android:colorBackground">#0A0A0A</item>
+        <item name="android:windowBackground">#0A0A0A</item>
+        <!-- Status bar - 深黑 -->
+        <item name="android:statusBarColor">#000000</item>
+        <item name="android:navigationBarColor">#000000</item>
+        <!-- Text - 浅蓝白 -->
+        <item name="android:textColorPrimary">#E3F2FD</item>
+        <item name="android:textColorSecondary">#90CAF9</item>
+    </style>
+</resources>
