@@ -48,7 +48,9 @@ namespace oa::media {
 // out-of-line DecodeState special members) so the destructor sees the full
 // type; VideoSource is complete through media_internal.h above.
 struct VideoEngine::DecodeState::MaskPartner {
-    std::unique_ptr<VideoSource> src; // decoder over the `_m` asset
+    // shared_ptr: the pipe worker holds the same decoder (shared keepalive)
+    // so a DecodeState teardown racing a worker's last mask step stays safe.
+    std::shared_ptr<VideoSource> src; // decoder over the `_m` asset
     int w = 0;                        // current mask frame dimensions
     int h = 0;
     bool frozen = false; // stream ended: hold the last frame, never advance
@@ -108,8 +110,14 @@ std::unique_ptr<VideoSource> open_any_source(const std::vector<uint8_t>& bytes);
 void VideoEngine::cancel_pipe(DecodeState& ds) {
     if (!ds.pipe) return;
     {
-        std::lock_guard<std::mutex> lk(ds.pipe->mu);
+        std::unique_lock<std::mutex> lk(ds.pipe->mu);
         ds.pipe->cancel = true;
+        // The stop paths may destroy DecodeState (and the mask partner the
+        // worker reads) right after this returns — wait a bounded span for
+        // the worker to actually exit so its decoders are idle. One decode
+        // step is ~6-16 ms; the wait never blocks a play path.
+        ds.pipe->cv.wait_for(lk, std::chrono::milliseconds(100),
+                             [&] { return ds.pipe->exited; });
     }
     ds.pipe->cv.notify_all();
     ds.pipe.reset();
@@ -120,31 +128,55 @@ void VideoEngine::cancel_pipe(DecodeState& ds) {
 /// The worker restarts loops exactly like the synchronous pump does, so the
 /// delivered frame sequence is deterministic and identical to decoding on
 /// the caller's thread.
-void VideoEngine::start_pipe(DecodeState& ds, const std::string& file, bool loop_play) {
+/// `mask` (may be null) is the channel's `_m` mask partner decoder — its
+/// frame-0 read already happened on the attaching thread. The worker steps
+/// it in lockstep with the main stream (one mask frame per produced main
+/// frame, the same rule step_mask applies on the caller side) and bakes the
+/// composite into the delivered slots, so the driver thread never pays the
+/// mask decode + full-frame alpha bake per frame. On exit it hands the main
+/// and mask decoders back through the pipe; the retirement path adopts them
+/// at their exact stream positions, keeping the sync fallback phase-locked
+/// with zero discard.
+void VideoEngine::start_pipe(DecodeState& ds, const std::string& file, bool loop_play,
+                             const std::shared_ptr<VideoSource>& mask) {
     if (!pool_ || pool_->threads() <= 0 || !loader_) return;
     auto pf = std::make_shared<DecodeState::Pipe>();
     pf->consumed = 1; // frame 0 already delivered by start_decode
     const auto loader_copy = loader_;
-    const bool ok = pool_->submit_long([pf, loader_copy, file, loop_play] {
+    const bool ok = pool_->submit_long([pf, loader_copy, file, loop_play, mask]() mutable {
+        // worker-local handle (mutable copy: the loop drops it on a mask
+        // dims mismatch without touching the caller's shared state)
+        std::shared_ptr<VideoSource> mask_local = mask;
         auto bytes = loader_copy(file);
         std::unique_ptr<VideoSource> src =
             bytes ? open_any_source(*bytes) : nullptr;
         auto give_up = [&] {
             std::lock_guard<std::mutex> lk(pf->mu);
             pf->eof = true;
+            pf->returned_main = std::move(src);
+            pf->returned_mask = mask;
+            pf->exited = true;
             pf->cv.notify_all();
         };
         if (!src) {
             give_up();
             return;
         }
+        bool mask_frozen = false;
         for (uint64_t seq = 1;; ++seq) {
             // One-frame lookahead: only write slot seq%2 once frame seq-2
             // has been delivered.
             {
                 std::unique_lock<std::mutex> lk(pf->mu);
                 pf->cv.wait(lk, [&] { return pf->cancel || pf->consumed + 1 >= seq; });
-                if (pf->cancel) return;
+                if (pf->cancel) {
+                    pf->returned_main = std::move(src);
+                    pf->returned_mask = mask;
+                    pf->returned_mask_frozen = mask_frozen;
+                    pf->exited = true;
+                    pf->cv.notify_all();
+                    return;
+                }
             }
             if (!src->read_frame()) {
                 // EOF: mirror the sync pump's restart rule.
@@ -162,6 +194,33 @@ void VideoEngine::start_pipe(DecodeState& ds, const std::string& file, bool loop
             std::memcpy(pf->buf[slot].data(), src->rgba().data(), px);
             pf->w = src->width();
             pf->h = src->height();
+            // Mask step + composite bake, the worker-side twin of
+            // step_mask: one mask frame per delivered main frame, freezing
+            // at the mask's own EOF, dropping on a dims mismatch. The mask
+            // decoder is shared with the attaching thread's MaskPartner,
+            // which consumed mask frame 0 for the attach composite — so
+            // seq 1 (main stream frame 0) bakes with the CURRENT mask
+            // frame, and every seq >= 2 steps the mask first, exactly the
+            // pairing the caller-side step_mask produced. A later sync
+            // fallback resumes at the exact next frame.
+            if (mask_local && !mask_frozen) {
+                if (seq > 1) {
+                    bool ok2 = mask_local->read_frame();
+                    if (!ok2 && loop_play && mask_local->seek_zero())
+                        ok2 = mask_local->read_frame();
+                    if (!ok2) {
+                        mask_frozen = true;
+                    } else if (mask_local->width() != pf->w ||
+                               mask_local->height() != pf->h) {
+                        mask_frozen = true; // dims mismatch: drop (never baked again)
+                        mask_local.reset();
+                    }
+                }
+            }
+            if (mask_local) {
+                bake_video_mask_alpha(pf->buf[slot].data(), pf->w, pf->h,
+                                      mask_local->rgba().data());
+            }
             pf->produced = seq;
             pf->cv.notify_all();
         }
@@ -363,11 +422,15 @@ bool VideoEngine::start_decode(VideoChannel& channel, DecodeState& ds) {
     // to the unmasked pipeline.
     attach_mask(channel, ds);
     // Optional decode-pool worker: decodes frame 1+ ahead (frame 0 is
-    // current). Falls back to the sync decoder on lag/cancel. The worker
-    // only ever decodes the MAIN stream; the mask partner is stepped by the
-    // caller (step_mask) one frame per delivered main frame, so both
-    // delivery paths stay phase-locked without touching the worker.
-    start_pipe(ds, channel.file, channel.loop_play);
+    // current) and, for a masked channel, steps the mask partner in
+    // lockstep and bakes the composite (the mask decode + full-frame bake
+    // never run on the driver thread). Falls back to the sync decoder on
+    // lag/cancel; the sync path keeps stepping the mask itself, and the
+    // worker hands its decoder positions back on exit so the fallback
+    // resumes phase-locked. The worker only ever decodes the MAIN stream
+    // picture into the pipe slots.
+    start_pipe(ds, channel.file, channel.loop_play,
+               ds.mask ? ds.mask->src : nullptr);
     if (std::getenv("OA_VIDEO_DEBUG")) {
         std::fprintf(stderr, "[video] source attached '%s' %dx%d @%.2ffps\n",
                      channel.file.c_str(), ds.width, ds.height,
@@ -796,8 +859,9 @@ void VideoEngine::pump_channel(VideoChannel& channel, DecodeState& ds) {
                     ++ds.revision;
                     pf->consumed = want;
                     pf->cv.notify_all();
-                    lk.unlock(); // mask step decodes; never under the pipe lock
-                    step_mask(channel, ds); // mask partner: one frame per delivered frame
+                    // The worker already stepped the mask partner and baked
+                    // the composite into the slot (pipe-slot twin of
+                    // step_mask) — the delivered frame is final here.
                     ds.next_frame_ms += ds.frame_interval_ms;
                     continue;
                 }
@@ -824,10 +888,28 @@ void VideoEngine::pump_channel(VideoChannel& channel, DecodeState& ds) {
             lk.unlock();
             // Worker lagged / was cancelled: retire the pipe permanently and
             // decode the wanted frame synchronously (same byte stream).
+            // Adopt the worker's decoders first: they sit at the exact next
+            // stream frame, so the sync path resumes phase-locked (main and
+            // mask) with zero discard — the old path re-decoded the whole
+            // stream from zero to re-sync.
             {
-                std::lock_guard<std::mutex> g(pf->mu);
+                std::unique_lock<std::mutex> g(pf->mu);
                 pf->cancel = true;
                 pf->cv.notify_all();
+                pf->cv.wait_for(g, std::chrono::milliseconds(100),
+                                [&] { return pf->exited; });
+                if (pf->returned_main) {
+                    ds.source = std::move(pf->returned_main);
+                    ds.main_seq = pf->produced;
+                }
+                if (ds.mask) {
+                    if (pf->returned_mask) {
+                        ds.mask->src = pf->returned_mask;
+                        ds.mask->frozen = pf->returned_mask_frozen;
+                    } else {
+                        ds.mask.reset();
+                    }
+                }
             }
             ds.pipe.reset();
         }
@@ -981,6 +1063,67 @@ void ycbcr_to_rgba(const th_ycbcr_buffer yuv, int pic_x, int pic_y, int w, int h
     const int ys = yuv[0].stride;
     const int us = yuv[1].stride;
     const int vs = yuv[2].stride;
+    if (cx == 1 && cy == 1 && (pic_x % 2) == 0 && (pic_y % 2) == 0) {
+        // 4:2:0 fast path (every real asset): an aligned 2x2 output block
+        // shares ONE (U,V) fetch, so the chroma bytes load a quarter as
+        // often as the per-pixel loop. Same integer expressions, same
+        // output bytes — the shared index is exactly the per-pixel one
+        // ((fx) >> 1 == (fx + 1) >> 1 for even fx, and both picture rows of
+        // a pair map to the same chroma row for even fy).
+        for (int py = 0; py < h; py += 2) {
+            const int fy = pic_y + py;
+            uint8_t* out0 = rgba.data() + size_t(py) * size_t(w) * 4;
+            const int fy1 = fy + 1;
+            const bool two_rows = (py + 1 < h) && (fy1 < pic_y + h);
+            uint8_t* out1 = two_rows ? out0 + size_t(w) * 4 : nullptr;
+            const unsigned char* yr0 = Y + size_t(fy) * size_t(ys);
+            const unsigned char* yr1 =
+                two_rows ? Y + size_t(fy1) * size_t(ys) : nullptr;
+            const unsigned char* ur = U + size_t(fy >> 1) * size_t(us);
+            const unsigned char* vr = V + size_t(fy >> 1) * size_t(vs);
+            for (int px = 0; px < w; px += 2) {
+                const int fx = pic_x + px;
+                const int uv = int(ur[fx >> 1]) - 128;
+                const int vv = int(vr[fx >> 1]) - 128;
+                const int yv = int(yr0[fx]) - 16;
+                out0[px * 4 + 0] = clamp8((298 * yv + 409 * vv + 128) >> 8);
+                out0[px * 4 + 1] =
+                    clamp8((298 * yv - 100 * uv - 208 * vv + 128) >> 8);
+                out0[px * 4 + 2] = clamp8((298 * yv + 516 * uv + 128) >> 8);
+                out0[px * 4 + 3] = 255;
+                if (two_rows) {
+                    const int yv1 = int(yr1[fx]) - 16;
+                    out1[px * 4 + 0] = clamp8((298 * yv1 + 409 * vv + 128) >> 8);
+                    out1[px * 4 + 1] =
+                        clamp8((298 * yv1 - 100 * uv - 208 * vv + 128) >> 8);
+                    out1[px * 4 + 2] = clamp8((298 * yv1 + 516 * uv + 128) >> 8);
+                    out1[px * 4 + 3] = 255;
+                }
+                if (px + 1 < w) {
+                    const int fx1 = fx + 1;
+                    const int yv2 = int(yr0[fx1]) - 16;
+                    out0[(px + 1) * 4 + 0] =
+                        clamp8((298 * yv2 + 409 * vv + 128) >> 8);
+                    out0[(px + 1) * 4 + 1] =
+                        clamp8((298 * yv2 - 100 * uv - 208 * vv + 128) >> 8);
+                    out0[(px + 1) * 4 + 2] =
+                        clamp8((298 * yv2 + 516 * uv + 128) >> 8);
+                    out0[(px + 1) * 4 + 3] = 255;
+                    if (two_rows) {
+                        const int yv3 = int(yr1[fx1]) - 16;
+                        out1[(px + 1) * 4 + 0] =
+                            clamp8((298 * yv3 + 409 * vv + 128) >> 8);
+                        out1[(px + 1) * 4 + 1] =
+                            clamp8((298 * yv3 - 100 * uv - 208 * vv + 128) >> 8);
+                        out1[(px + 1) * 4 + 2] =
+                            clamp8((298 * yv3 + 516 * uv + 128) >> 8);
+                        out1[(px + 1) * 4 + 3] = 255;
+                    }
+                }
+            }
+        }
+        return;
+    }
     for (int py = 0; py < h; ++py) {
         const int fy = pic_y + py; // full-frame row of this picture row
         uint8_t* out = rgba.data() + size_t(py) * size_t(w) * 4;
@@ -1305,6 +1448,81 @@ bool yuv_frame_to_rgba(const AVFrame* f, std::vector<uint8_t>& rgba, int* out_w,
     const int ys = f->linesize[0];
     const int us = f->linesize[1];
     const int vs = f->linesize[2];
+    if (cx == 1 && (w % 2) == 0) {
+        // 4:2:0/4:2:2 fast path (the WMV3/VC-1 decoders output 420p): an
+        // even px pair shares ONE (U,V) fetch, and an even row pair shares
+        // one chroma row for 420. Same integer expressions, same output
+        // bytes as the per-pixel loop below.
+        const bool two_rows = (cy == 1) && (h % 2) == 0;
+        for (int py = 0; py < h; py += two_rows ? 2 : 1) {
+            uint8_t* out0 = rgba.data() + size_t(py) * size_t(w) * 4;
+            const bool rows2 = two_rows && (py + 1 < h);
+            uint8_t* out1 = rows2 ? out0 + size_t(w) * 4 : nullptr;
+            const unsigned char* yr0 = Y + size_t(py) * size_t(ys);
+            const unsigned char* yr1 =
+                rows2 ? Y + size_t(py + 1) * size_t(ys) : nullptr;
+            const unsigned char* ur = U + size_t(py >> cy) * size_t(us);
+            const unsigned char* vr = V + size_t(py >> cy) * size_t(vs);
+            for (int px = 0; px < w; px += 2) {
+                const int uv = int(ur[px >> 1]) - 128;
+                const int vv = int(vr[px >> 1]) - 128;
+                if (full_range) {
+                    const int yv = int(yr0[px]);
+                    out0[px * 4 + 0] = uint8_t(clamp8((256 * yv + 359 * vv + 128) >> 8));
+                    out0[px * 4 + 1] = uint8_t(clamp8((256 * yv - 88 * uv - 183 * vv + 128) >> 8));
+                    out0[px * 4 + 2] = uint8_t(clamp8((256 * yv + 454 * uv + 128) >> 8));
+                    out0[px * 4 + 3] = 255;
+                    if (rows2) {
+                        const int yv1 = int(yr1[px]);
+                        out1[px * 4 + 0] = uint8_t(clamp8((256 * yv1 + 359 * vv + 128) >> 8));
+                        out1[px * 4 + 1] = uint8_t(clamp8((256 * yv1 - 88 * uv - 183 * vv + 128) >> 8));
+                        out1[px * 4 + 2] = uint8_t(clamp8((256 * yv1 + 454 * uv + 128) >> 8));
+                        out1[px * 4 + 3] = 255;
+                    }
+                    const int yv2 = int(yr0[px + 1]);
+                    out0[(px + 1) * 4 + 0] = uint8_t(clamp8((256 * yv2 + 359 * vv + 128) >> 8));
+                    out0[(px + 1) * 4 + 1] = uint8_t(clamp8((256 * yv2 - 88 * uv - 183 * vv + 128) >> 8));
+                    out0[(px + 1) * 4 + 2] = uint8_t(clamp8((256 * yv2 + 454 * uv + 128) >> 8));
+                    out0[(px + 1) * 4 + 3] = 255;
+                    if (rows2) {
+                        const int yv3 = int(yr1[px + 1]);
+                        out1[(px + 1) * 4 + 0] = uint8_t(clamp8((256 * yv3 + 359 * vv + 128) >> 8));
+                        out1[(px + 1) * 4 + 1] = uint8_t(clamp8((256 * yv3 - 88 * uv - 183 * vv + 128) >> 8));
+                        out1[(px + 1) * 4 + 2] = uint8_t(clamp8((256 * yv3 + 454 * uv + 128) >> 8));
+                        out1[(px + 1) * 4 + 3] = 255;
+                    }
+                } else {
+                    const int yv0 = int(yr0[px]) - 16;
+                    out0[px * 4 + 0] = uint8_t(clamp8((298 * yv0 + 409 * vv + 128) >> 8));
+                    out0[px * 4 + 1] = uint8_t(clamp8((298 * yv0 - 100 * uv - 208 * vv + 128) >> 8));
+                    out0[px * 4 + 2] = uint8_t(clamp8((298 * yv0 + 516 * uv + 128) >> 8));
+                    out0[px * 4 + 3] = 255;
+                    if (rows2) {
+                        const int yv1 = int(yr1[px]) - 16;
+                        out1[px * 4 + 0] = uint8_t(clamp8((298 * yv1 + 409 * vv + 128) >> 8));
+                        out1[px * 4 + 1] = uint8_t(clamp8((298 * yv1 - 100 * uv - 208 * vv + 128) >> 8));
+                        out1[px * 4 + 2] = uint8_t(clamp8((298 * yv1 + 516 * uv + 128) >> 8));
+                        out1[px * 4 + 3] = 255;
+                    }
+                    const int yv2 = int(yr0[px + 1]) - 16;
+                    out0[(px + 1) * 4 + 0] = uint8_t(clamp8((298 * yv2 + 409 * vv + 128) >> 8));
+                    out0[(px + 1) * 4 + 1] = uint8_t(clamp8((298 * yv2 - 100 * uv - 208 * vv + 128) >> 8));
+                    out0[(px + 1) * 4 + 2] = uint8_t(clamp8((298 * yv2 + 516 * uv + 128) >> 8));
+                    out0[(px + 1) * 4 + 3] = 255;
+                    if (rows2) {
+                        const int yv3 = int(yr1[px + 1]) - 16;
+                        out1[(px + 1) * 4 + 0] = uint8_t(clamp8((298 * yv3 + 409 * vv + 128) >> 8));
+                        out1[(px + 1) * 4 + 1] = uint8_t(clamp8((298 * yv3 - 100 * uv - 208 * vv + 128) >> 8));
+                        out1[(px + 1) * 4 + 2] = uint8_t(clamp8((298 * yv3 + 516 * uv + 128) >> 8));
+                        out1[(px + 1) * 4 + 3] = 255;
+                    }
+                }
+            }
+        }
+        if (out_w) *out_w = w;
+        if (out_h) *out_h = h;
+        return true;
+    }
     for (int py = 0; py < h; ++py) {
         uint8_t* out = rgba.data() + size_t(py) * size_t(w) * 4;
         const unsigned char* yr = Y + size_t(py) * size_t(ys);

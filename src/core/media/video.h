@@ -305,6 +305,19 @@ private:
             uint64_t consumed = 1; // frames already delivered (frame 0 exists)
             bool eof = false;      // worker gave up (non-loop end / restart fail)
             bool cancel = false;
+            // Mask-compositing worker: the pipe worker steps the `_m` mask
+            // in lockstep with the main stream and bakes the composite into
+            // the delivered slots, so the driver thread never decodes the
+            // mask stream (a 1080p30 masked pair used to cost the driver
+            // ~9 ms per frame of mask decode + alpha bake). On exit the
+            // worker hands its decoders back with their stream positions
+            // intact: a mid-play retirement (worker lag) adopts them, so
+            // the sync fallback resumes at the exact next frame instead of
+            // discarding back from stream zero.
+            std::unique_ptr<VideoSource> returned_main;
+            std::shared_ptr<VideoSource> returned_mask;
+            bool returned_mask_frozen = false;
+            bool exited = false;
         };
         std::shared_ptr<Pipe> pipe;
     };
@@ -335,7 +348,8 @@ private:
     /// Retire a channel's pipe worker (sync decode takes over).
     void cancel_pipe(DecodeState& ds);
     /// Spawn the decode-pool pipe worker for a fresh decode state.
-    void start_pipe(DecodeState& ds, const std::string& file, bool loop_play);
+    void start_pipe(DecodeState& ds, const std::string& file, bool loop_play,
+                    const std::shared_ptr<VideoSource>& mask);
     /// deterministic movie-stream flush. The movie stream is
     /// shared by every audio-bearing video channel (the audio-bearing split), so
     /// the flush only runs when no OTHER playing channel still feeds it

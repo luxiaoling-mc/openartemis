@@ -4,6 +4,7 @@
 #include "core/emote/emote_player.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -32,6 +33,23 @@ static bool env_flag_on(const char* name, bool dflt) {
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Host-compositing default for NEW players. The windowed app composites the
+// pose on the GPU (SDL_RenderGeometry) and only needs the player's own CPU
+// raster as a fallback — but without this latch every freshly loaded player
+// still paid one full CPU pose raster inside load() (43+ ms on the large
+// PSBs) before the host's first pump flipped external-pose on. The host
+// latches this once at startup (renderer exists -> on); headless /
+// OA_EMOTE_GPU=0 hosts keep it off so rgba() keeps its CPU truth.
+// ---------------------------------------------------------------------------
+std::atomic<bool> g_default_external_pose{false};
+void emote_set_default_external_pose(bool on) {
+    g_default_external_pose.store(on, std::memory_order_relaxed);
+}
+bool emote_default_external_pose() {
+    return g_default_external_pose.load(std::memory_order_relaxed);
+}
+
 EmotePlayer::EmotePlayer() {
     if (const char* fps = std::getenv("OA_EMOTE_FPS")) {
         const int v = std::atoi(fps);
@@ -49,6 +67,10 @@ EmotePlayer::EmotePlayer() {
     // interpolation constraint and the unfiltered track writes). Latched at
     // construction so one process can hold both arms side by side.
     s2_legacy_ = env_flag_on("OA_EMOTE_S2_LEGACY", false);
+    // GPU-compositing hosts latch this before boot (see
+    // emote_set_default_external_pose): new players skip their load-time CPU
+    // raster and the host composites the pose geometry instead.
+    external_pose_ = emote_default_external_pose();
 }
 
 EmotePlayer::~EmotePlayer() = default;

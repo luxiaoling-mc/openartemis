@@ -107,6 +107,14 @@
 
 namespace oa::emote {
 
+/// Host-side latch for NEW players: when the host composites poses itself
+/// (GPU geometry path), freshly loaded players must not spend one full CPU
+/// pose raster inside load(). Set once at startup before any player loads;
+/// per-player set_external_pose overrides remain as before. Default off
+/// (headless / CPU-raster hosts keep the load-time static pose).
+void emote_set_default_external_pose(bool on);
+bool emote_default_external_pose();
+
 class EmotePlayer {
 public:
     EmotePlayer();

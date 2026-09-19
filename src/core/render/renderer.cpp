@@ -782,6 +782,10 @@ bool RenderEngine::emote_render_parts(const oa::render::TextureKey& key,
     backend_->clear();
     backend_->set_draw_blend(BlendMode::Blend);
     backend_->clear_clip();
+    // the staging buffer is reused across the part loop (and grows once): a
+    // per-part vector allocated a fresh 2400-vertex buffer per warped part
+    // per pose (~30 poses/s per layer).
+    std::vector<Vertex> stage;
     for (const auto& part : parts) {
         if (part.source < 0 || part.source >= int(file.sources.size())) continue;
         const oa::emote::EmoteSource& src = *file.sources[size_t(part.source)];
@@ -805,8 +809,8 @@ bool RenderEngine::emote_render_parts(const oa::render::TextureKey& key,
             emote_atlases_[akey] = atlas;
         }
         const oa::emote::EmoteIcon& ic = src.icons[size_t(part.icon)];
-        std::vector<Vertex> verts;
-        verts.reserve(part.verts.size());
+        stage.clear();
+        stage.reserve(part.verts.size());
         const float a = float(std::clamp(part.alpha, 0.0, 1.0));
         for (const auto& v : part.verts) {
             // the atlas mapping comes from the same single
@@ -819,9 +823,9 @@ bool RenderEngine::emote_render_parts(const oa::render::TextureKey& key,
             sv.pos = {float(v.x), float(v.y)};
             sv.color = {1.0f, 1.0f, 1.0f, a};
             sv.uv = {float(tu), float(tv)};
-            verts.push_back(sv);
+            stage.push_back(sv);
         }
-        backend_->draw_geometry(atlas, verts.data(), int(verts.size()),
+        backend_->draw_geometry(atlas, stage.data(), int(stage.size()),
                                 nullptr, 0);
     }
     backend_->set_target(prev_target);

@@ -1,8 +1,11 @@
 #include "core/emote/psb_reader.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <thread>
+#include <vector>
 
 namespace oa::emote {
 namespace {
@@ -313,11 +316,28 @@ bool PsbReader::object_entries(uint32_t off, std::vector<std::string>* keys,
 }
 
 std::optional<uint32_t> PsbReader::object_member(uint32_t off, std::string_view key) const {
-    std::vector<std::string> keys;
-    std::vector<uint32_t> values;
-    if (!object_entries(off, &keys, &values)) return std::nullopt;
-    for (size_t i = 0; i < keys.size(); ++i)
-        if (keys[i] == key) return values[i];
+    // in-place scan (no temporaries): the parse hot path calls this ~15x per
+    // frame object, and the object_entries route below allocated two index
+    // vectors plus one key-string vector per call.
+    if (off >= data_.size() || data_[off] != uint8_t(Kind::Objects)) return std::nullopt;
+    int cw = 0, cnt = 0, ew = 0;
+    uint32_t ent = 0;
+    uint32_t cursor = off + 1;
+    if (!parse_array_head(cursor, &cw, &cnt, &ew, &ent)) return std::nullopt;
+    const uint32_t names_ent = ent;
+    const int names_ew = ew;
+    const int names_cnt = cnt;
+    cursor = ent + size_t(cnt) * ew;
+    if (!parse_array_head(cursor, &cw, &cnt, &ew, &ent)) return std::nullopt;
+    const uint32_t base = ent + size_t(cnt) * ew;
+    const int n = std::min(names_cnt, cnt);
+    for (int i = 0; i < n; ++i) {
+        const uint64_t idx = rd_compact(data_.data() + names_ent + size_t(i) * names_ew,
+                                        names_ew);
+        if (idx >= names_.size()) return std::nullopt;
+        if (std::string_view(names_[idx]) != key) continue;
+        return base + uint32_t(rd_compact(data_.data() + ent + size_t(i) * ew, ew));
+    }
     return std::nullopt;
 }
 
@@ -489,42 +509,65 @@ bool decode_bc3(const uint8_t* src, int width, int height,
     if (width <= 0 || height <= 0 || (width & 3) || (height & 3)) return false;
     rgba_out->assign(size_t(width) * height * 4, 0);
     const int bw = width / 4, bh = height / 4;
-    for (int by = 0; by < bh; ++by) {
-        for (int bx = 0; bx < bw; ++bx) {
-            const uint8_t* blk = src + size_t(by * bw + bx) * 16;
-            // alpha: 2 endpoint bytes + 6 bit-pair bytes (48 bits, 3b/texel)
-            const uint8_t a0 = blk[0], a1 = blk[1];
-            uint8_t alphas[8];
-            alphas[0] = a0;
-            alphas[1] = a1;
-            if (a0 > a1) {
-                for (int i = 1; i <= 6; ++i)
-                    alphas[i + 1] = uint8_t(((6 - i) * a0 + i * a1) / 7);
-            } else {
-                for (int i = 1; i <= 4; ++i)
-                    alphas[i + 1] = uint8_t(((4 - i) * a0 + i * a1) / 5);
-                alphas[6] = 0;
-                alphas[7] = 255;
-            }
-            uint8_t alpha[4][4];
-            uint64_t abits = 0;
-            for (int i = 0; i < 6; ++i) abits |= uint64_t(blk[2 + i]) << (8 * i);
-            for (int y = 0; y < 4; ++y)
-                for (int x = 0; x < 4; ++x)
-                    alpha[y][x] = alphas[(abits >> (3 * (y * 4 + x))) & 7];
-            uint8_t color[4][4][4];
-            decode_color_block(blk + 8, color);
-            for (int y = 0; y < 4; ++y) {
-                for (int x = 0; x < 4; ++x) {
-                    const int px = bx * 4 + x, py = by * 4 + y;
-                    uint8_t* d = rgba_out->data() + (size_t(py) * width + px) * 4;
-                    d[0] = color[y][x][0];
-                    d[1] = color[y][x][1];
-                    d[2] = color[y][x][2];
-                    d[3] = color[y][x][3] ? alpha[y][x] : 0;
+    // block rows are independent (each block writes its own 4x4 output
+    // span) — fan out across threads for the large E-mote atlases.
+    unsigned hw = std::thread::hardware_concurrency();
+    unsigned threads = std::clamp(hw ? hw : 1u, 1u, 16u);
+    if (const char* v = std::getenv("OA_EMOTE_THREADS")) {
+        const int n = std::atoi(v);
+        if (n >= 1 && n <= 16) threads = unsigned(n);
+    }
+    uint8_t* out = rgba_out->data();
+    auto decode_rows = [=](int by0, int by1) {
+        for (int by = by0; by < by1; ++by) {
+            for (int bx = 0; bx < bw; ++bx) {
+                const uint8_t* blk = src + size_t(by * bw + bx) * 16;
+                // alpha: 2 endpoint bytes + 6 bit-pair bytes (48 bits, 3b/texel)
+                const uint8_t a0 = blk[0], a1 = blk[1];
+                uint8_t alphas[8];
+                alphas[0] = a0;
+                alphas[1] = a1;
+                if (a0 > a1) {
+                    for (int i = 1; i <= 6; ++i)
+                        alphas[i + 1] = uint8_t(((6 - i) * a0 + i * a1) / 7);
+                } else {
+                    for (int i = 1; i <= 4; ++i)
+                        alphas[i + 1] = uint8_t(((4 - i) * a0 + i * a1) / 5);
+                    alphas[6] = 0;
+                    alphas[7] = 255;
+                }
+                uint8_t alpha[4][4];
+                uint64_t abits = 0;
+                for (int i = 0; i < 6; ++i) abits |= uint64_t(blk[2 + i]) << (8 * i);
+                for (int y = 0; y < 4; ++y)
+                    for (int x = 0; x < 4; ++x)
+                        alpha[y][x] = alphas[(abits >> (3 * (y * 4 + x))) & 7];
+                uint8_t color[4][4][4];
+                decode_color_block(blk + 8, color);
+                for (int y = 0; y < 4; ++y) {
+                    for (int x = 0; x < 4; ++x) {
+                        const int px = bx * 4 + x, py = by * 4 + y;
+                        uint8_t* d = out + (size_t(py) * width + px) * 4;
+                        d[0] = color[y][x][0];
+                        d[1] = color[y][x][1];
+                        d[2] = color[y][x][2];
+                        d[3] = color[y][x][3] ? alpha[y][x] : 0;
+                    }
                 }
             }
         }
+    };
+    if (threads <= 1 || bh < 16) {
+        decode_rows(0, bh);
+    } else {
+        const int band = (bh + int(threads) - 1) / int(threads);
+        std::vector<std::thread> th;
+        th.reserve(threads);
+        for (int b0 = 0; b0 < bh; b0 += band) {
+            const int b1 = std::min(bh, b0 + band);
+            th.emplace_back(decode_rows, b0, b1);
+        }
+        for (auto& t : th) t.join();
     }
     return true;
 }

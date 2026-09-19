@@ -47,10 +47,14 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <condition_variable>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <limits>
+#include <mutex>
 #include <thread>
 #include <map>
 #include <string>
@@ -868,8 +872,6 @@ void eval_node(EvalCtx& ctx, const EmoteMotion& motion, int nodeIdx, double inco
             lv.any = true;
         }
     }
-    std::vector<Level> childLevels = levels;
-    if (lv.any) childLevels.push_back(lv);
     const double nodeOpa = opaMul * std::clamp(fv.opa, 0.0, 1.0);
 
     if (src && ic) {
@@ -969,10 +971,20 @@ void eval_node(EvalCtx& ctx, const EmoteMotion& motion, int nodeIdx, double inco
         return;
     }
 
-    // transform carrier (blank / coord / mask frames)
-    for (int ch : node.children)
-        eval_node(ctx, motion, ch, incomingTick, childLevels, nodeOpa, depth + 1,
-                  type12Depth + (node.type == 12 ? 1 : 0), path);
+    // transform carrier (blank / coord / mask frames). The chain copy only
+    // happens when this level actually carries an affine/morph op; a no-op
+    // level (common on layout shells) recurses with the incoming chain.
+    if (lv.any) {
+        std::vector<Level> childLevels = levels;
+        childLevels.push_back(lv);
+        for (int ch : node.children)
+            eval_node(ctx, motion, ch, incomingTick, childLevels, nodeOpa, depth + 1,
+                      type12Depth + (node.type == 12 ? 1 : 0), path);
+    } else {
+        for (int ch : node.children)
+            eval_node(ctx, motion, ch, incomingTick, levels, nodeOpa, depth + 1,
+                      type12Depth + (node.type == 12 ? 1 : 0), path);
+    }
     path.pop_back();
 }
 
@@ -983,39 +995,82 @@ void eval_motion(EvalCtx& ctx, const EmoteMotion& motion, double tick,
         eval_node(ctx, motion, root, tick, levels, opaMul, depth, type12Depth, path);
 }
 
-double sample_atlas(const std::vector<uint8_t>& rgba, int texW, int texH, double u, double v,
-                    int c) {
-    if (texW <= 0 || texH <= 0) return 0;
-    double x = u * texW - 0.5;
-    double y = v * texH - 0.5;
-    const int x0 = int(std::floor(x)), y0 = int(std::floor(y));
-    const double fx = x - x0, fy = y - y0;
-    auto px = [&](int xx, int yy) -> double {
-        xx = std::clamp(xx, 0, texW - 1);
-        yy = std::clamp(yy, 0, texH - 1);
-        return rgba[(size_t(yy) * texW + xx) * 4 + c];
-    };
-    const double p00 = px(x0, y0), p10 = px(x0 + 1, y0);
-    const double p01 = px(x0, y0 + 1), p11 = px(x0 + 1, y0 + 1);
-    const double top = p00 + (p10 - p00) * fx;
-    const double bot = p01 + (p11 - p01) * fx;
-    return top + (bot - top) * fy;
-}
-
+// ---------------------------------------------------------------------------
+// bilinear atlas sampling, specialized for the scan loops. One texel-space
+// setup per source pixel feeds all four channels: the four surrounding
+// texels are fetched ONCE (the old per-channel sampler re-ran floor/clamp
+// 4x per pixel), then the bilinear weights apply per channel. Same texels
+// and weights as the previous double-precision sample_atlas, float
+// precision.
+// ---------------------------------------------------------------------------
 struct MeshVert {
     double x = 0, y = 0, u = 0, v = 0;
 };
 
-static void blend_pixel(int canvasW, int x, int y, double r, double g, double b, double a,
-                        std::vector<uint8_t>* canvas) {
-    uint8_t* dst = canvas->data() + (size_t(y) * canvasW + x) * 4;
-    const double da = dst[3] / 255.0;
-    const double outa = a + da * (1.0 - a);
-    if (outa <= 0.0001) return;
-    dst[0] = uint8_t(std::clamp((r * a + dst[0] * da * (1.0 - a)) / outa, 0.0, 255.0));
-    dst[1] = uint8_t(std::clamp((g * a + dst[1] * da * (1.0 - a)) / outa, 0.0, 255.0));
-    dst[2] = uint8_t(std::clamp((b * a + dst[2] * da * (1.0 - a)) / outa, 0.0, 255.0));
-    dst[3] = uint8_t(std::clamp(outa * 255.0, 0.0, 255.0));
+struct AtlasSampler {
+    const uint8_t* rgba;
+    int texW, texH;
+    // atlas mapping precomputed from the icon rect (the ONE mapping,
+    // emote_icon_uv_to_atlas, folded to affine form):
+    //   au = u * aw + bx ; av = v * ah + by
+    float aw, ah, bx, by;
+};
+
+struct BilerpTexels {
+    const uint8_t* t00;
+    const uint8_t* t10;
+    const uint8_t* t01;
+    const uint8_t* t11;
+    float fx, fy;
+};
+
+// u/v (icon space 0..1) -> the 4 surrounding atlas texels. Same texels and
+// weights as sample_atlas's independent per-texel clamping: after clamping
+// the base texel the fractional part clamps too, so a point that fell
+// outside the atlas resolves to its border texel exactly like the old
+// per-channel clamp (sample_atlas) did.
+inline bool bilerp_setup(const AtlasSampler& s, float u, float v, BilerpTexels* b) {
+    const float au = u * s.aw + s.bx;
+    const float av = v * s.ah + s.by;
+    const float x = au * float(s.texW) - 0.5f;
+    const float y = av * float(s.texH) - 0.5f;
+    int x0 = int(std::floor(x)), y0 = int(std::floor(y));
+    float fx = x - float(x0), fy = y - float(y0);
+    if (x0 < 0) {
+        x0 = 0;
+        fx = 0;
+    }
+    if (x0 > s.texW - 2) {
+        x0 = s.texW - 2;
+        fx = 1;
+    }
+    if (y0 < 0) {
+        y0 = 0;
+        fy = 0;
+    }
+    if (y0 > s.texH - 2) {
+        y0 = s.texH - 2;
+        fy = 1;
+    }
+    b->fx = fx;
+    b->fy = fy;
+    const size_t row = size_t(s.texW);
+    const uint8_t* p = s.rgba + (size_t(y0) * row + size_t(x0)) * 4;
+    b->t00 = p;
+    b->t10 = p + 4;
+    b->t01 = p + row * 4;
+    b->t11 = p + row * 4 + 4;
+    return true;
+}
+
+inline float bilerp_c(const BilerpTexels& b, int c) {
+    const float p00 = float(b.t00[c]);
+    const float p10 = float(b.t10[c]);
+    const float p01 = float(b.t01[c]);
+    const float p11 = float(b.t11[c]);
+    const float top = p00 + (p10 - p00) * b.fx;
+    const float bot = p01 + (p11 - p01) * b.fx;
+    return top + (bot - top) * b.fy;
 }
 
 // paint one entry: warped entries go through the forward UV mesh; pure
@@ -1030,14 +1085,80 @@ static int raster_threads() {
         if (n >= 1 && n <= 16) return n;
     }
     const unsigned hw = std::thread::hardware_concurrency();
-    return int(std::clamp(hw ? hw : 2u, 1u, 8u));
+    return int(std::clamp(hw ? hw : 2u, 1u, 16u));
 }
+
+// ---------------------------------------------------------------------------
+// persistent raster worker pool. The per-entry fan-outs used to spawn a
+// fresh thread set per draw entry (44 entries x 7 workers ≈ 300 thread
+// creations per pose ≈ 20+ ms of pure startup on the large PSBs); the pool
+// is created once per process and each pose dispatches band jobs to it.
+// Bands of one entry are disjoint canvas rows (no data sharing), and the
+// dispatch joins between entries, so the cross-entry blend order stays
+// exactly the sequential one.
+// ---------------------------------------------------------------------------
+struct RasterPool {
+    const int n;
+    std::mutex m;
+    std::condition_variable cv, done_cv;
+    const std::function<void(int)>* job = nullptr;
+    uint64_t gen = 0;
+    int pending = 0;
+    std::vector<std::thread> th;
+
+    explicit RasterPool(int threads) : n(threads > 1 ? threads : 1) {
+        th.reserve(size_t(n - 1));
+        for (int i = 1; i < n; ++i) th.emplace_back([this, i] { worker(i); });
+    }
+    static RasterPool& get() {
+        const int threads = raster_threads();
+        static RasterPool* pool = new RasterPool(threads); // leaky by design
+        return *pool;
+    }
+    void run(const std::function<void(int)>& j, int bands) {
+        if (n <= 1 || bands <= 1) {
+            j(0);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> g(m);
+            job = &j;
+            ++gen;
+            pending = bands - 1; // band 0 runs on the calling thread
+        }
+        cv.notify_all();
+        j(0);
+        std::unique_lock<std::mutex> g(m);
+        done_cv.wait(g, [this] { return pending == 0; });
+        job = nullptr;
+    }
+    void worker(int idx) {
+        uint64_t seen = 0;
+        for (;;) {
+            std::unique_lock<std::mutex> g(m);
+            cv.wait(g, [&] { return (job && gen != seen); });
+            seen = gen;
+            const std::function<void(int)>* j = job;
+            g.unlock();
+            (*j)(idx);
+            g.lock();
+            if (--pending == 0) done_cv.notify_one();
+        }
+    }
+};
 
 static void paint_entry(const DrawEntry& en, const Mat& fit, int canvasW, int canvasH,
                         std::vector<uint8_t>* canvas) {
     const std::vector<uint8_t>& rgba = en.source->rgba;
     const int texW = en.source->textureWidth, texH = en.source->textureHeight;
-    if (texW <= 0 || texH <= 0) return;
+    if (texW <= 0 || texH <= 0 || rgba.empty()) return;
+    // the one atlas mapping folded to affine form (identical to
+    // emote_icon_uv_to_atlas): au = u*aw + bx, av = v*ah + by
+    const AtlasSampler samp{rgba.data(), texW, texH,
+                            float(en.icon->width / double(texW)),
+                            float(en.icon->height / double(texH)),
+                            float(en.icon->left / double(texW)),
+                            float(en.icon->top / double(texH))};
     const int nThreads = canvasH >= 600 ? raster_threads() : 1;
     if (!en.warped) {
         // affine fast path: uv -> world is linear
@@ -1068,22 +1189,37 @@ static void paint_entry(const DrawEntry& en, const Mat& fit, int canvasW, int ca
         const int y0 = std::max(0, int(std::floor(minY)));
         const int y1 = std::min(canvasH - 1, int(std::ceil(maxY)));
         if (x0 > x1 || y0 > y1) return;
+        // inverse-map increments: u,v are linear in (px,py), so the row
+        // start value + a per-pixel step replaces the per-pixel 2x2 madd
+        // (same line, float precision — sampling only).
+        const float fu0 = float(ia), fu1 = float(ic), fv0 = float(ib), fv1 = float(id);
+        const float fuo = float(ie), fvo = float(inf);
         auto scan_band = [&](int r0, int r1) {
+            std::vector<uint8_t>& cnv = *canvas;
             for (int py = r0; py <= r1; ++py) {
-                for (int px = x0; px <= x1; ++px) {
-                    const double u = ia * (px + 0.5) + ic * (py + 0.5) + ie;
-                    const double v = ib * (px + 0.5) + id * (py + 0.5) + inf;
+                float u = fu0 * (float(x0) + 0.5f) + fu1 * (float(py) + 0.5f) + fuo;
+                float v = fv0 * (float(x0) + 0.5f) + fv1 * (float(py) + 0.5f) + fvo;
+                uint8_t* dst = cnv.data() + (size_t(py) * canvasW + size_t(x0)) * 4;
+                for (int px = x0; px <= x1; ++px, dst += 4, u += fu0, v += fv0) {
                     if (u < 0 || u > 1 || v < 0 || v > 1) continue;
-                    double au = 0, av = 0;
-                    // the one atlas mapping (no trim term)
-                    emote_icon_uv_to_atlas(*en.icon, texW, texH, u, v, &au, &av);
-                    const double alpha = sample_atlas(rgba, texW, texH, au, av, 3) / 255.0;
-                    if (alpha <= 0.001) continue;
-                    const double opa = alpha * en.opa;
-                    const double r = sample_atlas(rgba, texW, texH, au, av, 0);
-                    const double g = sample_atlas(rgba, texW, texH, au, av, 1);
-                    const double b = sample_atlas(rgba, texW, texH, au, av, 2);
-                    blend_pixel(canvasW, px, py, r, g, b, opa, canvas);
+                    BilerpTexels bt;
+                    bilerp_setup(samp, u, v, &bt);
+                    const float alpha = bilerp_c(bt, 3) / 255.0f;
+                    if (alpha <= 0.001f) continue;
+                    const float opa = alpha * float(en.opa);
+                    const float da = float(dst[3]) / 255.0f;
+                    const float outa = opa + da * (1.0f - opa);
+                    if (outa <= 0.0001f) continue;
+                    const float r = bilerp_c(bt, 0);
+                    const float g = bilerp_c(bt, 1);
+                    const float b = bilerp_c(bt, 2);
+                    dst[0] = uint8_t(std::clamp((r * opa + float(dst[0]) * da * (1.0f - opa)) / outa,
+                                                0.0f, 255.0f));
+                    dst[1] = uint8_t(std::clamp((g * opa + float(dst[1]) * da * (1.0f - opa)) / outa,
+                                                0.0f, 255.0f));
+                    dst[2] = uint8_t(std::clamp((b * opa + float(dst[2]) * da * (1.0f - opa)) / outa,
+                                                0.0f, 255.0f));
+                    dst[3] = uint8_t(std::clamp(outa * 255.0f, 0.0f, 255.0f));
                 }
             }
         };
@@ -1092,14 +1228,11 @@ static void paint_entry(const DrawEntry& en, const Mat& fit, int canvasW, int ca
         if (nThreads <= 1 || rows < 64) {
             scan_band(y0, y1);
         } else {
-            std::vector<std::thread> th;
-            th.reserve(size_t(nThreads));
-            for (int t = 0; t < nThreads && y0 + t * band <= y1; ++t) {
+            RasterPool::get().run([&](int t) {
                 const int b0 = y0 + t * band;
-                const int b1 = std::min(y1, b0 + band - 1);
-                th.emplace_back(scan_band, b0, b1);
-            }
-            for (auto& j : th) j.join();
+                if (t >= nThreads || b0 > y1) return;
+                scan_band(b0, std::min(y1, b0 + band - 1));
+            }, nThreads);
         }
         return;
     }
@@ -1116,6 +1249,7 @@ static void paint_entry(const DrawEntry& en, const Mat& fit, int canvasW, int ca
     // and must see the calling thread's buffers, not their own empty TLS.
     static thread_local std::vector<MeshVert> verts_tls;
     static thread_local std::vector<MeshVert> tris_tls;
+    static thread_local std::vector<uint32_t> tri_bucket_tls; // band bucketing
     std::vector<MeshVert>& verts = verts_tls;
     std::vector<MeshVert>& tris = tris_tls;
     verts.resize(size_t(n) * n);
@@ -1148,11 +1282,55 @@ static void paint_entry(const DrawEntry& en, const Mat& fit, int canvasW, int ca
             tris[ti++] = p2;
         }
     }
-    auto scan_band = [&](int r0_, int r1_) {
-        for (size_t ti = 0; ti + 2 < tris.size(); ti += 3) {
-            const MeshVert& amv = tris[ti];
-            const MeshVert& bmv = tris[ti + 1];
-            const MeshVert& cmv = tris[ti + 2];
+    // Row-band bucketing: each band worker used to re-walk EVERY triangle
+    // and skip the ones outside its rows (O(tris * bands)); the triangles
+    // are bucketed once below so each band scans only its own overlapping
+    // set. A triangle spanning several bands is appended to each (every
+    // band needs the copy); within a band the global triangle order is
+    // preserved, so the blending order is identical to the unbucketed scan.
+    // Serial mode keeps ONE band = the whole canvas (the exact old order).
+    const int rows_total = canvasH;
+    const int nBands = (nThreads > 1 && rows_total >= 256) ? nThreads : 1;
+    const int bandH = std::max(1, (canvasH + nBands - 1) / nBands);
+    std::vector<uint32_t>& bucket = tri_bucket_tls;
+    static thread_local std::vector<uint32_t> band_start_tls;
+    static thread_local std::vector<uint32_t> band_fill_tls;
+    std::vector<uint32_t>& band_start = band_start_tls;
+    {
+        const size_t nTris = tris.size() / 3;
+        static thread_local std::vector<int> tb0_tls, tb1_tls;
+        std::vector<int>& tb0 = tb0_tls;
+        std::vector<int>& tb1 = tb1_tls;
+        tb0.resize(nTris);
+        tb1.resize(nTris);
+        band_start.assign(size_t(nBands) + 1, 0);
+        for (size_t t = 0; t < nTris; ++t) {
+            const MeshVert& a = tris[t * 3];
+            const MeshVert& b = tris[t * 3 + 1];
+            const MeshVert& c = tris[t * 3 + 2];
+            const double ymin = std::min({a.y, b.y, c.y});
+            const double ymax = std::max({a.y, b.y, c.y});
+            const int b0 = std::clamp(int(std::floor(ymin)) / bandH, 0, nBands - 1);
+            const int b1 = std::clamp(int(std::ceil(ymax)) / bandH, 0, nBands - 1);
+            tb0[t] = b0;
+            tb1[t] = b1;
+            for (int bb = b0; bb <= b1; ++bb) ++band_start[size_t(bb) + 1];
+        }
+        for (int b = 0; b < nBands; ++b) band_start[size_t(b) + 1] += band_start[size_t(b)];
+        bucket.assign(band_start[size_t(nBands)], 0);
+        band_fill_tls.assign(size_t(nBands), 0);
+        for (size_t t = 0; t < nTris; ++t)
+            for (int bb = tb0[t]; bb <= tb1[t]; ++bb)
+                bucket[band_start[size_t(bb)] + band_fill_tls[size_t(bb)]++] = uint32_t(t);
+    }
+    auto scan_band = [&](int band, int r0_, int r1_) {
+        const uint32_t beg = band_start[size_t(band)];
+        const uint32_t end = band_start[size_t(band) + 1];
+        for (uint32_t bi = beg; bi < end; ++bi) {
+            const size_t t = size_t(bucket[bi]) * 3;
+            const MeshVert& amv = tris[t];
+            const MeshVert& bmv = tris[t + 1];
+            const MeshVert& cmv = tris[t + 2];
             const double minY = std::min({amv.y, bmv.y, cmv.y});
             const double maxY = std::max({amv.y, bmv.y, cmv.y});
             const int y0 = std::max(r0_, int(std::floor(minY)));
@@ -1174,35 +1352,39 @@ static void paint_entry(const DrawEntry& en, const Mat& fit, int canvasW, int ca
                     const double r2 = (cmv.y - amv.y) * (wx - cmv.x) + (amv.x - cmv.x) * (wy - cmv.y);
                     const double r3 = denom - r1 - r2;
                     if (r1 < -0.5 || r2 < -0.5 || r3 < -0.5) continue;
-                    const double u = (r1 * amv.u + r2 * bmv.u + r3 * cmv.u) * inv;
-                    const double v = (r1 * amv.v + r2 * bmv.v + r3 * cmv.v) * inv;
-                    double au = 0, av = 0;
-                    // the one atlas mapping (no trim term)
-                    emote_icon_uv_to_atlas(*en.icon, texW, texH, u, v, &au, &av);
-                    const double alpha = sample_atlas(rgba, texW, texH, au, av, 3) / 255.0;
-                    if (alpha <= 0.001) continue;
-                    const double opa = alpha * en.opa;
-                    const double r = sample_atlas(rgba, texW, texH, au, av, 0);
-                    const double g = sample_atlas(rgba, texW, texH, au, av, 1);
-                    const double b = sample_atlas(rgba, texW, texH, au, av, 2);
-                    blend_pixel(canvasW, px, py, r, g, b, opa, canvas);
+                    const float u = float((r1 * amv.u + r2 * bmv.u + r3 * cmv.u) * inv);
+                    const float v = float((r1 * amv.v + r2 * bmv.v + r3 * cmv.v) * inv);
+                    BilerpTexels bt;
+                    bilerp_setup(samp, u, v, &bt);
+                    const float alpha = bilerp_c(bt, 3) / 255.0f;
+                    if (alpha <= 0.001f) continue;
+                    const float opa = alpha * float(en.opa);
+                    uint8_t* dst = canvas->data() + (size_t(py) * canvasW + size_t(px)) * 4;
+                    const float da = float(dst[3]) / 255.0f;
+                    const float outa = opa + da * (1.0f - opa);
+                    if (outa <= 0.0001f) continue;
+                    const float r = bilerp_c(bt, 0);
+                    const float g = bilerp_c(bt, 1);
+                    const float b = bilerp_c(bt, 2);
+                    dst[0] = uint8_t(std::clamp((r * opa + float(dst[0]) * da * (1.0f - opa)) / outa,
+                                                0.0f, 255.0f));
+                    dst[1] = uint8_t(std::clamp((g * opa + float(dst[1]) * da * (1.0f - opa)) / outa,
+                                                0.0f, 255.0f));
+                    dst[2] = uint8_t(std::clamp((b * opa + float(dst[2]) * da * (1.0f - opa)) / outa,
+                                                0.0f, 255.0f));
+                    dst[3] = uint8_t(std::clamp(outa * 255.0f, 0.0f, 255.0f));
                 }
             }
         }
     };
-    const int rows = canvasH;
-    const int band = std::max(1, (rows + nThreads - 1) / nThreads);
-    if (nThreads <= 1 || rows < 256) {
-        scan_band(0, canvasH - 1);
+    if (nBands <= 1) {
+        scan_band(0, 0, canvasH - 1);
     } else {
-        std::vector<std::thread> th;
-        th.reserve(size_t(nThreads));
-        for (int t = 0; t < nThreads && t * band < canvasH; ++t) {
-            const int b0 = t * band;
-            const int b1 = std::min(canvasH - 1, b0 + band - 1);
-            th.emplace_back(scan_band, b0, b1);
-        }
-        for (auto& j : th) j.join();
+        RasterPool::get().run([&](int t) {
+            const int b0 = t * bandH;
+            if (t >= nBands || b0 >= canvasH) return;
+            scan_band(t, b0, std::min(canvasH - 1, b0 + bandH - 1));
+        }, nBands);
     }
 }
 

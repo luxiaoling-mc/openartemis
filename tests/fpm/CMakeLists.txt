@@ -8,6 +8,8 @@
 # Generic (asset-free) engine tests stay in tests/ (../CMakeLists.txt).
 # See docs/TESTING.md.
 find_package(Freetype CONFIG REQUIRED)
+find_package(SDL3 CONFIG REQUIRED)
+find_package(PNG CONFIG REQUIRED)
 
 # Resource tiering (2026-09): heavy real-game tests are serialized by default
 # (memory-safe on modest machines). Machines with ample RAM can build with
@@ -147,6 +149,11 @@ set_tests_properties(emote_timeline PROPERTIES
 # (report-only executable; not registered as a ctest).
 add_executable(emote_axis_dump emote_axis_dump.cpp)
 target_link_libraries(emote_axis_dump PRIVATE libopenartemis)
+
+# Headless emote performance probe (report-only, not a ctest): walks a real
+# game archive to an E-mote scene and measures tick/player-level costs.
+add_executable(emote_perf_probe emote_perf_probe.cpp)
+target_link_libraries(emote_perf_probe PRIVATE libopenartemis SDL3::SDL3 PNG::PNG Freetype::Freetype)
 
 # research/91 diagnostic: btjy (HENPRI) backlog speaker-face geometry probe
 # (report-only; not a ctest). Walks the story, opens the backlog and dumps
@@ -423,3 +430,7 @@ add_executable(movie_audio_bound_test movie_audio_bound_test.cpp)
 target_link_libraries(movie_audio_bound_test PRIVATE libopenartemis)
 add_test(NAME movie_audio_bound COMMAND movie_audio_bound_test)
 set_tests_properties(movie_audio_bound PROPERTIES ENVIRONMENT "OA_TEST_HCT_PFS=${OA_TEST_HCT_PFS}" SKIP_RETURN_CODE 77 ${_OA_RS})
+
+# Headless video performance probe (report-only, not a ctest).
+add_executable(video_perf_probe video_perf_probe.cpp)
+target_link_libraries(video_perf_probe PRIVATE libopenartemis SDL3::SDL3 PNG::PNG Freetype::Freetype)

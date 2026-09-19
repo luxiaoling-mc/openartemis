@@ -288,6 +288,14 @@ static uint64_t video_rgba_checksum(const uint8_t* rgba, size_t bytes) {
 /// Upload every stored emote static frame once per revision (the emote
 /// engine stores the rendered figure; hosts stream it to the GPU like the
 /// video layer frames). Returns true after uploading (forces a redraw).
+
+// GPU compositing is the default when a renderer exists; OA_EMOTE_GPU=0
+// restores the CPU pixel-fill + upload path (see emote_pump_frames).
+static bool emote_gpu_mode() {
+    return std::getenv("OA_EMOTE_GPU") == nullptr ||
+           std::getenv("OA_EMOTE_GPU")[0] != '0';
+}
+
 static bool emote_pump_frames(AppState* state) {
     oa::runtime::GameRuntime* rt = state->rt.get();
     if (!rt) return false;
@@ -296,8 +304,7 @@ static bool emote_pump_frames(AppState* state) {
     // layer canvas with SDL_RenderGeometry; OA_EMOTE_GPU=0 restores the CPU
     // pixel fill + upload path. In GPU mode the players skip their own CPU
     // raster (external-pose mode) so pose updates stay cheap.
-    static const bool gpu = std::getenv("OA_EMOTE_GPU") == nullptr ||
-                            std::getenv("OA_EMOTE_GPU")[0] != '0';
+    static const bool gpu = emote_gpu_mode();
     bool any = false;
     for (const auto& [id, st] : rt->emote_layers()) {
         if (!st.player) continue;
@@ -924,6 +931,11 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char* argv[])
                      state->opt.renderer.c_str(), SDL_GetError());
         return SDL_APP_FAILURE;
     }
+    // GPU-compositing host: latch the default for NEW emote players so a
+    // fresh layer skips its load-time full CPU pose raster (the app
+    // composites the pose from geometry at the first pump instead). Headless
+    // never reaches this point — its players keep the CPU raster truth.
+    oa::emote::emote_set_default_external_pose(emote_gpu_mode());
     // Presentation diagnostics: the letterbox scale is what decides whether the
     // stage fills the screen or lands tiny in a corner, and it is derived from
     // the window's size vs its pixel size. A logical size far below the pixel

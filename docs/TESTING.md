@@ -136,11 +136,13 @@ openartemis [options] [project.pfs]     # pfs 或解包目录（含 system.ini�
 | `OA_NM_SELDBG` | 选择支 select_* Lua 调用/引擎点击链诊断（研究/49） | src/core/runtime/runtime_lua.cpp、src/core/runtime/runtime.cpp | `OA_NM_SELDBG=1` |
 | `OA_EMOTE_HALFRES` | EmotePlayer 半分辨率回退（P4U3/research/40-emote 起默认全分辨率；弱机/调试用） | src/core/emote/emote_player.cpp | `OA_EMOTE_HALFRES=1` |
 | `OA_EMOTE_FULLRES` | 显式强制 1:1（现为默认；保留兼容） | src/core/emote/emote_player.cpp | `OA_EMOTE_FULLRES=1` |
-| `OA_EMOTE_THREADS` | 全分辨率 CPU 光栅行带并行线程数（默认 min(硬件并发,8)） | src/core/emote/emote_render.cpp | `OA_EMOTE_THREADS=4` |
-| `OA_EMOTE_GPU` | GPU 贴图合成开关（默认开：SDL_RenderGeometry 画离屏画布；=0 回退 CPU 光栅+上传，research/40-emote） | src/app/main.cpp | `OA_EMOTE_GPU=0` |
+| `OA_EMOTE_THREADS` | 全分辨率 CPU 光栅行带并行线程数与图集解码线程数（默认 min(硬件并发,16)） | src/core/emote/emote_render.cpp、emote_file.cpp、psb_reader.cpp | `OA_EMOTE_THREADS=4` |
+| `OA_EMOTE_GPU` | GPU 贴图合成开关（默认开：SDL_RenderGeometry 画离屏画布；=0 回退 CPU 光栅+上传，research/40-emote）。开启且渲染器创建成功时，宿主锁存 `emote_set_default_external_pose(true)`——新加载的 EmotePlayer 跳过 load() 内的整幅 CPU 初始姿态光栅（大 PSB 曾一次性付出 40+ms），首个泵由宿主按几何合成 | src/app/main.cpp、src/core/emote/emote_player.cpp | `OA_EMOTE_GPU=0` |
 | `OA_EMOTE_DEBUG` | emote 层创建/方法/渲染诊断 | src/core/runtime/runtime_media.cpp | `OA_EMOTE_DEBUG=1` |
 | `OA_EMOTE_ATLAS_KEY` | E-mote 图集纹理缓存键（research/132）：默认把 **PSB 身份**（`EmoteFile::uid()`）并入键 `{层画布键, source, uid}`，并在每层下次绘制时销毁属于**另一份 PSB** 的陈旧图集纹理。`=legacy` 回到修复前的"仅按层键"缓存（A/B 对照臂；游戏在同一层 id 下换 `file=` 时 GPU 会用上一份 PSB 的图集按新图的图标矩形采样 ⇒ 立绘"零件错乱"） | src/core/render/renderer.{h,cpp} | `OA_EMOTE_ATLAS_KEY=legacy OA_EMOTE_DEBUG=1 ./openartemis_test a.pfs` |
 | `OA_WAITDBG` | 运行时等待解析/揭示阻塞诊断 | src/core/runtime/runtime.cpp | `OA_WAITDBG=1` |
+| `OA_PERF_PSB` / `OA_PERF_GPU` / `OA_PERF_DUMP` | 无头 emote 性能探针（report-only，非 ctest）：`emote_perf_probe <root.pfs> [psb子串]` 经游戏自身 Lua 桥注入 `e:createEmoteLayer`，播放该 PSB 自己的 idle/表情时间线，测运行时 tick / advance_ms / collect_pose_parts / CPU 光栅 / 加载分解（psb 解析·图集解码·初始姿态）。`OA_PERF_GPU=1` 另建隐藏窗口测全帧路径（泵+合成+场景绘制+present）；`OA_PERF_DUMP=<目录>` 把当前姿态画布落 PPM（像素对比基线用）；`OA_PERF_STEADY`/`OA_PERF_GPU_FRAMES` 调采样帧数 | tests/fpm/emote_perf_probe.cpp | `emote_perf_probe game/root.pfs jsa_6` |
+| `OA_VPROBE_FRAMES` | 无头视频性能探针（report-only，非 ctest）：`video_perf_probe <root.pfs> <视频名子串>` 分级实测 主流解码+YCbCr→RGBA / `_m` 蒙版流解码+alpha 烘焙 / 引擎频道实时循环（decode pool + 驱动节拍，报告达成 fps vs 片源 fps）。mp4/wmv 走 ffmpeg 后端仅测引擎循环。蒙版合成已由驱动线程移入解码池 worker（锁相烘焙；worker 退出交还解码器位，同步回退零追赶），驱动线程每 tick 只剩 memcpy | tests/fpm/video_perf_probe.cpp | `video_perf_probe game/root.pfs sakura` |
 | `OA_DRAINSKIP` | 停驻期标签队列排水诊断（research/119）：排队来源的**点击型等待**扣留队列时打印 `[drainskip] hold kind=… queued=…`（含队首标签样本），队列排水命中暂停时打印 `paused remain=…` | src/core/runtime/runtime.cpp | `OA_DRAINSKIP=1 OA_AUTODRIVE=bt119cg ./openartemis_test a.pfs` |
 | `OA_SAVE_ROOT` | （同 A）部分 tests/fpm 测试运行时也显式设置以隔离存档 | tests/fpm/* | — |
 
