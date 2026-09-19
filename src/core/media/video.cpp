@@ -107,6 +107,11 @@ namespace {
 std::unique_ptr<VideoSource> open_any_source(const std::vector<uint8_t>& bytes);
 } // namespace
 
+void VideoEngine::release_channel_frames(const std::string& key) {
+    frame_staging_.erase(key);
+    revision_staging_.erase(key);
+}
+
 void VideoEngine::cancel_pipe(DecodeState& ds) {
     if (!ds.pipe) return;
     {
@@ -604,6 +609,7 @@ bool VideoEngine::stop_overlay_unlocked() {
             cancel_pipe(it->second);
             decode_.erase(it);
         }
+        release_channel_frames(kOverlayVideoId);
         return true;
     }
     return false;
@@ -665,6 +671,7 @@ bool VideoEngine::stop_layer_unlocked(const std::string& id) {
         cancel_pipe(d->second);
         decode_.erase(d);
     }
+    release_channel_frames(id);
     return true;
 }
 
@@ -702,6 +709,7 @@ size_t VideoEngine::stop_layer_subtree(const std::string& prefix) {
             cancel_pipe(d->second);
             decode_.erase(d);
         }
+        release_channel_frames(id);
         it = state_.video_layers.erase(it);
         ++n;
     }
@@ -726,6 +734,8 @@ void VideoEngine::stop_all_videos() {
     state_.video_layers.clear();
     for (auto& [id, ds] : decode_) cancel_pipe(ds);
     decode_.clear();
+    frame_staging_.clear();
+    revision_staging_.clear();
     // nothing is playing any more — no tail may survive.
     flush_movie_audio_locked(std::string());
 }

@@ -698,7 +698,10 @@ const oa::media::Image* RenderEngine::resolve_image(const std::string& name)
 {
     if (name.empty()) return nullptr;
     const auto it = decoded.find(name);
-    if (it != decoded.end()) return &it->second;
+    if (it != decoded.end()) {
+        decoded_use_[name] = ++cache_stamp_; // LRU refresh
+        return &it->second;
+    }
     std::string resolved = rt_->interpreter().resolve_magic_path(name);
     std::optional<std::vector<uint8_t>> bytes;
     // Extension-less layer files probe the real archive formats:
@@ -719,10 +722,57 @@ const oa::media::Image* RenderEngine::resolve_image(const std::string& name)
     if (!bytes) return nullptr;
     oa::media::Image img;
     if (!oa::media::decode_image(*bytes, img)) return nullptr;
-    decoded[name] = std::move(img);
+    decoded_note(name, std::move(img));
     std::printf("[app] texture: %s (%dx%d)\n", resolved.c_str(), decoded[name].w,
         decoded[name].h);
     return &decoded[name];
+}
+
+/// Insert decoded pixels with cache accounting, then trim the cache to its
+/// byte cap. Eviction destroys the GPU textures mirroring the evicted
+/// pixels (the plain asset texture and every masked composite built from
+/// it) — they re-create on demand if the scene shows them again.
+void RenderEngine::decoded_note(const std::string& name, oa::media::Image&& img) {
+    decoded_bytes_ += img.rgba.size();
+    decoded[name] = std::move(img);
+    decoded_use_[name] = ++cache_stamp_;
+    decoded_evict_if_needed();
+}
+
+void RenderEngine::decoded_evict_if_needed() {
+    static const size_t cap_mb = [] {
+        if (const char* v = std::getenv("OA_DECODED_CACHE_MB")) {
+            const long n = std::atol(v);
+            if (n >= 0) return size_t(n);
+        }
+        return size_t(1024);
+    }();
+    if (cap_mb == 0 || decoded_bytes_ <= cap_mb * 1024ull * 1024ull) return;
+    // least-recently used first (oldest stamp)
+    std::vector<std::pair<uint64_t, std::string>> order;
+    order.reserve(decoded_use_.size());
+    for (const auto& [name, stamp] : decoded_use_)
+        order.emplace_back(stamp, name);
+    std::sort(order.begin(), order.end());
+    for (const auto& [stamp, name] : order) {
+        if (decoded_bytes_ <= cap_mb * 1024ull * 1024ull) break;
+        const auto di = decoded.find(name);
+        if (di == decoded.end()) continue; // composite key already gone
+        decoded_bytes_ -= di->second.rgba.size();
+        decoded.erase(di);
+        // destroy the GPU mirrors: the plain asset texture + masked composites
+        const oa::render::TextureKey base = oa::render::asset_key(name);
+        const std::string masked_prefix = name + '';
+        for (auto it = textures.lower_bound(base); it != textures.end();) {
+            if (it->first.domain != oa::render::TextureKey::Domain::Asset ||
+                (it->first.name != name &&
+                 it->first.name.compare(0, masked_prefix.size(), masked_prefix) != 0))
+                break;
+            if (it->second) backend_->destroy_texture(it->second);
+            it = textures.erase(it);
+        }
+        decoded_use_.erase(name);
+    }
 }
 
 bool RenderEngine::emote_render_parts(const oa::render::TextureKey& key,
@@ -931,6 +981,8 @@ bool RenderEngine::pump_host_frames(bool* emote_presented) {
     // ---- video layer channels + overlay ------------------------------------
     oa::media::VideoEngine& ve = rt_->video();
     const auto vsnap = ve.state();
+    std::set<std::string> live_video;
+    for (const auto& [id, ch] : vsnap.video_layers) live_video.insert(id);
     for (const auto& [id, ch] : vsnap.video_layers) {
         if (!ch.playing || !ch.decoded) continue;
         any = true;
@@ -970,6 +1022,62 @@ bool RenderEngine::pump_host_frames(bool* emote_presented) {
                                         oa::render::DirtyAspect::HostFrame);
             }
         }
+    }
+
+    // ---- evict host-frame surfaces whose owner is gone ---------------------
+    // The runtime erases emote players / video channels when their layer is
+    // deleted, but the GPU surfaces the pump created for them used to stay
+    // in the caches forever: one 1920x1620 canvas + the atlas set per emote
+    // layer, the last 8 MB frame per video channel — accumulating on every
+    // scene exit. A stopped channel whose layer still exists keeps showing
+    // its frozen last frame, so video textures evict only when the scene no
+    // longer has the id either (the overlay keeps its last frame by design).
+    std::set<std::string> live_emote;
+    for (const auto& [id, st] : rt_->emote_layers())
+        if (st.player) live_emote.insert(id);
+    for (auto it = emote_atlases_.begin(); it != emote_atlases_.end();) {
+        if (!live_emote.count(it->first.layer.name)) {
+            if (it->second) backend_->destroy_texture(it->second);
+            it = emote_atlases_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = emote_canvas_.begin(); it != emote_canvas_.end();) {
+        if (!live_emote.count(it->first.name)) {
+            textures.erase(it->first); // same surface registered for the scene
+            if (it->second) backend_->destroy_texture(it->second);
+            it = emote_canvas_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    // Any remaining host-frame texture whose owner is gone is stale too —
+    // notably the EmoteCanvas-domain streaming texture the CPU-upload
+    // fallback creates (it is not registered in emote_canvas_, so the pass
+    // above never sees it).
+    for (auto it = textures.begin(); it != textures.end();) {
+        bool stale = false;
+        if (it->first.domain == oa::render::TextureKey::Domain::VideoFrame)
+            stale = !live_video.count(it->first.name) &&
+                    rt_->scene().find(it->first.name) == nullptr;
+        else if (it->first.domain == oa::render::TextureKey::Domain::EmoteCanvas)
+            stale = !live_emote.count(it->first.name);
+        if (stale) {
+            if (it->second) backend_->destroy_texture(it->second);
+            it = textures.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    // the pump bookkeeping itself: drop entries of ids that no longer exist
+    for (auto it = pump_emote_rev_.begin(); it != pump_emote_rev_.end();) {
+        if (!live_emote.count(it->first)) it = pump_emote_rev_.erase(it);
+        else ++it;
+    }
+    for (auto it = pump_video_rev_.begin(); it != pump_video_rev_.end();) {
+        if (!live_video.count(it->first)) it = pump_video_rev_.erase(it);
+        else ++it;
     }
     return any;
 }
@@ -1127,7 +1235,7 @@ TextureRef RenderEngine::texture_for_masked(const oa::render::Layer& l)
     }
     TextureRef tex = make_texture(out);
     if (!tex) return nullptr;
-    decoded[key] = std::move(out); // cache pixels (hit sampling etc.)
+    decoded_note(key, std::move(out)); // cache pixels (hit sampling etc.)
     textures[masked] = tex;
     return tex;
 }

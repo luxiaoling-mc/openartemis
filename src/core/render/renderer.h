@@ -171,6 +171,12 @@ public:
     /// Last frame revision the pump uploaded for `channel` ("" = the overlay
     /// video; a layer id otherwise). Diagnostics/tests.
     uint64_t host_video_rev(const std::string& channel) const;
+    // Cache counters (memory probes/tests): live GPU textures by cache,
+    // decoded asset pixels and the emote GPU surfaces.
+    size_t host_texture_count() const { return textures.size(); }
+    size_t decoded_count() const { return decoded.size(); }
+    size_t emote_canvas_count() const { return emote_canvas_.size(); }
+    size_t emote_atlas_count() const { return emote_atlases_.size(); }
 
     // lyc [anime] mask composition: out.rgb = file.rgb and
     // out.a = file.a * mask灰度 (the R channel of a grey image) per pixel,
@@ -405,6 +411,17 @@ private:
 	// The scene lives inside GameRuntime; the host
 	// only READS it for rendering and hit dispatch.
 	std::map<std::string, oa::media::Image> decoded;
+	// decoded pixel cache bounds (long sessions: every unique CG/bg/sprite
+	// pixel buffer used to stay for the process lifetime — unbounded RAM
+	// growth on asset-heavy games). Stamp per use; evict least-recently
+	// used entries past a byte cap (OA_DECODED_CACHE_MB, default 1024, 0 =
+	// unbounded), destroying the GPU textures that mirror the evicted
+	// pixels (the plain asset texture + its masked composites).
+	std::map<std::string, uint64_t> decoded_use_;
+	uint64_t cache_stamp_ = 0;
+	size_t decoded_bytes_ = 0;
+	void decoded_note(const std::string& name, oa::media::Image&& img);
+	void decoded_evict_if_needed();
 	// 纹理缓存按 TextureKey 域分桶 —— 资源文件(Asset)与
 	// 宿主供帧(VideoFrame/EmoteCanvas/OverlayFrame)结构性分开,撞名不可能,
 	// 不再需要保留命名空间拼写。

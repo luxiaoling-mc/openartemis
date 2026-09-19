@@ -434,3 +434,10 @@ set_tests_properties(movie_audio_bound PROPERTIES ENVIRONMENT "OA_TEST_HCT_PFS=$
 # Headless video performance probe (report-only, not a ctest).
 add_executable(video_perf_probe video_perf_probe.cpp)
 target_link_libraries(video_perf_probe PRIVATE libopenartemis SDL3::SDL3 PNG::PNG Freetype::Freetype)
+
+# Memory-churn probe (report-only, not a ctest).
+add_executable(mem_churn_probe mem_churn_probe.cpp)
+target_link_libraries(mem_churn_probe PRIVATE libopenartemis SDL3::SDL3 PNG::PNG Freetype::Freetype)
+if(WIN32)
+  target_link_libraries(mem_churn_probe PRIVATE psapi)
+endif()
