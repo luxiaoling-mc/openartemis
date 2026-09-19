@@ -151,6 +151,27 @@ public:
                             const std::vector<oa::emote::EmoteDrawPart>& parts,
                             int w, int h);
 
+    // ------------------------------------------------------------------
+    // Host-frame pump — the media→texture streaming half of the compositor
+    // (the former app-side *_pump_frames, moved beside the textures it
+    // feeds so the domain keys, revision bookkeeping and upload paths live
+    // in one place). Streams every decoded frame that changed since the
+    // last call, BEFORE the host's draw pass:
+    //   * emote layers — GPU geometry compositing for external-pose players
+    //     (the OA_EMOTE_GPU default), or the CPU canvas upload;
+    //   * video layer channels — verbatim for mask-composited channels,
+    //     luma-keyed otherwise (the keyed transform runs straight into the
+    //     locked streaming texture: no intermediate full-frame copy);
+    //   * the overlay video (verbatim).
+    // Returns true while any channel is presenting (the host redraw gate);
+    // `emote_presented` reports a fresh emote pose composited/uploaded this
+    // call. No-op-safe without a backend (uploads report failure).
+    // ------------------------------------------------------------------
+    bool pump_host_frames(bool* emote_presented = nullptr);
+    /// Last frame revision the pump uploaded for `channel` ("" = the overlay
+    /// video; a layer id otherwise). Diagnostics/tests.
+    uint64_t host_video_rev(const std::string& channel) const;
+
     // lyc [anime] mask composition: out.rgb = file.rgb and
     // out.a = file.a * mask灰度 (the R channel of a grey image) per pixel,
     // composited at the texture-provider level. The mask must decode and match
@@ -412,6 +433,18 @@ private:
         }
     };
     std::map<EmoteAtlasKey, TextureRef> emote_atlases_;
+
+    // Host-frame pump bookkeeping: last uploaded revision per emote layer /
+    // video channel (the app-side layer_*_rev maps, moved with the pump).
+    std::map<std::string, uint64_t> pump_emote_rev_;
+    std::map<std::string, uint64_t> pump_video_rev_;
+    uint64_t pump_overlay_rev_ = 0;
+    /// upload_host_frame with the host-side luma-key fused into the texture
+    /// fill (alpha = layer_video_key_alpha(luma) per pixel, RGB verbatim):
+    /// the keyed frame lands in the locked texture without the intermediate
+    /// full-frame copy.
+    bool upload_host_frame_keyed(const oa::render::TextureKey& key, int w, int h,
+                                 const uint8_t* rgba);
     // Transitions: capture texture for the overlay — type-1 crossfade
     // draws it on top of the new scene at opacity 1-progress; type-2 rule
     // dissolve (GLES line) re-uses it as the dissolve source (per-pixel

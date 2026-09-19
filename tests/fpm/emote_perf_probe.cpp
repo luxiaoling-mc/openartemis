@@ -354,22 +354,12 @@ int main(int argc, char** argv) {
                     }
                     const auto t0 = Clock::now();
                     rt.tick(16, in);
-                    // ---- host emote pump (emote_pump_frames core) ----
-                    const bool gpu = true;
-                    for (const auto& [id, st] : rt.emote_layers()) {
-                        if (!st.player) continue;
-                        st.player->set_external_pose(gpu);
-                        const uint64_t rev = st.player->revision();
-                        if (rev == 0 || seen_rev[id] == rev) continue;
-                        std::vector<oa::emote::EmoteDrawPart> parts;
-                        std::string err;
-                        const oa::render::TextureKey tkey =
-                            oa::render::EmoteContent::canvas_key(id);
-                        if (st.player->collect_pose_parts(&parts, &err) &&
-                            re.emote_render_parts(tkey, st.player->file(),
-                                                  parts, st.width, st.height))
-                            seen_rev[id] = rev;
-                    }
+                    // ---- host frame pump: the real core-side pump ----
+                    // (RenderEngine::pump_host_frames — same call the app
+                    // loop makes; the probe's local rev map is no longer the
+                    // delivery mechanism, only the churn replay below uses
+                    // its own bookkeeping.)
+                    re.pump_host_frames(nullptr);
                     if (i >= frames && i % 120 == 0) {
                         // replay the one-shot during churn
                         for (auto& [id, st] : rt.emote_layers()) {

@@ -21,6 +21,12 @@
 #include <thread>
 #include <vector>
 
+#include <SDL3/SDL.h>
+
+#include "core/render/content_role.h"
+#include "core/render/renderer.h"
+#include "core/runtime/runtime.h"
+
 #include "core/fs/physfs_fs.h"
 #include "core/media/decode_pool.h"
 #include "core/media/media_internal.h"
@@ -33,6 +39,10 @@ double ms_since(Clock::time_point t0) {
                       Clock::now() - t0)
                       .count()) /
            1e6;
+}
+int env_int(const char* name, int dflt) {
+    const char* v = std::getenv(name);
+    return v && *v ? std::atoi(v) : dflt;
 }
 std::string find_video(oa::fs::IFileSystem& fs, const std::string& sub) {
     std::vector<std::string> queue = {"image/anime", "movie", "image/anime/"};
@@ -197,6 +207,51 @@ int main(int argc, char** argv) {
                     frames_played / sim_s, authored,
                     frames_played / sim_s >= authored * 0.95 ? "REALTIME_OK"
                                                              : "LAGGING");
+    }
+    // ---- stage 4: windowed pump stage (optional, OA_VPROBE_GPU=1) --------
+    // Hidden window + the real RenderEngine: drives RenderEngine::
+    // pump_host_frames() per real-time tick with the channel live — the
+    // exact core-side pump the app loop calls (video_frame -> fused keyed
+    // upload / verbatim upload -> mark_dirty), against a real backend.
+    if (env_int("OA_VPROBE_GPU", 0)) {
+        const int sw = 1280, sh = 720;
+        if (!SDL_Init(SDL_INIT_VIDEO)) {
+            std::printf("[vprobe] GPU stage: SDL_Init failed: %s\n", SDL_GetError());
+            return 0;
+        }
+        SDL_Window* win = SDL_CreateWindow("oa-vprobe", sw, sh, SDL_WINDOW_HIDDEN);
+        // A real GameRuntime so the pump reads rt->video(): boot headlessly,
+        // attach the renderer, play the channel on the runtime's engine and
+        // let RenderEngine::pump_host_frames stream it (the exact app path).
+        oa::runtime::GameRuntime rt(fs);
+        rt.open_project("windows");
+        oa::render::RenderEngine re(&*fs, &rt);
+        rt.boot_project();
+        if (!win || !re.create_renderer(win, "sdl")) {
+            std::printf("[vprobe] GPU stage: renderer creation failed\n");
+        } else {
+            oa::media::VideoConfig cfg2;
+            cfg2.file = video;
+            cfg2.loop_play = true;
+            rt.video().play_layer("probe", cfg2);
+                int presented = 0;
+            const int ticks = env_int("OA_VPROBE_GPU_TICKS", 625); // 10 s
+            auto next = Clock::now();
+            for (int i = 0; i < ticks; ++i) {
+                next += std::chrono::milliseconds(16);
+                rt.tick(16, oa::runtime::FrameInput{});
+                if (re.pump_host_frames(nullptr)) ++presented;
+                std::this_thread::sleep_until(next);
+            }
+            const uint64_t uprev = re.host_video_rev("probe");
+            std::printf("[vprobe] windowed pump: uploaded %d/%d ticks "
+                        "(rev=%llu, ~%.1f fps) %s\n",
+                        presented, ticks, (unsigned long long)uprev,
+                        double(presented) / (double(ticks) * 16.0 / 1000.0),
+                        uprev > 0 ? "OK" : "NO_UPLOAD");
+        }
+        if (win) SDL_DestroyWindow(win);
+        SDL_Quit();
     }
     return 0;
 }

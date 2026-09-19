@@ -140,10 +140,10 @@ struct AppState
     bool video_demo_finished = false;
     bool video_demo_print_first = false;
 #endif
-    uint64_t fs_video_rev = 0;                    // last uploaded fullscreen rev
-    std::map<std::string, uint64_t> layer_video_rev; // layer id -> uploaded rev
-    // emote static frames (layer id -> uploaded revision).
-    std::map<std::string, uint64_t> layer_emote_rev;
+    // fullscreen video: headless demo runs track the raw engine rev here;
+    // windowed runs read the pump-uploaded rev via
+    // RenderEngine::host_video_rev("").
+    uint64_t fs_video_rev = 0;
 
 #if OA_TEST_BUILD
     // ---- auto-drive (OA_AUTODRIVE=exit|title|help|conf) -------------------

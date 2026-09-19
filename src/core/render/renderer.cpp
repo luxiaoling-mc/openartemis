@@ -2,6 +2,8 @@
 #include "core/render/backend_gles.h"
 #include "core/render/backend_sdl.h"
 #include "core/emote/emote_file.h"
+#include "core/emote/emote_player.h"
+#include "core/media/video.h" // rgba_luma / layer_video_key_alpha (keyed upload)
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -830,6 +832,152 @@ bool RenderEngine::emote_render_parts(const oa::render::TextureKey& key,
     }
     backend_->set_target(prev_target);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Host-frame pump (see renderer.h). The former app-side emote/video pump
+// pair: one pass over the runtime's media state that streams every fresh
+// frame into the textures the scene draw resolves. Order preserved from the
+// app loop (emote first, then video) so the redraw gate sees the same
+// per-frame flags.
+// ---------------------------------------------------------------------------
+
+/// upload_host_frame with the luma-key transform fused into the texture
+/// fill: alpha = layer_video_key_alpha(luma) per pixel, RGB verbatim — the
+/// same bytes key_overlay_frame produced, without the intermediate
+/// full-frame copy (one 8.3 MB pass saved per keyed 1080p frame).
+bool RenderEngine::upload_host_frame_keyed(const oa::render::TextureKey& key,
+                                           int w, int h, const uint8_t* rgba) {
+    if (!backend_ || key.empty() || w <= 0 || h <= 0 || !rgba) return false;
+    // mode switch back to CPU uploads: drop any GPU canvas / stale texture
+    // under this key first (same lifecycle as upload_host_frame).
+    const auto cc = emote_canvas_.find(key);
+    if (cc != emote_canvas_.end()) {
+        textures.erase(key);
+        backend_->destroy_texture(cc->second);
+        emote_canvas_.erase(cc);
+    }
+    const auto it = textures.find(key);
+    if (it != textures.end()) {
+        backend_->destroy_texture(it->second);
+        textures.erase(it);
+    }
+    TextureRef tex = backend_->create_texture(w, h, TextureAccess::Streaming);
+    if (!tex) return false;
+    backend_->set_texture_blend(tex, BlendMode::Blend);
+    textures[key] = tex;
+    uint8_t* px = nullptr;
+    int pitch = 0;
+    if (!backend_->lock_texture(tex, &px, &pitch)) return false;
+    for (int y = 0; y < h; ++y) {
+        uint8_t* row = px + size_t(y) * size_t(pitch);
+        const uint8_t* src = rgba + size_t(y) * size_t(w) * 4;
+        for (int x = 0; x < w; ++x) {
+            const uint8_t* p = src + size_t(x) * 4;
+            uint8_t* d = row + size_t(x) * 4;
+            d[0] = p[0];
+            d[1] = p[1];
+            d[2] = p[2];
+            d[3] = oa::media::layer_video_key_alpha(oa::media::rgba_luma(p));
+        }
+    }
+    backend_->unlock_texture(tex);
+    return true;
+}
+
+bool RenderEngine::pump_host_frames(bool* emote_presented) {
+    if (emote_presented) *emote_presented = false;
+    if (!rt_) return false;
+    bool any = false;
+
+    // ---- emote layers ------------------------------------------------------
+    // GPU compositing by default when a renderer exists (the host latched
+    // emote_default_external_pose at startup); OA_EMOTE_GPU=0 restores the
+    // CPU canvas upload. In GPU mode the players skip their own CPU raster
+    // (external-pose mode) so pose updates stay cheap.
+    const bool gpu = oa::emote::emote_default_external_pose() && renderer_ok();
+    for (const auto& [id, st] : rt_->emote_layers()) {
+        if (!st.player) continue;
+        st.player->set_external_pose(gpu);
+        if (st.revision == 0 || pump_emote_rev_[id] == st.revision) continue;
+        // 读取域键 = 角色实例决定(emote 画布域,名 = 层 id;与场景侧
+        // content_role_of(layer).texture_key 同源单点)。
+        const oa::render::TextureKey tkey = oa::render::EmoteContent::canvas_key(id);
+        bool presented = false;
+        if (gpu) {
+            std::vector<oa::emote::EmoteDrawPart> parts;
+            std::string err;
+            if (st.player->collect_pose_parts(&parts, &err) &&
+                emote_render_parts(tkey, st.player->file(), parts, st.width,
+                                   st.height)) {
+                presented = true;
+            }
+        }
+        if (!presented) {
+            const auto& rgba = st.player->rgba();
+            if (upload_host_frame(tkey, st.width, st.height, rgba.data()))
+                presented = true;
+        }
+        if (presented) {
+            pump_emote_rev_[id] = st.revision;
+            // layer-model 簿记: 实际上传/GPU 合成 = HostFrame 内容写
+            // （与 video 帧同款；redraw 门由返回值消费）。
+            rt_->scene().mark_dirty(id, oa::render::DirtyAspect::HostFrame);
+            if (emote_presented) *emote_presented = true;
+            any = true;
+        }
+    }
+
+    // ---- video layer channels + overlay ------------------------------------
+    oa::media::VideoEngine& ve = rt_->video();
+    const auto vsnap = ve.state();
+    for (const auto& [id, ch] : vsnap.video_layers) {
+        if (!ch.playing || !ch.decoded) continue;
+        any = true;
+        const uint64_t rev = ve.frame_revision(id);
+        if (rev == 0 || pump_video_rev_[id] == rev) continue;
+        int w = 0, h = 0;
+        const uint8_t* rgba = nullptr;
+        // A channel with an auto-detected `_m` mask partner (ch.mask_on)
+        // already carries the engine-level composite alpha (luma-key of the
+        // main picture x mask gray), so its frames upload verbatim;
+        // unmasked channels get the fused luma-key fill.
+        bool ok = ve.video_frame(id, &w, &h, &rgba, nullptr);
+        if (ok) {
+            const oa::render::TextureKey tkey = oa::render::VideoContent::frame_key(id);
+            ok = ch.mask_on ? upload_host_frame(tkey, w, h, rgba)
+                            : upload_host_frame_keyed(tkey, w, h, rgba);
+        }
+        if (ok) {
+            pump_video_rev_[id] = rev;
+            // layer-model 簿记: 实际上传 = HostFrame 内容写(见泵写面)。
+            rt_->scene().mark_dirty(id, oa::render::DirtyAspect::HostFrame);
+        }
+    }
+    // overlay video (host-drawn surface, uploaded verbatim).
+    if (ve.is_overlay_playing()) {
+        any = true;
+        const uint64_t rev = ve.frame_revision("");
+        if (rev != pump_overlay_rev_) {
+            int w = 0, h = 0;
+            const uint8_t* rgba = nullptr;
+            if (ve.video_frame("", &w, &h, &rgba, nullptr) &&
+                upload_host_frame(oa::render::OverlayContent::frame_key(), w, h,
+                                  rgba)) {
+                pump_overlay_rev_ = rev;
+                // layer-model 簿记: overlay 上传 = HostFrame 写
+                rt_->scene().mark_dirty(oa::render::kOverlayNodeId,
+                                        oa::render::DirtyAspect::HostFrame);
+            }
+        }
+    }
+    return any;
+}
+
+uint64_t RenderEngine::host_video_rev(const std::string& channel) const {
+    if (channel.empty()) return pump_overlay_rev_;
+    const auto it = pump_video_rev_.find(channel);
+    return it == pump_video_rev_.end() ? 0 : it->second;
 }
 
 TextureRef RenderEngine::texture_for_asset(const std::string& name)

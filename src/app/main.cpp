@@ -272,174 +272,12 @@ static void print_status(AppState* state) {
 // the live frame through the normal texture lookup).
 // ---------------------------------------------------------------------------
 
-#if OA_TEST_BUILD
-static uint64_t video_rgba_checksum(const uint8_t* rgba, size_t bytes) {
-    uint64_t c = 1469598103934665603ull;
-    for (size_t i = 0; i < bytes; i += 4093) {
-        c = (c ^ rgba[i]) * 1099511628211ull;
-    }
-    return c;
-}
-#endif
-
-/// Upload every decoded frame that changed since the last pump. Returns true
-/// while any video channel is showing decoded frames (forces per-frame
-/// redraws — video is not a static frame).
-/// Upload every stored emote static frame once per revision (the emote
-/// engine stores the rendered figure; hosts stream it to the GPU like the
-/// video layer frames). Returns true after uploading (forces a redraw).
-
 // GPU compositing is the default when a renderer exists; OA_EMOTE_GPU=0
-// restores the CPU pixel-fill + upload path (see emote_pump_frames).
+// restores the CPU pixel-fill + upload path (latched at renderer creation
+// and consumed by RenderEngine::pump_host_frames).
 static bool emote_gpu_mode() {
     return std::getenv("OA_EMOTE_GPU") == nullptr ||
            std::getenv("OA_EMOTE_GPU")[0] != '0';
-}
-
-static bool emote_pump_frames(AppState* state) {
-    oa::runtime::GameRuntime* rt = state->rt.get();
-    if (!rt) return false;
-    // GPU compositing by default when a renderer exists —
-    // the pose geometry (CPU mesh subdivision only) is rasterised into the
-    // layer canvas with SDL_RenderGeometry; OA_EMOTE_GPU=0 restores the CPU
-    // pixel fill + upload path. In GPU mode the players skip their own CPU
-    // raster (external-pose mode) so pose updates stay cheap.
-    static const bool gpu = emote_gpu_mode();
-    bool any = false;
-    for (const auto& [id, st] : rt->emote_layers()) {
-        if (!st.player) continue;
-        st.player->set_external_pose(gpu);
-        if (st.revision == 0 || state->layer_emote_rev[id] == st.revision) continue;
-        // 读取域键 = 角色实例决定(emote 画布域,名 = 层 id;与场景侧
-        // content_role_of(layer).texture_key 同源单点)。
-        const oa::render::TextureKey tkey = oa::render::EmoteContent::canvas_key(id);
-        bool presented = false;
-        if (gpu && state->oaRender->renderer_ok()) {
-            std::vector<oa::emote::EmoteDrawPart> parts;
-            std::string err;
-            if (st.player->collect_pose_parts(&parts, &err) &&
-                state->oaRender->emote_render_parts(tkey, st.player->file(), parts,
-                                                    st.width, st.height)) {
-                presented = true;
-                if (std::getenv("OA_EMOTE_DEBUG"))
-                    std::fprintf(stderr, "[emote] host gpu-composited layer '%s' "
-                                         "%dx%d parts=%zu\n",
-                                 id.c_str(), st.width, st.height, parts.size());
-            }
-        }
-        if (!presented) {
-            const auto& rgba = st.player->rgba();
-            if (state->oaRender->upload_host_frame(tkey, st.width, st.height,
-                                                   rgba.data())) {
-                presented = true;
-                if (std::getenv("OA_EMOTE_DEBUG"))
-                    std::fprintf(stderr, "[emote] host uploaded layer '%s' %dx%d\n",
-                                 id.c_str(), st.width, st.height);
-            }
-        }
-        if (presented) {
-            state->layer_emote_rev[id] = st.revision;
-            // layer-model 簿记: 实际上传/GPU 合成 = HostFrame 内容写
-            // （与 video 帧同款；redraw 门由调用方用返回的 any 消费）。
-            state->rt->scene().mark_dirty(id, oa::render::DirtyAspect::HostFrame);
-            any = true;
-        }
-    }
-    return any;
-}
-
-// Artemis layer (overlay) movies are effect strips drawn over
-// the composed scene — snll's title petal layer (500.z.mv, sakura.ogv) is a
-// white-petals-on-black canvas (98.9% of pixels luma<8, ~1% near-white) that
-// must composite with black -> transparent, otherwise the opaque canvas
-// blacks out the whole title underneath (the layer sits on top by design:
-// the 500.z zone follows the system zzlogo/zzamask overlay convention). The
-// keyed copy is uploaded under the layer's VideoFrame domain key.
-// The key alpha map was retuned (oa::media::layer_video_key_alpha, shared with
-// the runtime bind gate): canvas blacks (luma<=16) stay transparent but the
-// mid-grey content of in-story weather strips (btjy snow03.ogv flakes live
-// at luma ~16..190) now draws as authored — the old 32..224 ramp attenuated
-// every mid-tone strip to near-zero alpha and the story-start snowfall was
-// invisible. Bright strips (white petals / noise / flashes) are unchanged.
-static void key_overlay_frame(const uint8_t* rgba, int w, int h,
-                              std::vector<uint8_t>& out) {
-    const size_t n = size_t(w) * size_t(h);
-    out.resize(n * 4);
-    for (size_t i = 0; i < n; ++i) {
-        const uint8_t lum = oa::media::rgba_luma(&rgba[i * 4]);
-        out[i * 4 + 0] = rgba[i * 4 + 0];
-        out[i * 4 + 1] = rgba[i * 4 + 1];
-        out[i * 4 + 2] = rgba[i * 4 + 2];
-        out[i * 4 + 3] = oa::media::layer_video_key_alpha(lum);
-    }
-}
-
-static bool upload_layer_video_frame(AppState* state, const std::string& id,
-                                     int w, int h, const uint8_t* rgba,
-                                     bool key) {
-    // This path only ever serves LAYER videos. A channel with
-    // an auto-detected `_m` mask partner (ch.mask_on) already carries the
-    // engine-level composite alpha (luma-key of the main picture x mask
-    // gray), so its frames upload verbatim; unmasked channels get the
-    // host-side luma-key copy (overlay frames take the raw branch in
-    // video_pump_frames).
-    // 读取域键 = 角色实例决定(视频帧域,名 = 通道 id = 层 id;与场景侧
-    // content_role_of(layer).texture_key 同源单点)。
-    const oa::render::TextureKey tkey = oa::render::VideoContent::frame_key(id);
-    if (!key) return state->oaRender->upload_host_frame(tkey, w, h, rgba);
-    static thread_local std::vector<uint8_t> keyed;
-    key_overlay_frame(rgba, w, h, keyed);
-    return state->oaRender->upload_host_frame(tkey, w, h, keyed.data());
-}
-
-static bool video_pump_frames(AppState* state) {
-    oa::runtime::GameRuntime* rt = state->rt.get();
-    oa::media::VideoEngine& ve = rt->video();
-    bool active = false;
-    // Layer videos: upload new frames under each layer's VideoFrame key.
-    const auto vsnap = ve.state();
-    for (const auto& [id, ch] : vsnap.video_layers) {
-        if (!ch.playing || !ch.decoded) continue;
-        active = true;
-        const uint64_t rev = ve.frame_revision(id);
-        if (rev == 0 || rev == state->layer_video_rev[id]) continue;
-        int w = 0, h = 0;
-        const uint8_t* rgba = nullptr;
-        if (ve.video_frame(id, &w, &h, &rgba, nullptr) &&
-            upload_layer_video_frame(state, id, w, h, rgba, !ch.mask_on)) {
-            state->layer_video_rev[id] = rev;
-            // layer-model 簿记: 实际上传 = HostFrame 内容写(与现状
-            // video_active 帧项同帧,见泵写面)
-            state->rt->scene().mark_dirty(id, oa::render::DirtyAspect::HostFrame);
-        }
-    }
-    // overlay video (host-drawn surface).
-    if (ve.is_overlay_playing()) {
-        active = true;
-        const uint64_t rev = ve.frame_revision("");
-        if (rev != state->fs_video_rev) {
-            int w = 0, h = 0;
-            const uint8_t* rgba = nullptr;
-            if (ve.video_frame("", &w, &h, &rgba, nullptr) &&
-                state->oaRender->upload_host_frame(
-                    oa::render::OverlayContent::frame_key(), w, h, rgba)) {
-                state->fs_video_rev = rev;
-                // layer-model 簿记: overlay 上传 = HostFrame 写
-                state->rt->scene().mark_dirty(oa::render::kOverlayNodeId,
-                                              oa::render::DirtyAspect::HostFrame);
-#if OA_TEST_BUILD
-                if (!state->video_demo_print_first || rev % 25 == 0 || rev == 1) {
-                    state->video_demo_print_first = true;
-                    std::printf("[video] frame rev=%llu %dx%d cksum=%016llx\n",
-                        (unsigned long long)rev, w, h,
-                        (unsigned long long)video_rgba_checksum(rgba,
-                            size_t(w) * size_t(h) * 4));
-                }
-#endif
-            }
-        }
-    }
-    return active;
 }
 
 #if OA_TEST_BUILD
@@ -472,10 +310,15 @@ static void video_demo_end(AppState* state, bool* quit) {
         state->frames <= state->video_demo_start_frame + 5)
         return;
     state->video_demo_finished = true;
+    // decoded revisions: headless tracks the raw engine rev (fs_video_rev);
+    // windowed the pump-uploaded rev lives in the renderer's bookkeeping.
+    const uint64_t decoded_revs =
+        state->fs_video_rev > state->oaRender->host_video_rev("")
+            ? state->fs_video_rev
+            : state->oaRender->host_video_rev("");
     std::printf("[video] demo EOF f=%llu decoded_revs=%llu\n",
-        (unsigned long long)state->frames,
-        (unsigned long long)state->fs_video_rev);
-    if (state->fs_video_rev == 0)
+        (unsigned long long)state->frames, (unsigned long long)decoded_revs);
+    if (decoded_revs == 0)
         std::fprintf(stderr, "[video] demo FAILED: no decoded frame appeared\n");
     *quit = true;
 }
@@ -1506,14 +1349,14 @@ SDL_AppResult SDL_AppIterate(void* appstate)
     if (state->rt->exit_requested()) state->quit = true;
     const std::vector<oa::runtime::Event> drained_events = state->rt->drain_events();
     for (const auto& e : drained_events) state->oaRender->process_event(e);
-    // upload newly decoded video frames (before the draw pass so bound
-    // layer textures resolve; forces redraws while a channel is active).
-    // static emote textures before the draw pass. A fresh emote pose revision
-    // must force a repaint exactly like a video frame does: otherwise the
-    // static-frame skip freezes a parked portrait (no text reveal / tween /
-    // transition) even though the player keeps breathing underneath.
-    const bool emote_active = emote_pump_frames(state);
-    const bool video_active = video_pump_frames(state);
+    // stream every fresh media frame into the renderer's textures (video
+    // channels + emote layers; before the draw pass so bound layer textures
+    // resolve). A fresh emote pose revision must force a repaint exactly
+    // like a video frame does: otherwise the static-frame skip freezes a
+    // parked portrait (no text reveal / tween / transition) even though the
+    // player keeps breathing underneath.
+    bool emote_active = false;
+    const bool video_active = state->oaRender->pump_host_frames(&emote_active);
 #if OA_TEST_BUILD
     // OA_STATE_LOG=1: fine-grained headless-style state heartbeat (every 120
     // frames) for external drivers (Xvfb UX journeys): wait kind, layer count
