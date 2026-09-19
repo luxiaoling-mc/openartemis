@@ -63,7 +63,8 @@ struct RgbaF {
 
 /// 引擎实际使用的混合语义子集（layermode: add/additive、screen≈blend、
 /// multiply→mod；其余一律 blend；NONE 仅离屏清屏用）。
-enum class BlendMode { None, Blend, Add, Mod };
+enum class BlendMode { None, Blend, Add, Mod,
+                       AlphaMultiply }; // dstA *= srcA, dstRGB kept (stencil mask)
 
 /// 纹理创建方式（与引擎三种用法一一对应：静态贴图/流式逐帧刷新/离屏
 /// target）。

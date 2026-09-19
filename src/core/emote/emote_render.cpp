@@ -142,6 +142,7 @@ const S2Env& s2_env() {
 std::atomic<int> g_s2_anglewrap{-1}, g_s2_tailfallback{-1}, g_s2_paramoob{-1},
     g_s2_nonfinite{-1};
 
+
 int clamp_mesh_div(int d) { return std::clamp(d, kEmoteMeshDivMin, kEmoteMeshDivMax); }
 
 // adaptive rule, kept verbatim as one arm of the hybrid fallback / the A-B arm
@@ -301,11 +302,40 @@ struct DrawEntry {
     // from exactly this node (E:emoterunner.cpp:853-854), <2 -> 8.
     int authoredMeshDivision = 0;
     int type12Depth = 0; // number of type-12 stencil nodes above this entry
+    // Stencil composite (type 12) tagging. stencil_group = the innermost
+    // stencil whose subtree this entry draws under (its alpha is masked by
+    // the group's mask shapes); mask_for_group = the stencil group this
+    // entry's shape masks (the entry itself still draws normally — the
+    // eye-white is both visible content and the pupil's stencil).
+    int stencil_group = -1;
+    int mask_for_group = -1;
+    int mask_scope_depth = -1; // transient: deepest matching scope depth
     // transient index into emote_collect_parts' per-entry
     // grid slices; it survives the z sort so the geometry pass can look up the
     // grid points the bounds pass already evaluated.
     int slot = -1;
     std::vector<std::string> debugPath;
+};
+
+/// One type-12 stencil-composite node seen during evaluation. `labels` are
+/// the stencilCompositeMaskLayerList node labels; `scope` is the stencil's
+/// PARENT node index within `motion` — mask labels resolve among draw
+/// entries whose node chain contains that scope (the ancestor rule binds
+/// each 目L/目R stencil to the 'shirome' node of its own eye branch).
+struct StencilFrame {
+    const void* motion = nullptr; // EmoteMotion identity
+    int node = -1;
+};
+struct StencilGroup {
+    std::vector<std::string> labels;
+    // the stencil's ancestor chain including its parent node — a draw entry
+    // belongs to this group's mask when its own chain has this chain as a
+    // prefix (binds each eye's 'shirome' to its own 目L/目R branch and lets
+    // mask references cross sub-motion boundaries)
+    std::vector<StencilFrame> scope_chain;
+    const void* owner_motion = nullptr; // the stencil node itself
+    int owner_node = -1;
+    mutable bool mask_built = false; // CPU raster: mask bitmap ready
 };
 
 struct EvalCtx {
@@ -314,6 +344,7 @@ struct EvalCtx {
     std::vector<DrawEntry>* out = nullptr;
     std::string* err = nullptr;
     bool debug = false;
+    std::vector<StencilGroup> stencil_groups;
     // policy snapshot for this evaluation (read once).
     EmoteS2Policy s2;
     // the eval-time content bounds are only consumed by
@@ -729,7 +760,16 @@ void map_entry_uv(const EntryMap& m, double u, double v, double* x, double* y) {
 
 void eval_motion(EvalCtx& ctx, const EmoteMotion& motion, double tick,
                  const std::vector<Level>& levels, double opaMul, int depth,
-                 int type12Depth, std::vector<std::string>& path);
+                 int type12Depth, std::vector<std::string>& path,
+                 std::vector<StencilFrame>& chain, int stencil_group);
+
+/// Pre-scan a motion tree for type-12 stencil nodes, recording one group
+/// per node (mask labels + the stencil's ancestor chain). Runs before the
+/// main walk so a mask node drawn BEFORE its stencil (the eye-white
+/// precedes the eye stencil in tree order) can still be tagged as that
+/// stencil's mask.
+void scan_stencil_groups(EvalCtx& ctx, const EmoteMotion& motion,
+                         int nodeIdx, std::vector<StencilFrame> chain);
 
 /// the cell count one entry's mesh is built with — the
 /// node-authorised value under the active policy (see emote_file.h).
@@ -739,14 +779,59 @@ static int entry_mesh_div(const DrawEntry& en) {
                                          en.icon ? en.icon->height : 0.0);
 }
 
+void scan_stencil_groups(EvalCtx& ctx, const EmoteMotion& motion,
+                         int nodeIdx, std::vector<StencilFrame> chain) {
+    if (nodeIdx < 0 || nodeIdx >= int(motion.nodes.size())) return;
+    const EmoteNode& node = motion.nodes[nodeIdx];
+    if (node.removed) return;
+    if (node.isMaskNode && !node.stencil_mask_layers.empty()) {
+        StencilGroup g;
+        g.labels = node.stencil_mask_layers;
+        // scope = the stencil's ancestor chain (the chain here EXCLUDES the
+        // stencil itself): the mask shapes are drawn in sibling branches of
+        // that chain (eye-white under mabuta), so a mask node matches when
+        // its own chain extends this scope chain
+        g.scope_chain = chain;
+        g.owner_motion = (const void*)&motion;
+        g.owner_node = nodeIdx;
+        ctx.stencil_groups.push_back(std::move(g));
+    }
+    chain.push_back({(const void*)&motion, nodeIdx});
+    for (int ch : node.children)
+        scan_stencil_groups(ctx, motion, ch, chain);
+    // stencil/mask pairs across a sub-motion reference: scan the referenced
+    // motion too (the ancestor chain continues through the dive)
+    for (const auto& f : node.frames) {
+        if (!f.isSubMotion) continue;
+        const int midx = ctx.file.find_motion(f.subObject, f.subMotion);
+        if (midx >= 0 && !ctx.file.motions[midx].nodes.empty())
+            for (int root : ctx.file.motions[midx].layer)
+                scan_stencil_groups(ctx, ctx.file.motions[midx], root, chain);
+    }
+}
+
 void eval_node(EvalCtx& ctx, const EmoteMotion& motion, int nodeIdx, double incomingTick,
                const std::vector<Level>& levels, double opaMul, int depth,
-               int type12Depth, std::vector<std::string>& path) {
+               int type12Depth, std::vector<std::string>& path,
+               std::vector<StencilFrame>& chain, int stencil_group) {
     if (depth > 96) return;
     if (nodeIdx < 0 || nodeIdx >= int(motion.nodes.size())) return;
     const EmoteNode& node = motion.nodes[nodeIdx];
     if (node.removed || node.frames.empty()) return;
     path.push_back(node.label);
+    chain.push_back({(const void*)&motion, nodeIdx});
+    const int group_in = stencil_group;
+    if (node.isMaskNode && !node.stencil_mask_layers.empty()) {
+        // a stencil node: its subtree's draws clip against the mask labels.
+        // The pre-scan recorded the group under this exact stencil node.
+        for (const auto& g : ctx.stencil_groups) {
+            if (g.owner_motion == (const void*)&motion &&
+                g.owner_node == nodeIdx) {
+                stencil_group = int(&g - ctx.stencil_groups.data());
+                break;
+            }
+        }
+    }
 
     // --- tick & frame selection --------------------------------------------
     // the reference's getTickByIdx returns -1 for
@@ -759,8 +844,10 @@ void eval_node(EvalCtx& ctx, const EmoteMotion& motion, int nodeIdx, double inco
     if (paramOob && ctx.s2.paramOobSkip) {
         for (int ch : node.children)
             eval_node(ctx, motion, ch, incomingTick, levels, opaMul, depth + 1,
-                      type12Depth + (node.type == 12 ? 1 : 0), path);
+                      type12Depth + (node.type == 12 ? 1 : 0), path, chain,
+                      stencil_group);
         path.pop_back();
+        chain.pop_back();
         return;
     }
     const double tick = node_tick(motion, node, incomingTick, ctx);
@@ -775,8 +862,10 @@ void eval_node(EvalCtx& ctx, const EmoteMotion& motion, int nodeIdx, double inco
     if (!hasContent) {
         for (int ch : node.children)
             eval_node(ctx, motion, ch, incomingTick, levels, opaMul, depth + 1,
-                      type12Depth + (node.type == 12 ? 1 : 0), path);
+                      type12Depth + (node.type == 12 ? 1 : 0), path, chain,
+                      stencil_group);
         path.pop_back();
+        chain.pop_back();
         return;
     }
 
@@ -843,12 +932,15 @@ void eval_node(EvalCtx& ctx, const EmoteMotion& motion, int nodeIdx, double inco
             if (lv.any) childLevels.push_back(lv);
             const double subTick = incomingTick + fv.timeOffset;
             eval_motion(ctx, ctx.file.motions[midx], subTick, childLevels, opaMul, depth + 1,
-                        type12Depth + (node.type == 12 ? 1 : 0), path);
+                        type12Depth + (node.type == 12 ? 1 : 0), path, chain,
+                        stencil_group);
         }
         for (int ch : node.children)
             eval_node(ctx, motion, ch, incomingTick, levels, opaMul, depth + 1,
-                      type12Depth + (node.type == 12 ? 1 : 0), path);
+                      type12Depth + (node.type == 12 ? 1 : 0), path, chain,
+                      stencil_group);
         path.pop_back();
+        chain.pop_back();
         return;
     }
     // source icon (resolved above for the non-finite `lim`)
@@ -898,6 +990,31 @@ void eval_node(EvalCtx& ctx, const EmoteMotion& motion, int nodeIdx, double inco
         // itself sits in the chain.
         en.authoredMeshDivision = node.meshDivision;
         en.type12Depth = type12Depth + (node.type == 12 ? 1 : 0);
+        en.stencil_group = stencil_group;
+        // mask-shape tagging: this node's label appears in a stencil group's
+        // mask list whose scope (the stencil's parent) is an ancestor of —
+        // or is — the current node. Deepest scope wins (binds each eye's
+        // 'shirome' to its own 目L/目R stencil).
+        for (int gi = 0; gi < int(ctx.stencil_groups.size()); ++gi) {
+            const StencilGroup& g = ctx.stencil_groups[gi];
+            if (g.scope_chain.size() > chain.size()) continue;
+            bool prefix = true;
+            for (size_t ci = 0; ci < g.scope_chain.size(); ++ci) {
+                if (g.scope_chain[ci].motion != chain[ci].motion ||
+                    g.scope_chain[ci].node != chain[ci].node) {
+                    prefix = false;
+                    break;
+                }
+            }
+            if (!prefix) continue;
+            if (std::find(g.labels.begin(), g.labels.end(), node.label) ==
+                g.labels.end())
+                continue;
+            if (int(g.scope_chain.size()) > en.mask_scope_depth) {
+                en.mask_scope_depth = int(g.scope_chain.size());
+                en.mask_for_group = gi; // deepest scope wins (L/R eyes)
+            }
+        }
         if (ctx.debug || emote_mesh_debug()) {
             en.debugPath = path;
             if (node.type == 12 && !en.debugPath.empty()) en.debugPath.back() += "#12";
@@ -966,8 +1083,10 @@ void eval_node(EvalCtx& ctx, const EmoteMotion& motion, int nodeIdx, double inco
         // walk them without adding an icon level.
         for (int ch : node.children)
             eval_node(ctx, motion, ch, incomingTick, levels, opaMul, depth + 1,
-                      type12Depth + (node.type == 12 ? 1 : 0), path);
+                      type12Depth + (node.type == 12 ? 1 : 0), path, chain,
+                      stencil_group);
         path.pop_back();
+        chain.pop_back();
         return;
     }
 
@@ -979,20 +1098,29 @@ void eval_node(EvalCtx& ctx, const EmoteMotion& motion, int nodeIdx, double inco
         childLevels.push_back(lv);
         for (int ch : node.children)
             eval_node(ctx, motion, ch, incomingTick, childLevels, nodeOpa, depth + 1,
-                      type12Depth + (node.type == 12 ? 1 : 0), path);
+                      type12Depth + (node.type == 12 ? 1 : 0), path, chain,
+                      stencil_group);
     } else {
         for (int ch : node.children)
             eval_node(ctx, motion, ch, incomingTick, levels, nodeOpa, depth + 1,
-                      type12Depth + (node.type == 12 ? 1 : 0), path);
+                      type12Depth + (node.type == 12 ? 1 : 0), path, chain,
+                      stencil_group);
     }
     path.pop_back();
+    chain.pop_back();
 }
 
 void eval_motion(EvalCtx& ctx, const EmoteMotion& motion, double tick,
                  const std::vector<Level>& levels, double opaMul, int depth,
-                 int type12Depth, std::vector<std::string>& path) {
+                 int type12Depth, std::vector<std::string>& path,
+                 std::vector<StencilFrame>& chain, int stencil_group) {
+    // a sub-motion dive starts a fresh node-index space but the ancestor
+    // CHAIN continues (mask references cross sub-motion boundaries) and
+    // the enclosing stencil group is kept: the eye stencil's content
+    // lives under a UD sub-motion inside the stencil subtree
     for (int root : motion.layer)
-        eval_node(ctx, motion, root, tick, levels, opaMul, depth, type12Depth, path);
+        eval_node(ctx, motion, root, tick, levels, opaMul, depth,
+                  type12Depth, path, chain, stencil_group);
 }
 
 // ---------------------------------------------------------------------------
@@ -1103,7 +1231,9 @@ struct RasterPool {
     std::condition_variable cv, done_cv;
     const std::function<void(int)>* job = nullptr;
     uint64_t gen = 0;
-    int pending = 0;
+    int done_count = 0;   // workers finished for the current generation
+    int expected = 0;     // workers expected to finish that generation
+    bool done = false;
     std::vector<std::thread> th;
 
     explicit RasterPool(int threads) : n(threads > 1 ? threads : 1) {
@@ -1124,12 +1254,14 @@ struct RasterPool {
             std::lock_guard<std::mutex> g(m);
             job = &j;
             ++gen;
-            pending = bands - 1; // band 0 runs on the calling thread
+            expected = bands - 1; // band 0 runs on the calling thread
+            done_count = 0;
+            done = false;
         }
         cv.notify_all();
         j(0);
         std::unique_lock<std::mutex> g(m);
-        done_cv.wait(g, [this] { return pending == 0; });
+        done_cv.wait(g, [this] { return done; });
         job = nullptr;
     }
     void worker(int idx) {
@@ -1138,17 +1270,31 @@ struct RasterPool {
             std::unique_lock<std::mutex> g(m);
             cv.wait(g, [&] { return (job && gen != seen); });
             seen = gen;
+            const int my_gen = int(gen);
             const std::function<void(int)>* j = job;
+            const int my_expected = expected;
             g.unlock();
             (*j)(idx);
             g.lock();
-            if (--pending == 0) done_cv.notify_one();
+            // only the completion of the CURRENT generation counts
+            if (int(gen) == my_gen) {
+                if (++done_count == my_expected) {
+                    done = true;
+                    done_cv.notify_one();
+                }
+            }
         }
     }
 };
 
+// mask_in (when non-null): a canvasW*canvasH alpha map multiplying this
+// entry's coverage (the stencil composite: content only where the mask
+// shape covers). mask_out (when non-null): the entry paints its coverage
+// ALPHA only into this 1-byte map (max-blended union — the mask shapes'
+// own rasterization); color sampling is skipped.
 static void paint_entry(const DrawEntry& en, const Mat& fit, int canvasW, int canvasH,
-                        std::vector<uint8_t>* canvas) {
+                        std::vector<uint8_t>* canvas, const uint8_t* mask_in = nullptr,
+                        uint8_t* mask_out = nullptr) {
     const std::vector<uint8_t>& rgba = en.source->rgba;
     const int texW = en.source->textureWidth, texH = en.source->textureHeight;
     if (texW <= 0 || texH <= 0 || rgba.empty()) return;
@@ -1204,9 +1350,18 @@ static void paint_entry(const DrawEntry& en, const Mat& fit, int canvasW, int ca
                     if (u < 0 || u > 1 || v < 0 || v > 1) continue;
                     BilerpTexels bt;
                     bilerp_setup(samp, u, v, &bt);
-                    const float alpha = bilerp_c(bt, 3) / 255.0f;
+                    float alpha = bilerp_c(bt, 3) / 255.0f;
                     if (alpha <= 0.001f) continue;
-                    const float opa = alpha * float(en.opa);
+                    alpha *= float(en.opa);
+                    if (mask_out) {
+                        const uint8_t cov = uint8_t(std::min(255.0f, alpha * 255.0f + 0.5f));
+                        uint8_t& slot = mask_out[size_t(py) * canvasW + size_t(px)];
+                        if (cov > slot) slot = cov; // union of the mask shapes
+                        continue;
+                    }
+                    if (mask_in) alpha *= float(mask_in[size_t(py) * canvasW + size_t(px)]) / 255.0f;
+                    if (alpha <= 0.001f) continue;
+                    const float opa = alpha;
                     const float da = float(dst[3]) / 255.0f;
                     const float outa = opa + da * (1.0f - opa);
                     if (outa <= 0.0001f) continue;
@@ -1356,10 +1511,19 @@ static void paint_entry(const DrawEntry& en, const Mat& fit, int canvasW, int ca
                     const float v = float((r1 * amv.v + r2 * bmv.v + r3 * cmv.v) * inv);
                     BilerpTexels bt;
                     bilerp_setup(samp, u, v, &bt);
-                    const float alpha = bilerp_c(bt, 3) / 255.0f;
+                    float alpha = bilerp_c(bt, 3) / 255.0f;
                     if (alpha <= 0.001f) continue;
-                    const float opa = alpha * float(en.opa);
+                    alpha *= float(en.opa);
                     uint8_t* dst = canvas->data() + (size_t(py) * canvasW + size_t(px)) * 4;
+                    if (mask_out) {
+                        const uint8_t cov = uint8_t(std::min(255.0f, alpha * 255.0f + 0.5f));
+                        uint8_t& slot = mask_out[size_t(py) * canvasW + size_t(px)];
+                        if (cov > slot) slot = cov;
+                        continue;
+                    }
+                    if (mask_in) alpha *= float(mask_in[size_t(py) * canvasW + size_t(px)]) / 255.0f;
+                    if (alpha <= 0.001f) continue;
+                    const float opa = alpha;
                     const float da = float(dst[3]) / 255.0f;
                     const float outa = opa + da * (1.0f - opa);
                     if (outa <= 0.0001f) continue;
@@ -1458,6 +1622,20 @@ void emote_set_s2_policy(int angleWrap, int tailFallback, int paramOobSkip,
     g_s2_nonfinite.store(nonfiniteGuard, std::memory_order_relaxed);
 }
 
+// ---------------------------------------------------------------------------
+// stencil composite A/B arm (OA_EMOTE_STENCIL=0 disables the type-12 mask
+// compositing — the pre-fix behaviour arm for same-process comparison).
+// ---------------------------------------------------------------------------
+std::atomic<int> g_stencil_enabled{-1};
+bool emote_stencil_enabled() {
+    const int v = g_stencil_enabled.load(std::memory_order_relaxed);
+    if (v >= 0) return v != 0;
+    return env_flag_on("OA_EMOTE_STENCIL", true);
+}
+void emote_set_stencil_enabled(int on) {
+    g_stencil_enabled.store(on, std::memory_order_relaxed);
+}
+
 bool static_content_bounds(const EmoteFile& file, const std::map<std::string, double>& vars,
                            double* minX, double* minY, double* maxX, double* maxY) {
     EvalCtx ctx{file, vars, nullptr, nullptr};
@@ -1467,7 +1645,8 @@ bool static_content_bounds(const EmoteFile& file, const std::map<std::string, do
     if (midx < 0) return false;
     std::vector<Level> empty;
     std::vector<std::string> p;
-    eval_motion(ctx, file.motions[midx], 0, empty, 1.0, 0, 0, p);
+    std::vector<StencilFrame> chain;
+    eval_motion(ctx, file.motions[midx], 0, empty, 1.0, 0, 0, p, chain, -1);
     if (ctx.minX > ctx.maxX) return false;
     *minX = ctx.minX;
     *minY = ctx.minY;
@@ -1480,7 +1659,8 @@ bool static_content_bounds(const EmoteFile& file, const std::map<std::string, do
 // the CPU raster and the GPU part collector); decodes the used atlases.
 static bool evaluate_entries(const EmoteFile& file,
                              const std::map<std::string, double>& vars,
-                             std::vector<DrawEntry>* entries, std::string* err) {
+                             std::vector<DrawEntry>* entries, std::string* err,
+                             std::vector<StencilGroup>* stencil_groups = nullptr) {
     EvalCtx ctx{file, vars, entries, err};
     ctx.s2 = emote_s2_policy(); // read the policy once
     ctx.debug = std::getenv("OA_DEBUG_EVAL") != nullptr;
@@ -1493,9 +1673,39 @@ static bool evaluate_entries(const EmoteFile& file,
         if (err) *err = "emote: base motion not found";
         return false;
     }
+    // pre-scan stencil groups so mask nodes drawn before their stencil can
+    // still be tagged (the eye-white precedes the eye stencil in tree order)
+    if (emote_stencil_enabled()) {
+        for (int root : file.motions[midx].layer)
+            scan_stencil_groups(ctx, file.motions[midx], root,
+                                std::vector<StencilFrame>{});
+    }
     std::vector<Level> empty;
     std::vector<std::string> p;
-    eval_motion(ctx, file.motions[midx], 0, empty, 1.0, 0, 0, p);
+    std::vector<StencilFrame> chain;
+    eval_motion(ctx, file.motions[midx], 0, empty, 1.0, 0, 0, p, chain, -1);
+    if (stencil_groups) *stencil_groups = ctx.stencil_groups;
+    if (ctx.debug) {
+        for (const auto& en2 : *entries) {
+            std::string full;
+            for (const auto& seg : en2.debugPath) full += seg + "/";
+            const std::string lbl = full;
+            if (lbl.find("mabuta") != std::string::npos ||
+                lbl.find("eye") != std::string::npos ||
+                en2.stencil_group >= 0 || en2.mask_for_group >= 0)
+                std::printf("[stencil] entry path=\'%s' sg=%d mf=%d\n",
+                            full.c_str(),
+                            en2.stencil_group, en2.mask_for_group);
+        }
+        for (size_t gi = 0; gi < ctx.stencil_groups.size(); ++gi) {
+            long nm = 0, nc = 0;
+            for (const auto& en2 : *entries) {
+                if (en2.mask_for_group == int(gi)) ++nm;
+                if (en2.stencil_group == int(gi)) ++nc;
+            }
+            std::printf("[stencil] group %zu owner_node=%d labels=%d mask=%ld content=%ld\n", gi, ctx.stencil_groups[gi].owner_node, int(ctx.stencil_groups[gi].labels.size()), nm, nc);
+        }
+    }
     if (ctx.debug) {
         std::fprintf(stderr, "[eval] entries=%zu bounds=%.0f..%.0f x %.0f..%.0f\n",
                      entries->size(), ctx.minX, ctx.maxX, ctx.minY, ctx.maxY);
@@ -1517,7 +1727,8 @@ bool render_static_frame(const EmoteFile& file, const std::map<std::string, doub
                          std::vector<uint8_t>* rgba, std::string* err) {
     if (canvasW <= 0 || canvasH <= 0) return false;
     std::vector<DrawEntry> entries;
-    if (!evaluate_entries(file, vars, &entries, err)) return false;
+    std::vector<StencilGroup> stencil_groups;
+    if (!evaluate_entries(file, vars, &entries, err, &stencil_groups)) return false;
     if (entries.empty()) return true; // nothing drawn; canvas stays transparent
 
     // ---- provisional psb -> canvas mapping --------------------------------
@@ -1569,7 +1780,46 @@ bool render_static_frame(const EmoteFile& file, const std::map<std::string, doub
 
     rgba->assign(size_t(canvasW) * canvasH * 4, 0);
     Mat fit = mul(translate(offX, offY), scale(k, k));
-    for (const DrawEntry& en : entries) paint_entry(en, fit, canvasW, canvasH, rgba);
+
+    // stencil composite: per group, the mask shapes' union alpha rasterized
+    // once (lazily, at the first content entry of the group in draw order)
+    // and multiplied into every content entry's coverage.
+    const size_t nGroups = stencil_groups.size();
+    std::vector<char> mask_built(nGroups, 0);
+    std::vector<std::vector<uint8_t>> mask_bits(nGroups);
+    auto mask_bits_of = [&](int gi) -> uint8_t* {
+        if (!mask_built[gi]) {
+            mask_bits[gi].assign(size_t(canvasW) * canvasH, 0);
+            mask_built[gi] = 1;
+        }
+        return mask_bits[gi].data();
+    };
+
+        const bool dbg_stencil = std::getenv("OA_DEBUG_STENCIL") != nullptr;
+    for (const DrawEntry& en : entries) {
+        if (dbg_stencil && (en.mask_for_group >= 0 || en.stencil_group >= 0))
+            std::printf("[stencil-raster] paint entry sg=%d mf=%d warped=%d src_rgba=%zu\n",
+                         en.stencil_group, en.mask_for_group, int(en.warped),
+                         en.source ? en.source->rgba.size() : size_t(0));
+        if (en.mask_for_group >= 0) {
+            // the mask shape draws normally AND feeds its group's stencil
+            paint_entry(en, fit, canvasW, canvasH, rgba, nullptr,
+                        mask_bits_of(en.mask_for_group));
+            continue;
+        }
+        const uint8_t* ma =
+            en.stencil_group >= 0 ? mask_bits_of(en.stencil_group) : nullptr;
+        paint_entry(en, fit, canvasW, canvasH, rgba, ma);
+    }
+    if (dbg_stencil) {
+        for (size_t gi = 0; gi < stencil_groups.size(); ++gi) {
+            if (!mask_built[gi]) continue;
+            long nz = 0;
+            for (uint8_t v : mask_bits[gi])
+                if (v) ++nz;
+            std::printf("[stencil-raster] group %zu mask bits nonzero=%ld\n", gi, nz);
+        }
+    }
     return true;
 }
 
@@ -1691,6 +1941,9 @@ bool emote_collect_parts(const EmoteFile& file, const std::map<std::string, doub
         part.authoredMeshDivision = en.authoredMeshDivision;
         part.meshDivision = en.warped ? entry_mesh_div(en) : 1;
         part.type12Depth = en.type12Depth;
+        part.stencil_group = en.stencil_group;
+        part.mask_role = en.mask_for_group >= 0 ? 1 : 0;
+        part.mask_group = en.mask_for_group;
         if (meshdbg) {
             part.nodePath.clear();
             for (size_t i = 0; i < en.debugPath.size(); ++i) {

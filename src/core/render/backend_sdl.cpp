@@ -19,6 +19,14 @@ SDL_BlendMode to_sdl_blend(BlendMode m) {
         case BlendMode::None: return SDL_BLENDMODE_NONE;
         case BlendMode::Add: return SDL_BLENDMODE_ADD;
         case BlendMode::Mod: return SDL_BLENDMODE_MOD;
+        case BlendMode::AlphaMultiply:
+            // dstRGB kept, dstA *= srcA: the stencil mask multiplies the
+            // content's alpha channel (color ops pass destination through)
+            return SDL_ComposeCustomBlendMode(
+                SDL_BLENDFACTOR_ZERO, SDL_BLENDFACTOR_ONE,
+                SDL_BLENDOPERATION_ADD,           // color: dst kept
+                SDL_BLENDFACTOR_DST_ALPHA, SDL_BLENDFACTOR_ZERO,
+                SDL_BLENDOPERATION_ADD);          // alpha: dstA *= srcA
         case BlendMode::Blend: break; // fallthrough to default
     }
     return SDL_BLENDMODE_BLEND;

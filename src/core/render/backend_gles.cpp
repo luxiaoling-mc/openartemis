@@ -35,7 +35,7 @@ enum : unsigned int {
     GL_FALSE_ = 0, GL_TRUE_ = 1, GL_NO_ERROR_ = 0,
     GL_ZERO_ = 0, GL_ONE_ = 1,
     GL_SRC_COLOR_ = 0x0300, GL_SRC_ALPHA_ = 0x0302,
-    GL_ONE_MINUS_SRC_ALPHA_ = 0x0303,
+    GL_ONE_MINUS_SRC_ALPHA_ = 0x0303, GL_DST_ALPHA_ = 0x0304,
     GL_BLEND_ = 0x0BE2, GL_SCISSOR_TEST_ = 0x0C11, GL_DEPTH_TEST_ = 0x0B71,
     GL_CULL_FACE_ = 0x0B44,
     GL_FUNC_ADD_ = 0x8006,
@@ -611,6 +611,10 @@ void GlesRenderBackend::apply_draw_state(GlesTexture* tex, BlendMode blend)
                 break;
             case BlendMode::Mod:
                 glBlendFuncSeparate(GL_ZERO_, GL_SRC_COLOR_, GL_ZERO_, GL_ONE_);
+                break;
+            case BlendMode::AlphaMultiply:
+                // dstRGB kept, dstA *= srcA (stencil mask composite)
+                glBlendFuncSeparate(GL_ZERO_, GL_ONE_, GL_DST_ALPHA_, GL_ZERO_);
                 break;
             case BlendMode::None: break;
         }

@@ -112,9 +112,20 @@ bool RenderEngine::create_renderer(SDL_Window* ctx,
     return true;
 }
 
+void RenderEngine::release_stencil_scratch()
+{
+    if (!backend_) return;
+    for (auto& t : stencil_scratch_) {
+        if (t) backend_->destroy_texture(t);
+        t = nullptr;
+    }
+    stencil_scratch_w_ = stencil_scratch_h_ = 0;
+}
+
 void RenderEngine::release_all()
 {
     if (!backend_) return;
+    release_stencil_scratch();
     if (stage_rt) {
         backend_->destroy_texture(stage_rt);
         stage_rt = nullptr;
@@ -826,7 +837,12 @@ bool RenderEngine::emote_render_parts(const oa::render::TextureKey& key,
         emote_canvas_[key] = canvas;
         textures[key] = canvas;
     }
-    // draw into the canvas: clear transparent, then parts in draw order
+    // draw into the canvas: clear transparent, then parts in draw order.
+    // Stencil-composite parts (type-12 eye masks) split off: per group the
+    // mask shapes render into one scratch target, the content into another,
+    // the mask multiplies the content's alpha, and the result lands on the
+    // canvas — SDL geometry has no stencil, so the E-mote stencil composite
+    // is a two-offscreen alpha multiply.
     TextureRef prev_target = backend_->current_target();
     backend_->set_target(canvas);
     backend_->set_draw_blend(BlendMode::None);
@@ -838,11 +854,29 @@ bool RenderEngine::emote_render_parts(const oa::render::TextureKey& key,
     // per-part vector allocated a fresh 2400-vertex buffer per warped part
     // per pose (~30 poses/s per layer).
     std::vector<Vertex> stage;
+
+    struct StencilBucket {
+        std::vector<const oa::emote::EmoteDrawPart*> mask;
+        std::vector<const oa::emote::EmoteDrawPart*> content;
+    };
+    std::map<int, StencilBucket> stencil;
+    std::vector<const oa::emote::EmoteDrawPart*> plain;
     for (const auto& part : parts) {
-        if (part.source < 0 || part.source >= int(file.sources.size())) continue;
+        if (part.mask_role == 1)
+            stencil[part.mask_group].mask.push_back(&part);
+        else if (part.stencil_group >= 0)
+            stencil[part.stencil_group].content.push_back(&part);
+        else
+            plain.push_back(&part);
+    }
+
+    // one part draw, translated by (ox,oy) scratch-space offset
+    auto draw_part = [&](const oa::emote::EmoteDrawPart& part,
+                         float ox, float oy) {
+        if (part.source < 0 || part.source >= int(file.sources.size())) return;
         const oa::emote::EmoteSource& src = *file.sources[size_t(part.source)];
-        if (part.icon < 0 || part.icon >= int(src.icons.size())) continue;
-        if (part.verts.size() < 3) continue;
+        if (part.icon < 0 || part.icon >= int(src.icons.size())) return;
+        if (part.verts.size() < 3) return;
         const RenderEngine::EmoteAtlasKey akey{key, part.source, file_uid};
         TextureRef atlas = nullptr;
         const auto ai = emote_atlases_.find(akey);
@@ -850,11 +884,12 @@ bool RenderEngine::emote_render_parts(const oa::render::TextureKey& key,
         if (!atlas) {
             std::string err;
             if (!file.ensure_atlas(const_cast<oa::emote::EmoteSource*>(&src), &err))
-                continue;
-            if (src.rgba.empty() || src.textureWidth <= 0 || src.textureHeight <= 0) continue;
+                return;
+            if (src.rgba.empty() || src.textureWidth <= 0 || src.textureHeight <= 0)
+                return;
             atlas = backend_->create_texture(src.textureWidth, src.textureHeight,
                                              TextureAccess::Static);
-            if (!atlas) continue;
+            if (!atlas) return;
             backend_->update_texture(atlas, src.rgba.data(),
                                      src.textureWidth * 4);
             backend_->set_texture_blend(atlas, BlendMode::Blend);
@@ -872,13 +907,79 @@ bool RenderEngine::emote_render_parts(const oa::render::TextureKey& key,
             oa::emote::emote_icon_uv_to_atlas(ic, src.textureWidth,
                                                      src.textureHeight, v.u, v.v, &tu, &tv);
             Vertex sv;
-            sv.pos = {float(v.x), float(v.y)};
+            sv.pos = {float(v.x) + ox, float(v.y) + oy};
             sv.color = {1.0f, 1.0f, 1.0f, a};
             sv.uv = {float(tu), float(tv)};
             stage.push_back(sv);
         }
         backend_->draw_geometry(atlas, stage.data(), int(stage.size()),
                                 nullptr, 0);
+    };
+
+    for (const oa::emote::EmoteDrawPart* part : plain)
+        draw_part(*part, 0.0f, 0.0f);
+
+    // stencil groups: two-offscreen alpha multiply
+    for (auto& [gid, bucket] : stencil) {
+        if (bucket.content.empty()) continue;
+        // group bbox over mask + content vertices (canvas space)
+        double x0 = 1e300, y0 = 1e300, x1 = -1e300, y1 = -1e300;
+        bool any_v = false;
+        for (const auto* plist : {&bucket.mask, &bucket.content})
+            for (const auto* part : *plist)
+                for (const auto& v : part->verts) {
+                    any_v = true;
+                    x0 = std::min(x0, v.x);
+                    y0 = std::min(y0, v.y);
+                    x1 = std::max(x1, v.x);
+                    y1 = std::max(y1, v.y);
+                }
+        if (!any_v) continue;
+        int bx0 = std::max(0, int(std::floor(x0)));
+        int by0 = std::max(0, int(std::floor(y0)));
+        int bx1 = std::min(w - 1, int(std::ceil(x1)));
+        int by1 = std::min(h - 1, int(std::ceil(y1)));
+        if (bx0 > bx1 || by0 > by1) continue;
+        const int bw = bx1 - bx0 + 1, bh = by1 - by0 + 1;
+        if (stencil_scratch_w_ != bw || stencil_scratch_h_ != bh) {
+            release_stencil_scratch();
+            for (auto& t : stencil_scratch_) {
+                t = backend_->create_texture(bw, bh, TextureAccess::Target);
+                if (!t) break;
+            }
+            if (!stencil_scratch_[0] || !stencil_scratch_[1]) {
+                release_stencil_scratch();
+                continue;
+            }
+            stencil_scratch_w_ = bw;
+            stencil_scratch_h_ = bh;
+        }
+        // pass 1: mask shapes into scratch 0 (straight alpha accumulation)
+        backend_->set_target(stencil_scratch_[0]);
+        backend_->set_draw_blend(BlendMode::None);
+        backend_->set_draw_color(0, 0, 0, 0);
+        backend_->clear();
+        backend_->set_draw_blend(BlendMode::Blend);
+        backend_->clear_clip();
+        for (const auto* part : bucket.mask) draw_part(*part, -float(bx0), -float(by0));
+        // pass 2: content into scratch 1
+        backend_->set_target(stencil_scratch_[1]);
+        backend_->set_draw_blend(BlendMode::None);
+        backend_->set_draw_color(0, 0, 0, 0);
+        backend_->clear();
+        backend_->set_draw_blend(BlendMode::Blend);
+        backend_->clear_clip();
+        for (const auto* part : bucket.content)
+            draw_part(*part, -float(bx0), -float(by0));
+        // pass 3: mask multiplies the content's alpha (color untouched)
+        backend_->set_texture_blend(stencil_scratch_[0], BlendMode::AlphaMultiply);
+        backend_->draw_texture(stencil_scratch_[0], nullptr, nullptr);
+        // pass 4: composited content onto the emote canvas at its bbox
+        backend_->set_target(canvas);
+        backend_->set_draw_blend(BlendMode::Blend);
+        const FRect dst{float(bx0), float(by0), float(bw), float(bh)};
+        backend_->draw_texture(stencil_scratch_[1], nullptr, &dst);
+        backend_->set_texture_blend(stencil_scratch_[0], BlendMode::Blend);
     }
     backend_->set_target(prev_target);
     return true;

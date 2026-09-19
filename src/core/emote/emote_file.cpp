@@ -369,6 +369,7 @@ bool EmoteFile::parse_node(EmoteMotion& m, int nodeIndex, uint32_t off, std::str
         int64_t t = 0;
         if (psb_.read_int(*v, &t)) N.inheritMask = uint32_t(t);
     }
+    N.isMaskNode = N.type == 12;
     if (auto p = psb_.object_member(off, "parameterize")) {
         const Kind k = psb_.kind_at(*p);
         if (k != Kind::Objects && k != Kind::Null) {
@@ -376,6 +377,19 @@ bool EmoteFile::parse_node(EmoteMotion& m, int nodeIndex, uint32_t off, std::str
             if (psb_.read_int(*p, &idx)) {
                 N.isParameterized = true;
                 N.parameterIndex = int(idx);
+            }
+        }
+    }
+    if (auto v = psb_.object_member(off, "stencilType")) {
+        int64_t t = 0;
+        if (psb_.read_int(*v, &t)) N.stencil_type = int(t);
+    }
+    if (auto v = psb_.object_member(off, "stencilCompositeMaskLayerList")) {
+        std::vector<uint32_t> labels;
+        if (psb_.list_items(*v, &labels)) {
+            for (uint32_t lo : labels) {
+                if (auto s = psb_.read_string(lo))
+                    N.stencil_mask_layers.push_back(*s);
             }
         }
     }

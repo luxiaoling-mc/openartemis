@@ -441,3 +441,7 @@ target_link_libraries(mem_churn_probe PRIVATE libopenartemis SDL3::SDL3 PNG::PNG
 if(WIN32)
   target_link_libraries(mem_churn_probe PRIVATE psapi)
 endif()
+
+# E-mote stencil/mask structure survey (report-only).
+add_executable(emote_mask_dump emote_mask_dump.cpp)
+target_link_libraries(emote_mask_dump PRIVATE libopenartemis)

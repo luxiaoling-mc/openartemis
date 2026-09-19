@@ -76,6 +76,13 @@ struct EmoteNode {
     int meshCombine = 0, meshDivision = 0, meshTransform = 0;
     bool removed = false;
     bool isMaskNode = false; // type 12 (stencil composite)
+    // stencilCompositeMaskLayerList — node LABELS whose drawn alpha masks
+    // this stencil's subtree (the eye: content = the pupil subtree, mask =
+    // the eye-white shape). Labels resolve within the stencil's parent
+    // subtree (ancestor scope): both eyes carry a node labeled 'shirome'
+    // and each stencil binds the one inside its own 目L/目R branch.
+    std::vector<std::string> stencil_mask_layers;
+    int stencil_type = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -305,8 +312,16 @@ struct EmoteDrawPart {
     // how many type-12 stencil-composite nodes sit
     // above this draw in the node chain. 0 = the plain path; >0 = the
     // reference would composite it through a mask target built from that
-    // node's stencilCompositeMaskLayerList (which our engine ignores).
+    // node's stencilCompositeMaskLayerList (implemented: see stencil_group).
     int type12Depth = 0;
+    // Stencil composite (type 12) tagging, mirroring the CPU raster:
+    //   mask_role 0 + stencil_group >= 0 — content drawn under that stencil
+    //   group, composited through the group's mask shapes;
+    //   mask_role 1 — this part IS a mask shape of mask_group (it also
+    //   draws normally; the renderer consumes both roles).
+    int stencil_group = -1;
+    int mask_role = 0;
+    int mask_group = -1;
     // Draw path ("/"-joined node labels; nodes with type==12 are tagged
     // "<label>#12"). Only filled when OA_EMOTE_MESHDBG=1 — the production
     // hot path stays allocation-free.
@@ -399,5 +414,9 @@ EmoteS2Policy emote_s2_policy();
 /// Each argument: -1 restores the environment latch, 0/1 forces off/on.
 void emote_set_s2_policy(int angleWrap, int tailFallback, int paramOobSkip,
                          int nonfiniteGuard);
+/// Stencil-composite (type-12 eye mask) A/B arm: -1 restores the environment
+/// latch (OA_EMOTE_STENCIL, default on), 0/1 forces off/on.
+bool emote_stencil_enabled();
+void emote_set_stencil_enabled(int on);
 
 } // namespace oa::emote

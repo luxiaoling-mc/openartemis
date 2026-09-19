@@ -451,6 +451,11 @@ private:
     };
     std::map<EmoteAtlasKey, TextureRef> emote_atlases_;
 
+    // stencil-composite scratch targets (mask + content offscreens for one
+    // stencil group, sized to the group bbox; recreated when it grows)
+    TextureRef stencil_scratch_[2] = {nullptr, nullptr};
+    int stencil_scratch_w_ = 0, stencil_scratch_h_ = 0;
+    void release_stencil_scratch();
     // Host-frame pump bookkeeping: last uploaded revision per emote layer /
     // video channel (the app-side layer_*_rev maps, moved with the pump).
     std::map<std::string, uint64_t> pump_emote_rev_;
