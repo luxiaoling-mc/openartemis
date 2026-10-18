@@ -191,6 +191,10 @@ int parse_args(int argc, char** argv, Options& o) {
             if (errno || !end || *end || n <= 0)
                 return usage_error("--frames: expected a positive integer, got '" + v + "'");
             o.frames_target = (uint64_t)n;
+        } else if (name == "--mute") {
+            // Unattended runs must not play a sound: keeps the device, the
+            // decoders and the mix, zeroes what reaches the speakers.
+            o.mute = true;
         } else if (name == "--fps") {
             std::string v;
             if (!value_of(v)) return usage_error("--fps needs a positive frame rate");
@@ -942,6 +946,16 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char* argv[])
     });
 
     state->rt->media_players().init();
+    // OA_AUDIO_MUTE=1 (also implied by --mute): keep the whole audio path —
+    // device, decoders, mixer, the queue and its diagnostics — but zero the
+    // mixed frames, so an unattended windowed run never plays a sound.
+    {
+        const char* mv = std::getenv("OA_AUDIO_MUTE");
+        if ((mv && *mv && std::atoi(mv) != 0) || state->opt.mute) {
+            state->rt->audio().set_master_volume(0.0f);
+            std::printf("[app] audio muted (master volume 0; pipeline unchanged)\n");
+        }
+    }
     // movie (container) audio rides the SAME SDL stream the
     // sound players mix into. VideoEngine pushes its decoded 44100 stereo
     // through MediaPlayers (SDL_AudioStream serializes internally, so the

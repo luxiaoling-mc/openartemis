@@ -5988,6 +5988,285 @@ static bool ad_hover_drive(AppState* s) {
     return false;
 }
 
+
+// ---------------------------------------------------------------------------
+// OA_AUTODRIVE=confreturn — in-story config round-trip with E-mote layers.
+//
+// Reported defect: on a story page with two E-mote characters, opening the
+// dock's config page, moving a volume slider and coming back leaves both
+// characters showing only their feet.
+//
+// The journey reaches a story page that carries emote layers, snapshots every
+// emote layer's geometry (layer rect / world rect / clip / canvas size) and the
+// presented frame, opens the config page, drags a slider, closes it, and
+// snapshots again — so "what changed" is a diff of numbers, not a guess.
+//   OA_CONFRET_SLIDER=x,y   drag start (stage coords) when no slider handler
+//                           is registered yet
+// ---------------------------------------------------------------------------
+static void ad_emote_dump(AppState* s, const char* tag) {
+    oa::runtime::GameRuntime* rt = s->rt.get();
+    std::printf("[confret] %s emote_layers=%zu\n", tag, rt->emote_layers().size());
+    for (const auto& [id, st] : rt->emote_layers()) {
+        const oa::render::Layer* l = rt->scene().find(id);
+        int wx = 0, wy = 0, ww = 0, wh = 0;
+        if (l) {
+            if (const auto r = s->oaRender->layer_world_rect(*l)) {
+                wx = int((*r)[0]);
+                wy = int((*r)[1]);
+                ww = int((*r)[2]);
+                wh = int((*r)[3]);
+            }
+        }
+        std::printf("[confret]   id=%s canvas=%dx%d rev=%llu vis=%d alpha=%.2f "
+                    "left=%.1f top=%.1f scale=%.1f/%.1f anchor=%.0f/%.0f "
+                    "clip=%d(%.0f,%.0f,%.0fx%.0f) world=(%d,%d %dx%d)\n",
+                    id.c_str(), st.width, st.height,
+                    (unsigned long long)st.revision, l ? int(l->visible) : -1,
+                    l ? l->alpha : -1.0, l ? l->left : -1.0, l ? l->top : -1.0,
+                    l ? l->x_scale : -1.0, l ? l->y_scale : -1.0,
+                    l ? l->anchor_x : -1.0, l ? l->anchor_y : -1.0,
+                    l ? int(l->has_clip) : -1, l ? l->clip_x : 0.0,
+                    l ? l->clip_y : 0.0, l ? l->clip_w : 0.0,
+                    l ? l->clip_h : 0.0, wx, wy, ww, wh);
+    }
+}
+static void ad_conf_inventory(AppState* s) {
+    oa::runtime::GameRuntime* rt = s->rt.get();
+    std::string clicks, drags;
+    for (const oa::render::Layer* l : rt->scene().draw_order()) {
+        if (!rt->scene().is_effectively_visible(l->id)) continue;
+        for (const auto& [kind, h] : l->event_handlers) {
+            const auto k = h.params.find("key");
+            if (k == h.params.end()) continue;
+            std::string& out = (kind == "drag") ? drags : clicks;
+            if (kind != "drag" && kind != "click" && kind != "rollover") continue;
+            out += " " + k->second;
+        }
+    }
+    std::printf("[confret] keys click:%s\n", clicks.c_str());
+    std::printf("[confret] keys drag:%s\n", drags.c_str());
+}
+static bool ad_confret_drive(AppState* s) {
+    oa::runtime::GameRuntime* rt = s->rt.get();
+    static int sub = 0, waits = 0;
+    static uint64_t t_stage = 0;
+    const uint64_t now = SDL_GetTicks();
+    if (sub == 0) { // language row -> title
+        const oa::render::Layer* cn = ad_find_clickable(s, "bt_cn", "", false);
+        if (!cn) cn = ad_find_clickable(s, "", "bt_cn", true);
+        // qureate-family pages dispatch the row from ONE full-screen catcher,
+        // so a layer-centre click lands between the rows: pick the first row
+        // band instead (language pages put the first row at ~40% height).
+        if (!cn && waits > 90) {
+            // qureate-family select pages need the row clicked twice (pick,
+            // then confirm): keep clicking the first row band until the title
+            // shows up.
+            const int sw = rt->project_.config.stage_width;
+            const int sh = rt->project_.config.stage_height;
+            const bool title_up = ad_find_clickable(s, "bt_start", "", false) ||
+                                  ad_find_clickable(s, "bt_continue", "", false);
+            if (title_up || now - t_stage > 25000) {
+                sub = 1;
+                t_stage = now;
+                waits = 0;
+                return false;
+            }
+            if (waits % 30 == 0) {
+                // Hold the button a few frames like a real press: the select
+                // page reacts on the held state, and a one-frame synthetic
+                // press can be sampled before the page's own timer runs.
+                ad_arm_drag(s, sw / 2, int(sh * 0.40), sw / 2, int(sh * 0.40), 6);
+                s->ad_press_key = 13; // Enter: some select pages confirm on the key
+                std::printf("[confret] language row press (%d,%d) via page catcher\n",
+                            sw / 2, int(sh * 0.40));
+            }
+        }
+        if (cn) {
+            ad_click_layer(s, cn);
+            std::printf("[confret] language clicked\n");
+            sub = 1;
+            t_stage = now;
+            waits = 0;
+        } else if (++waits > 900) {
+            std::printf("[confret] no bt_cn language row; inventory on this page://n");
+            ad_conf_inventory(s);
+            sub = 1;
+            t_stage = now;
+            waits = 0;
+        }
+        return false;
+    }
+    if (sub == 1) { // title -> story (continue a save when the title offers it)
+        if (now - t_stage > 40000) {
+            std::printf("[confret] VERDICT FAIL (title never opened)\n");
+            return true;
+        }
+        if (waits++ < 60) return false;
+        if (waits == 61) ad_conf_inventory(s);
+        const oa::render::Layer* start = ad_find_clickable(s, "bt_continue", "", false);
+        const char* which = "bt_continue";
+        if (!start) {
+            start = ad_find_clickable(s, "bt_start", "", false);
+            which = "bt_start";
+        }
+        if (start) {
+            ad_click_layer(s, start);
+            std::printf("[confret] %s clicked\n", which);
+            sub = 2;
+            t_stage = now;
+            waits = 0;
+        }
+        return false;
+    }
+    if (sub == 2) { // quicksave load first, then advance until an emote layer exists
+        static bool tried_qload = false;
+        if (!tried_qload && waits > 45 && waits % 60 == 0) {
+            const oa::render::Layer* ql = ad_find_clickable(s, "bt_qload", "", false);
+            if (!ql) ql = ad_find_clickable(s, "tb_qload", "", false);
+            if (ql) {
+                tried_qload = true;
+                ad_click_layer(s, ql);
+                std::printf("[confret] quicksave load clicked ('%s')\n", ql->id.c_str());
+                t_stage = now;
+                return false;
+            }
+        }
+        if (rt->emote_layers().size() >= 1 && waits > 30) {
+            std::printf("[confret] story page with %zu emote layer(s)\n",
+                        rt->emote_layers().size());
+            ad_emote_dump(s, "before");
+            ad_conf_inventory(s);
+            if (!s->ad_out.empty()) ad_png_shot(s, "confret_before");
+            sub = 3;
+            waits = 0;
+            return false;
+        }
+        if (now - t_stage > 240000 || ++waits > 24000) {
+            std::printf("[confret] VERDICT FAIL (no emote layer on screen)\n");
+            ad_conf_inventory(s);
+            return true;
+        }
+        if (waits % 300 == 0 && waits)
+            std::printf("[confret] waiting for an emote page: t=%llums "
+                        "frames=%llu layers=%zu emotes=%zu\n",
+                        (unsigned long long)(now - t_stage),
+                        (unsigned long long)s->frames, rt->scene().size(),
+                        rt->emote_layers().size());
+        if (waits % 90 == 0) {
+            // A choice page stops the ADV advance: pick a row (its click key
+            // is sel*; the chapter-1 branch rows are 1.80.120.*) and keep
+            // clicking, otherwise the walk parks on the select overlay.
+            const oa::render::Layer* row = nullptr;
+            for (const oa::render::Layer* l : rt->scene().draw_order()) {
+                const auto it = l->event_handlers.find("click");
+                if (it == l->event_handlers.end()) continue;
+                if (!rt->scene().is_effectively_visible(l->id)) continue;
+                const auto k = it->second.params.find("key");
+                if (k == it->second.params.end()) continue;
+                const std::string& key = k->second;
+                if (key.rfind("sel", 0) == 0 && key != "selback" &&
+                    key != "selnext") {
+                    row = l;
+                    break;
+                }
+                if (l->id.find(".120.") != std::string::npos) {
+                    row = l;
+                    break;
+                }
+            }
+            if (row) ad_click_layer(s, row);
+            else {
+                const int sw = rt->project_.config.stage_width;
+                const int sh = rt->project_.config.stage_height;
+                s->ad_cx = sw / 2;
+                s->ad_cy = int(sh * 0.87);
+                s->ad_click = true;
+            }
+        }
+        return false;
+    }
+    if (sub == 3) { // open config
+        const oa::render::Layer* cfg = ad_find_clickable(s, "bt_config", "", false);
+        if (!cfg) cfg = ad_find_clickable(s, "bt_conf", "", false);
+        if (!cfg) cfg = ad_find_clickable(s, "", "config", true);
+        if (cfg && ++waits > 30) {
+            ad_click_layer(s, cfg);
+            std::printf("[confret] config button '%s' clicked\n", cfg->id.c_str());
+            sub = 4;
+            t_stage = now;
+            waits = 0;
+            return false;
+        }
+        if (now - t_stage > 8000) {
+            std::printf("[confret] VERDICT FAIL (no config button)\n");
+            return true;
+        }
+        return false;
+    }
+    if (sub == 4) { // config open: drag a volume slider, then close
+        if (now - t_stage > 20000) {
+            std::printf("[confret] VERDICT FAIL (config page never opened)\n");
+            return true;
+        }
+        // The config page is up when a slider handle is registered.
+        int sx = 0, sy = 0;
+        bool slider = false;
+        for (const char* k : {"vol", "bgmvol", "sevol", "volume"}) {
+            if (ad_find_drag_layer(s, k, &sx, &sy)) {
+                slider = true;
+                break;
+            }
+        }
+        if (!slider) {
+            for (const oa::render::Layer* l : rt->scene().draw_order()) {
+                const auto it = l->event_handlers.find("drag");
+                if (it == l->event_handlers.end()) continue;
+                if (!rt->scene().is_effectively_visible(l->id)) continue;
+                if (ad_layer_center(s, l, &sx, &sy)) {
+                    slider = true;
+                    break;
+                }
+            }
+        }
+        if (!slider) return false;
+        ad_arm_drag(s, sx, sy, sx + 120, sy, 12);
+        std::printf("[confret] volume drag (%d,%d)->(%d,%d)\n", sx, sy, sx + 120, sy);
+        sub = 5;
+        t_stage = now;
+        waits = 0;
+        return false;
+    }
+    if (sub == 5) { // close the config page
+        if (now - t_stage > 20000) {
+            std::printf("[confret] VERDICT FAIL (could not leave config)\n");
+            return true;
+        }
+        if (waits > 40) {
+            for (const char* k : {"bt_exit", "bt_back", "bt_return", "bt_close"}) {
+                const oa::render::Layer* b = ad_find_clickable(s, k, "", false);
+                if (b) {
+                    ad_click_layer(s, b);
+                    std::printf("[confret] close via %s\n", k);
+                    sub = 6;
+                    t_stage = now;
+                    waits = 0;
+                    return false;
+                }
+            }
+        }
+        ++waits;
+        return false;
+    }
+    // sub 6: back on the story page — snapshot and compare
+    ++waits;
+    if (waits < 90) return false;
+    std::printf("[confret] back on the story page\n");
+    ad_emote_dump(s, "after");
+    if (!s->ad_out.empty()) ad_png_shot(s, "confret_after");
+    std::printf("[confret] DONE\n");
+    return true;
+}
+
 bool ad_drive(AppState* s) {
     oa::runtime::GameRuntime* rt = s->rt.get();
     ++s->ad_stage_f;
@@ -6011,6 +6290,7 @@ bool ad_drive(AppState* s) {
     if (s->ad_flow == "fontscan") return ad_fontscan_drive(s);
     if (s->ad_flow == "langidle") return ad_langidle_drive(s);
     if (s->ad_flow == "hover") return ad_hover_drive(s);
+    if (s->ad_flow == "confreturn") return ad_confret_drive(s);
 #endif
     switch (s->ad_stage) {
         case 0: { // wait for the parked title with bt_start, then enter story

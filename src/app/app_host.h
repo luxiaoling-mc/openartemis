@@ -38,6 +38,7 @@ struct Options {
     uint64_t frames_target = 0; // 0 => run continuously (no self-check exit)
     int fps = 0;                // 0 => legacy ~8 ms delay + real-delta pacing
     bool headless = false;      // no window/renderer, virtual 16 ms ticks
+    bool mute = false;          // --mute / OA_AUDIO_MUTE: master volume 0
     std::string dump;           // --dump PATH (PPM snapshot at end-of-run)
     bool dump_on_end = false;   // OA_DUMP_FRAME or --dump
     // project platform (ini section + script os var). Default is the build's
