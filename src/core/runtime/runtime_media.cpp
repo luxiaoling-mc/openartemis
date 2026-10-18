@@ -663,6 +663,26 @@ void GameRuntime::RuntimeState::apply_emote_static(const oa::runtime::Event& e) 
                          err.c_str());
         return;
     }
+    // Same layer id re-created (the game re-runs the scene block when a UI
+    // page closes): the script treats it as the same character and issues the
+    // view calls before/around this create, so carry the view over instead of
+    // starting from the defaults (scale 0.6, coord 0,0) — otherwise the
+    // figure is drawn at the wrong scale/offset inside the canvas and only its
+    // feet stay visible ("只剩脚" report).
+    if (const auto it = emote_layers_.find(id); it != emote_layers_.end() && it->second.player) {
+        player->copy_view_from(*it->second.player);
+        if (std::getenv("OA_EMOTE_DEBUG"))
+            std::fprintf(stderr, "[emote] %s: view carried over (scale=%.3f)\n",
+                         id.c_str(), player->view_scale());
+    } else if (const auto vit = emote_view_cache_.find(id);
+               vit != emote_view_cache_.end()) {
+        // The layer was torn down and is being rebuilt (see emote_view_cache_):
+        // the script's setScale/setCoordinate ran against the old player.
+        player->set_view_state(vit->second);
+        if (std::getenv("OA_EMOTE_DEBUG"))
+            std::fprintf(stderr, "[emote] %s: view restored (scale=%.3f y=%.1f)\n",
+                         id.c_str(), vit->second.scale, vit->second.y);
+    }
     EmoteLayerState st;
     st.width = player->width();   // actual render buffer (may be half res)
     st.height = player->height();

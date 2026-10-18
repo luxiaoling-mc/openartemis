@@ -534,6 +534,7 @@ void GameRuntime::RuntimeState::reset_domains() {
     scene_.clear_scene();
     drop_pending_tween_cancels(); // deferred timer rounds die with nodes
     emote_layers_.clear(); // static emote frames die with the scene
+    emote_view_cache_.clear(); // ... and so does a recorded view
     transition_.clear();
     hovered_.clear();
     drag_layer_.clear();
@@ -620,6 +621,7 @@ void GameRuntime::RuntimeState::finish_all_delete() {
     screenshot_.valid = false;
     capture_pending_ = false;
     emote_layers_.clear(); // static emote frames die with the scene
+    emote_view_cache_.clear(); // ... and so does a recorded view
 }
 
 void GameRuntime::RuntimeState::restart_project() {
@@ -1315,6 +1317,8 @@ bool GameRuntime::RuntimeState::apply_scene_event(const oa::runtime::Event& e) {
             if (id == e.id || (id.size() > e.id.size() + 1 &&
                                id.compare(0, e.id.size(), e.id) == 0 &&
                                id[e.id.size()] == '.')) {
+                if (it->second.player)
+                    emote_view_cache_[id] = it->second.player->view_state();
                 it = emote_layers_.erase(it);
             } else {
                 ++it;

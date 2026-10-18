@@ -364,6 +364,14 @@ struct GameRuntime::RuntimeState {
     std::unique_ptr<oa::media::DecodePool> decode_pool_;
     // [C] E: emote 播放器（资源）+ 层 id；读档须 clear
     std::map<std::string, EmoteLayerState> emote_layers_;
+    /// Last view each emote layer was configured with, kept across the
+    /// delete+create pair a UI round-trip performs. The script emits the
+    /// create as a queued event but calls setScale/setCoordinate immediately,
+    /// so those land on the player that is about to be replaced; re-applying
+    /// the recorded view on the re-created player is what keeps the figure at
+    /// the scale/offset the script asked for ("只剩脚" report: the fresh
+    /// player fell back to scale 0.6 / coord 0 and the body left the canvas).
+    std::map<std::string, oa::emote::EmotePlayer::ViewState> emote_view_cache_;
     // [C] E: 诊断计数
     size_t emote_layer_events_ = 0;
     // [C] E: 语音 id 发生器（单调；读档不恢复）

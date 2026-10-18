@@ -166,6 +166,39 @@ public:
     void set_scale(double s, double origin_x = 0.0, double origin_y = 0.0);
     void set_coord(double x, double y);
     double view_scale() const { return view_scale_; }
+    /// The view the game configured (setScale args + setCoord offset), so a
+    /// host can restore it across a player that is torn down and rebuilt.
+    struct ViewState {
+        double scale = 0.6;
+        double origin_x = 0, origin_y = 0;
+        double x = 0, y = 0;
+    };
+    ViewState view_state() const {
+        return ViewState{view_scale_, scale_origin_x_, scale_origin_y_, view_x_,
+                         view_y_};
+    }
+    void set_view_state(const ViewState& v) {
+        view_scale_ = v.scale;
+        scale_origin_x_ = v.origin_x;
+        scale_origin_y_ = v.origin_y;
+        view_x_ = v.x;
+        view_y_ = v.y;
+        render_now();
+    }
+    /// Carry the view (setScale args + setCoord offset) over from another
+    /// player. A layer that is RE-CREATED for the same id (the game re-runs
+    /// the scene block on returning from a UI page) is the same character to
+    /// the script: it issues the create and its setScale/setCoordinate in that
+    /// order, so a fresh player must not start at the defaults — that reset
+    /// lands the figure scaled 0.6/offset 0 inside a canvas sized for 0.8/+y
+    /// and only the feet stay visible.
+    void copy_view_from(const EmotePlayer& other) {
+        view_scale_ = other.view_scale_;
+        view_x_ = other.view_x_;
+        view_y_ = other.view_y_;
+        scale_origin_x_ = other.scale_origin_x_;
+        scale_origin_y_ = other.scale_origin_y_;
+    }
 
     // -- E-mote layer API ---------------------------------------------------
     /// Play a foreground timeline. flags & TIMELINE_PLAY_PARALLEL (1)

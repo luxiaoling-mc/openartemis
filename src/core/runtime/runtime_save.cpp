@@ -446,6 +446,7 @@ size_t GameRuntime::RuntimeState::reset_ephemeral_on_load() {
     video_.stop_all_videos(); clr();  // [C]：通道绑在已清场的层 id 上
     video_finished_ = false; clr();   // [C]（结束闩；reset_domains 亦漏，见文件头契约）
     emote_layers_.clear(); clr();     // [C]：播放器（③ 资源）+ 旧层 id
+    emote_view_cache_.clear();        // 回标题/读档不继承上一场景的视图
     pending_emote_methods_.clear(); clr(); // [C]：方法补发队列（同生共死）
 
     // ---- 文本 / 场景容器 ----

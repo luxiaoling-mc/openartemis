@@ -92,6 +92,9 @@ bool EmotePlayer::load(const uint8_t* data, size_t size, int canvasW, int canvas
     height_ = std::max(64, int(std::lround(h * scale)));
     req_width_ = w;
     req_height_ = h;
+    if (std::getenv("OA_EMOTE_DEBUG"))
+        std::fprintf(stderr, "[emote] load req=%dx%d buf=%dx%d scale=%.2f\n", w, h,
+                     width_, height_, scale);
     init_defaults();
     // initial static pose (evidence; the game fades the idle timeline in
     // right after creation, so the static pose only shows for a frame or two)
@@ -682,12 +685,19 @@ void EmotePlayer::set_scale(double s, double origin_x, double origin_y) {
     if (s > 0.01 && s <= 4.0) view_scale_ = s;
     scale_origin_x_ = origin_x;
     scale_origin_y_ = origin_y;
+    if (std::getenv("OA_EMOTE_DEBUG"))
+        std::fprintf(stderr, "[emote] set_scale s=%.3f origin=(%.1f,%.1f) "
+                             "req=%dx%d buf=%dx%d\n",
+                     view_scale_, scale_origin_x_, scale_origin_y_, req_width_,
+                     req_height_, width_, height_);
     render_now();
 }
 
 void EmotePlayer::set_coord(double x, double y) {
     view_x_ = x;
     view_y_ = y;
+    if (std::getenv("OA_EMOTE_DEBUG"))
+        std::fprintf(stderr, "[emote] set_coord (%.1f,%.1f)\n", view_x_, view_y_);
     render_now();
 }
 
