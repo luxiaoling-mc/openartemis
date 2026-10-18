@@ -1684,6 +1684,41 @@ SDL_AppResult SDL_AppIterate(void* appstate)
         fstat_mark(&s_fstat_cur.present);
         s_fstat_cur.repaint = true;
 #if OA_TEST_BUILD
+        // OA_TEXT_BENCH=N — draw a synthetic N-glyph page through the real
+        // glyph path (inside the render pass, on top of the scene) so
+        // OA_FRAME_STATS separates per-glyph draw cost from everything else.
+        // The page content is constant, so after the first frame it exercises
+        // only the draw loop (layout is cached).
+        if (const char* tb = std::getenv("OA_TEXT_BENCH"); tb && *tb) {
+            static const int bench_chars = std::max(0, std::atoi(tb));
+            static const oa::render::MessageLayer bench_layer = [&] {
+                oa::render::MessageLayer ml;
+                ml.id = "@text_bench";
+                ml.positioned = true;
+                ml.left = 8;
+                ml.top = 8;
+                ml.width = 1904;
+                ml.height = 1064;
+                ml.font.raw["size"] = "32";
+                ml.font.raw["color"] = "0FFFFFF";
+                oa::render::PageUnit u;
+                u.kind = oa::render::PageUnit::Kind::Text;
+                u.font = ml.font;
+                const char* kana = "あいうえおかきくけこさしすせそたちつてとなにぬねの";
+                for (int i = 0; i < bench_chars; ++i) {
+                    const size_t n = std::strlen(kana);
+                    size_t off = 0;
+                    for (size_t k = 0; k < size_t(i % 25) && off < n; ++k)
+                        off += (kana[off] & 0x80) ? 3 : 1;
+                    u.data.append(kana + off, (kana[off] & 0x80) ? 3 : 1);
+                }
+                ml.page.push_back(std::move(u));
+                ml.char_count = size_t(bench_chars);
+                ml.reveal_index = size_t(-1);
+                return ml;
+            }();
+            if (bench_chars > 0) state->oaRender->draw_text_bench(bench_layer, 1);
+        }
         // auto-drive: sample the just-presented pixels (tail stage) and
         // note that a fresh frame exists for the driver's residue counting.
         if (!state->ad_flow.empty()) {

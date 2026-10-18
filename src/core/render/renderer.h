@@ -296,6 +296,10 @@ public:
     /// offscreen only when they actually need it. `global_fade`
     /// ([alldelete]) multiplies the whole chain. Returns the drawn count.
     size_t draw_scene(const oa::render::Compositor& sc, double global_fade);
+    /// Diagnostics (OA_TEXT_BENCH): draw `ml` `times` through the real
+    /// glyph path, no scene node — isolates per-glyph draw cost from the
+    /// rest of the frame.
+    size_t draw_text_bench(const oa::render::MessageLayer& ml, int times);
     /// present = blit the stage offscreen target into the
     /// window. The SDL logical letterbox presentation (installed in
     /// create_renderer) scales the full-stage rect into the real window —

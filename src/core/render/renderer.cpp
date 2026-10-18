@@ -709,6 +709,15 @@ void RenderEngine::draw_node(const oa::render::Compositor& sc,
                     scissor, drawn_out);
 }
 
+size_t RenderEngine::draw_text_bench(const oa::render::MessageLayer& ml, int times) {
+    if (!backend_ || !fontSystem) return 0;
+    size_t drawn = 0;
+    for (int i = 0; i < times; ++i)
+        drawn += fontSystem->draw_text_layer(backend_.get(), ml,
+                                             oa::render::Affine2{}, 255.0);
+    return drawn;
+}
+
 size_t RenderEngine::draw_scene(const oa::render::Compositor& sc, double global_fade) {
     // ONE recursive traversal over the Compositor's explicit
     // SceneNode tree (roots → node.children), passed by const& down the

@@ -538,6 +538,75 @@ void FontSystem::style_colors(const oa::render::FontDesc& f, oa::render::Rgba* s
         if (const auto p = parse_rgb(*v)) *outline = *p;
 }
 
+namespace {
+inline void oa_fnv_bytes(uint64_t& h, const void* p, size_t n) {
+    const uint8_t* b = static_cast<const uint8_t*>(p);
+    for (size_t i = 0; i < n; ++i) {
+        h ^= b[i];
+        h *= 1099511628211ull;
+    }
+}
+inline void oa_fnv_u64(uint64_t& h, uint64_t v) { oa_fnv_bytes(h, &v, sizeof v); }
+inline void oa_fnv_strmap(uint64_t& h, const std::map<std::string, std::string>& m) {
+    oa_fnv_u64(h, m.size());
+    for (const auto& [k, v] : m) {
+        oa_fnv_bytes(h, k.data(), k.size());
+        oa_fnv_bytes(h, v.data(), v.size());
+    }
+}
+inline void oa_fnv_double(uint64_t& h, double v) { oa_fnv_bytes(h, &v, sizeof v); }
+} // namespace
+
+uint64_t FontSystem::layout_key(const oa::render::MessageLayer& ml) const {
+    uint64_t h = 1469598103934665603ull;
+    oa_fnv_u64(h, ml.generation);
+    oa_fnv_u64(h, ml.positioned ? 1u : 0u);
+    oa_fnv_double(h, ml.left);
+    oa_fnv_double(h, ml.top);
+    oa_fnv_double(h, ml.width);
+    oa_fnv_double(h, ml.height);
+    oa_fnv_strmap(h, ml.font.raw);
+    oa_fnv_u64(h, ml.font_stack.size());
+    for (const auto& f : ml.font_stack) oa_fnv_strmap(h, f.raw);
+    oa_fnv_u64(h, ml.page.size());
+    for (const auto& u : ml.page) {
+        oa_fnv_u64(h, uint64_t(u.kind));
+        oa_fnv_bytes(h, u.data.data(), u.data.size());
+        oa_fnv_bytes(h, u.ruby_annotation.data(), u.ruby_annotation.size());
+        oa_fnv_strmap(h, u.font.raw);
+    }
+    // Layout-wide config ([prohibit]/[wordparts]/[indent]).
+    const oa::render::LayoutConfig& cfg = rt_->text().layout_config();
+    oa_fnv_bytes(h, cfg.prohibit_head.data(), cfg.prohibit_head.size());
+    oa_fnv_bytes(h, cfg.prohibit_foot.data(), cfg.prohibit_foot.size());
+    oa_fnv_bytes(h, cfg.wordparts.data(), cfg.wordparts.size());
+    oa_fnv_bytes(h, cfg.indent_pair.data(), cfg.indent_pair.size());
+    oa_fnv_u64(h, uint64_t(int64_t(cfg.indent_range)));
+    oa_fnv_u64(h, cfg.indent_nest ? 1u : 0u);
+    return h;
+}
+
+/// The laid-out page for `ml`, re-laid only when a layout input changed.
+const oa::render::LaidPage& FontSystem::cached_page(
+    const oa::render::MessageLayer& ml, oa::render::RenderBackend* backend) const {
+    FontSystem* self = const_cast<FontSystem*>(this);
+    // OA_NO_TEXT_CACHE=1: A/B switch — re-lay out every call (pre-cache
+    // behaviour) so a run can measure what the cache buys.
+    static const bool no_cache = std::getenv("OA_NO_TEXT_CACHE") != nullptr;
+    PageCacheEntry& entry = self->page_cache_[ml.id];
+    const uint64_t key = no_cache ? 0u : layout_key(ml);
+    if (entry.key != key) {
+        entry.page = oa::render::layout_page(
+            ml, metrics_fn, rt_->text().layout_config(), self);
+        entry.key = key;
+        // Bounded: layers are few; a runaway (scene churn) resets instead of
+        // growing without limit.
+        if (self->page_cache_.size() > 128) self->page_cache_.clear();
+    }
+    (void)backend;
+    return entry.page;
+}
+
 size_t FontSystem::draw_text_layer(oa::render::RenderBackend* backend,
                                    const oa::render::MessageLayer& ml,
                                    const oa::render::Affine2& world,
@@ -545,8 +614,11 @@ size_t FontSystem::draw_text_layer(oa::render::RenderBackend* backend,
 {
     if (!backend) return 0;
     if (!default_face && font_faces.empty()) return 0;
-    const oa::render::LaidPage page = oa::render::layout_page(
-        ml, metrics_fn, rt_->text().layout_config(), this);
+    // OA_TEXT_STATS=1: layout vs glyph-draw split for this layer (diagnostic).
+    static const bool text_stats = std::getenv("OA_TEXT_STATS") != nullptr;
+    const auto ts0 = std::chrono::steady_clock::now();
+    const oa::render::LaidPage& page = cached_page(ml, backend);
+    const auto ts1 = std::chrono::steady_clock::now();
     if (page.glyphs.empty()) return 0;
     size_t drawn = 0;
     // 字形布局坐标 = 文本节点本地坐标（节点世界变换的 text_for 注入语义：
@@ -735,6 +807,28 @@ size_t FontSystem::draw_text_layer(oa::render::RenderBackend* backend,
             ++drawn;
         }
     }
+    if (text_stats) {
+        const auto ts2 = std::chrono::steady_clock::now();
+        const double lay_us =
+            std::chrono::duration<double, std::micro>(ts1 - ts0).count();
+        const double draw_us =
+            std::chrono::duration<double, std::micro>(ts2 - ts1).count();
+        static uint64_t calls = 0, glyphs = 0;
+        static double lay_sum = 0, draw_sum = 0;
+        ++calls;
+        glyphs += page.glyphs.size();
+        lay_sum += lay_us;
+        draw_sum += draw_us;
+        if (calls % 120 == 0) {
+            std::printf("[text] calls=%llu glyphs=%llu layout=%.0fus/call "
+                        "draw=%.0fus/call last=%zu lay=%.0fus\n",
+                        (unsigned long long)calls, (unsigned long long)glyphs,
+                        lay_sum / 120.0, draw_sum / 120.0, page.glyphs.size(),
+                        lay_us);
+            lay_sum = 0;
+            draw_sum = 0;
+        }
+    }
     return drawn;
 }
 
@@ -742,9 +836,7 @@ FontSystem::TextExtents FontSystem::measure_text_extents(const oa::render::Messa
 {
     TextExtents ext;
     if (!const_cast<FontSystem*>(this)->face_for(ml.font)) return ext;
-    const oa::render::LaidPage page = oa::render::layout_page(
-        ml, metrics_fn, rt_->text().layout_config(),
-        const_cast<FontSystem*>(this));
+    const oa::render::LaidPage& page = cached_page(ml, nullptr);
     if (page.glyphs.empty()) return ext;
     uint32_t max_line = 0;
     for (const auto& g : page.glyphs) {

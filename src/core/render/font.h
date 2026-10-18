@@ -4,6 +4,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <unordered_map>
 
 #include "core/render/backend.h"
 #include "core/render/text.h"
@@ -98,6 +99,23 @@ public:
     // 供 e:var system=get_message_layer_width/height/line_width。
     struct TextExtents { double width = 0; double height = 0; double line_width = 0; };
     TextExtents measure_text_extents(const oa::render::MessageLayer& ml) const;
+    /// Per-layer layout cache for draw_text_layer. layout_page() is a full
+    /// re-layout — per-glyph metric lookups, line breaking, several vector
+    /// allocations — and the renderer asks for it once per visible message
+    /// layer PER FRAME; 逐字 reveal keeps the frame dirty for the whole page,
+    /// so the same unchanged page was re-laid out 60 times a second. The key
+    /// covers every layout input (page units + fonts + geometry + config), so
+    /// a content change re-lays out and an unchanged page costs one hash.
+    struct PageCacheEntry {
+        uint64_t key = 0;
+        oa::render::LaidPage page;
+    };
+    mutable std::unordered_map<std::string, PageCacheEntry> page_cache_;
+    /// FNV-1a over every input layout_page() reads (see PageCacheEntry).
+    uint64_t layout_key(const oa::render::MessageLayer& ml) const;
+    /// The laid-out page for `ml`, re-laid only when a layout input changed.
+    const oa::render::LaidPage& cached_page(const oa::render::MessageLayer& ml,
+                                            oa::render::RenderBackend* backend) const;
     /// Diagnostics/tests: whether a default text face resolved
     /// (engine default name + project font/ fallback).
     bool default_face_loaded() const { return default_face != nullptr; }
