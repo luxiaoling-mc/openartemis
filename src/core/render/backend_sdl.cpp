@@ -228,6 +228,18 @@ void SdlRenderBackend::present()
     SDL_RenderPresent(renderer_);
 }
 
+bool SdlRenderBackend::set_vsync(bool on)
+{
+    if (!renderer_) return false;
+    if (!SDL_SetRenderVSync(renderer_, on ? 1 : 0)) {
+        // No adapter vsync (remote desktop, compositor without a refresh
+        // clock): the host keeps its own pacing delay.
+        if (on) std::fprintf(stderr, "[render] vsync unavailable: %s\n", SDL_GetError());
+        return false;
+    }
+    return on;
+}
+
 TextureRef SdlRenderBackend::create_texture(int w, int h, TextureAccess access)
 {
     SDL_Texture* tex = SDL_CreateTexture(renderer_, SDL_PIXELFORMAT_RGBA32,

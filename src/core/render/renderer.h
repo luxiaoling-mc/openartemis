@@ -311,6 +311,10 @@ public:
     /// read between frames (snapshot_renderer / frame_luma / the [trans]
     /// GPU capture) hits the fixed stage frame.
     void render_end();
+    /// Ask the backend for vertical sync (true = present() paces the loop).
+    /// Returns whether the request took effect; the host keeps its own pacing
+    /// delay when it did not.
+    bool set_vsync(bool on);
 
 private:
     // ------------------------------------------------------------------

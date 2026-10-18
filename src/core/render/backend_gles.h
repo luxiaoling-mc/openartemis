@@ -72,6 +72,7 @@ public:
     bool draw_rule_transition(TextureRef capture, TextureRef rule,
                               float progress, float band) override;
     void present() override;
+    bool set_vsync(bool on) override;
 
     TextureRef create_texture(int w, int h, TextureAccess access) override;
     void destroy_texture(TextureRef t) override;

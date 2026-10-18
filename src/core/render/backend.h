@@ -150,6 +150,12 @@ public:
         return false;
     }
     virtual void present() = 0;
+    /// Enable/disable vertical sync for the presentation path. Returns true
+    /// when the request took effect; backends that cannot (or must not) change
+    /// it keep the default no-op and answer false so the host keeps its own
+    /// pacing delay. Presentation pacing is the host's call — see the app's
+    /// pacing tail.
+    virtual bool set_vsync(bool /*on*/) { return false; }
 
     // ---- 纹理对象 ----
     /// RGBA32 纹理（引擎所有像素都是直 RGBA）。

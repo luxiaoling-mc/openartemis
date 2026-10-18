@@ -48,6 +48,7 @@ public:
     void draw_geometry(TextureRef t, const Vertex* verts, int nverts,
                        const int* indices, int nindices) override;
     void present() override;
+    bool set_vsync(bool on) override;
 
     TextureRef create_texture(int w, int h, TextureAccess access) override;
     void destroy_texture(TextureRef t) override;

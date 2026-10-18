@@ -861,6 +861,12 @@ bool GlesRenderBackend::draw_rule_transition(TextureRef capture,
     return true;
 }
 
+bool GlesRenderBackend::set_vsync(bool on)
+{
+    if (!gl_context_) return false;
+    return SDL_GL_SetSwapInterval(on ? 1 : 0) == 0 && on;
+}
+
 void GlesRenderBackend::present()
 {
     if (!gl_context_) return;

@@ -709,6 +709,10 @@ void RenderEngine::draw_node(const oa::render::Compositor& sc,
                     scissor, drawn_out);
 }
 
+bool RenderEngine::set_vsync(bool on) {
+    return backend_ ? backend_->set_vsync(on) : false;
+}
+
 size_t RenderEngine::draw_text_bench(const oa::render::MessageLayer& ml, int times) {
     if (!backend_ || !fontSystem) return 0;
     size_t drawn = 0;

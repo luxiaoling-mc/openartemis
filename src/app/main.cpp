@@ -403,9 +403,11 @@ struct FrameStat {
     uint32_t pump = 0;     // host-frame pump (video/emote texture uploads)
     uint32_t draw = 0;     // dirty gate + text layout + draw pass
     uint32_t present = 0;  // render_end (present / readback)
+    uint32_t present_gap = 0; // time since the previous PRESENTED frame
     bool repaint = false;
     uint64_t frame = 0;
 };
+static bool s_vsync_active = false; // present() paces the loop (no SDL_Delay)
 static bool s_fstats = false; // OA_FRAME_STATS
 static std::vector<FrameStat> s_fstat_log;
 static FrameStat s_fstat_cur;
@@ -432,11 +434,15 @@ static void frame_stats_report() {
         std::sort(vals.begin(), vals.end());
         return vals[std::min(vals.size() - 1, size_t(p * double(vals.size())))];
     };
-    double isum = 0, wsum = 0;
+    double isum = 0, wsum = 0, tsum = 0, psum = 0, dsum = 0, rsum = 0;
     size_t over33 = 0, over50 = 0, repaints = 0;
     for (const auto& s : v) {
         isum += s.interval;
         wsum += s.work;
+        tsum += s.tick;
+        psum += s.pump;
+        dsum += s.draw;
+        rsum += s.present;
         if (s.interval > 33333) ++over33;
         if (s.interval > 50000) ++over50;
         if (s.repaint) ++repaints;
@@ -451,6 +457,25 @@ static void frame_stats_report() {
                 pct(0.99, &FrameStat::interval) / 1000.0,
                 pct(0.999, &FrameStat::interval) / 1000.0, over33,
                 100.0 * double(over33) / n, over50);
+    {
+        std::vector<uint32_t> gaps;
+        for (const auto& s : v)
+            if (s.present_gap) gaps.push_back(s.present_gap);
+        std::sort(gaps.begin(), gaps.end());
+        if (!gaps.empty())
+            std::printf("[fstats] presented=%zu gap p50=%.2f p90=%.2f p99=%.2f "
+                        "max=%.2f ms (%.1f fps)\n",
+                        gaps.size(), gaps[gaps.size() / 2] / 1000.0,
+                        gaps[std::min(gaps.size() - 1, size_t(gaps.size() * 0.9))] / 1000.0,
+                        gaps[std::min(gaps.size() - 1, size_t(gaps.size() * 0.99))] / 1000.0,
+                        gaps.back() / 1000.0,
+                        gaps[gaps.size() / 2] ? 1000.0 / (gaps[gaps.size() / 2] / 1000.0) : 0.0);
+    }
+    std::printf("[fstats] mean split: tick=%.2f pump=%.2f draw=%.2f "
+                "present=%.2f other=%.2f ms\n",
+                tsum / n / 1000.0, psum / n / 1000.0, dsum / n / 1000.0,
+                rsum / n / 1000.0,
+                (wsum - tsum - psum - dsum - rsum) / n / 1000.0);
     std::sort(v.begin(), v.end(),
               [](const FrameStat& a, const FrameStat& b) { return a.interval > b.interval; });
     const size_t show = std::min<size_t>(8, v.size());
@@ -857,6 +882,21 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char* argv[])
         std::fprintf(stderr, "[app] renderer creation failed (kind=%s): %s\n",
                      state->opt.renderer.c_str(), SDL_GetError());
         return SDL_APP_FAILURE;
+    }
+    // Presentation pacing. A real window syncs to the display by default:
+    // present() then blocks until the next refresh, which IS the frame pacing —
+    // adding the loop's own SDL_Delay on top would give 16 ms + 8 ms ≈ 47 fps
+    // on a 60 Hz panel. `--fps N` keeps the explicit harness pacing, and
+    // autodrive journeys keep it too (their frame↔time mapping is what the
+    // pixel baselines are recorded against). OA_VSYNC=0/1 forces the choice.
+    {
+        const char* v = std::getenv("OA_VSYNC");
+        bool harness = state->opt.fps != 0; // explicit --fps pacing
+#if OA_TEST_BUILD
+        harness = harness || !state->ad_flow.empty();
+#endif
+        const bool want = (v && *v) ? std::atoi(v) != 0 : !harness;
+        if (want) s_vsync_active = state->oaRender->set_vsync(true);
     }
     // GPU-compositing host: latch the default for NEW emote players so a
     // fresh layer skips its load-time full CPU pose raster (the app
@@ -1629,6 +1669,9 @@ SDL_AppResult SDL_AppIterate(void* appstate)
     // window resize/expose events force one repaint at the new size.
     const bool repaint_requested = state->force_repaint;
     state->force_repaint = false;
+    // Whether this iteration actually presented (vsync only paces frames that
+    // reach the display; a skipped static frame would otherwise spin).
+    bool presented_this_frame = false;
     if (frame_dirty || !s_rendered_any || repaint_requested) {
 
         state->oaRender->render_beigin();
@@ -1681,6 +1724,28 @@ SDL_AppResult SDL_AppIterate(void* appstate)
         // content (pre-present) when a takess request is pending.
         state->rt->post_frame_capture();
         state->oaRender->render_end();
+        // Vsync effectiveness canary. Presenting can be a no-op for the
+        // compositor (occluded/minimized window, remote desktop): the swap
+        // chain then returns immediately and the loop would run at hundreds of
+        // fps with nothing pacing it. Measure the presented-frame interval and
+        // fall back to the timer delay if it stays faster than any display.
+        if (s_vsync_active) {
+            static uint64_t prev_present_ms = 0;
+            static double ema_ms = -1;
+            static int samples = 0;
+            const uint64_t now_ms = SDL_GetTicks();
+            if (prev_present_ms && now_ms > prev_present_ms) {
+                const double d = double(now_ms - prev_present_ms);
+                ema_ms = ema_ms < 0 ? d : ema_ms * 0.9 + d * 0.1;
+                if (++samples > 60 && ema_ms < 3.5) {
+                    s_vsync_active = false;
+                    std::printf("[render] vsync is not pacing presentation "
+                                "(%.1f ms between frames); using the timer "
+                                "delay instead\n", ema_ms);
+                }
+            }
+            prev_present_ms = now_ms ? now_ms : 1;
+        }
         fstat_mark(&s_fstat_cur.present);
         s_fstat_cur.repaint = true;
 #if OA_TEST_BUILD
@@ -1730,6 +1795,7 @@ SDL_AppResult SDL_AppIterate(void* appstate)
         }
 #endif
         s_rendered_any = true;
+        presented_this_frame = true;
     }
     ++state->frames;
     if (state->frames == 1) std::printf("[app] first-frame layers=%zu\n", state->rt->scene().size());
@@ -1998,18 +2064,37 @@ SDL_AppResult SDL_AppIterate(void* appstate)
 #endif
     if (s_fstats)
         s_fstat_cur.work = fstat_us(s_fstat_start, std::chrono::steady_clock::now());
-    if (state->opt.fps > 0) {
-        // --fps N: pace each frame to ~1000/N ms of wall time (keeps the
-        // real-time delta semantics, just with a target frame interval).
+    // Pacing tail. `--fps N` is the harness cap; a real window instead syncs
+    // to the display and caps at the PROJECT's fps (the timeline the game was
+    // authored against — the Rust runtime paces the same way), so a 165 Hz
+    // panel does not render a 60 fps story at 165 fps. Both are the same
+    // arithmetic: present already waited for the vblank, so only the rest of
+    // the frame budget is slept. No cap at all → the legacy 8 ms idle delay
+    // (also what a static frame that skipped the present uses: vsync cannot
+    // pace a frame that never reached the display).
+    const int cap = state->opt.fps > 0
+                        ? state->opt.fps
+                        : (s_vsync_active && presented_this_frame
+                               ? state->rt->project_.config.fps
+                               : 0);
+    if (cap > 0) {
         const Uint64 spent = SDL_GetTicks() - frame_start;
-        const Uint64 want = 1000u / (unsigned)state->opt.fps;
+        const Uint64 want = 1000u / (unsigned)cap;
         if (want > 0 && spent < want) SDL_Delay((Uint32)(want - spent));
-    }
-    else {
-        SDL_Delay(8); // legacy default pacing (~60 fps ballpark)
+    } else {
+        SDL_Delay(8);
     }
     if (s_fstats) {
         s_fstat_cur.frame = state->frames;
+        // Presented-frame cadence: the interval the eye actually sees (idle
+        // frames that skip the present are not part of it).
+        static std::chrono::steady_clock::time_point last_present{};
+        if (s_fstat_cur.repaint) {
+            const auto t = std::chrono::steady_clock::now();
+            if (last_present.time_since_epoch().count())
+                s_fstat_cur.present_gap = fstat_us(last_present, t);
+            last_present = t;
+        }
         if (std::getenv("OA_FRAME_STATS")[0] == '2' && s_fstat_cur.interval > 25000)
             std::printf("[fstats] slow f=%llu interval=%.1f work=%.1f tick=%.1f "
                         "pump=%.1f draw=%.1f present=%.1f repaint=%d\n",
