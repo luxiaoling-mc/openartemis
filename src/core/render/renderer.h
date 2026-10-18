@@ -437,6 +437,12 @@ private:
     // GPU emote canvases (offscreen targets, also registered in
     // `textures` under the same key while active) and their atlas textures.
     std::map<oa::render::TextureKey, TextureRef> emote_canvas_;
+    /// Pixel size each cached canvas was created with. The canvas is reused
+    /// across poses, but a reload can change the render-buffer size (E-mote
+    /// half-res policy differs per PSB / per load): reusing the old texture
+    /// then draws the new pose into a target of the wrong size and the figure
+    /// is cropped (seen as "only the feet" after a config round-trip).
+    std::map<oa::render::TextureKey, std::pair<int, int>> emote_canvas_size_;
     // Emote atlas textures, keyed by ({layer canvas key}, source index, PSB
     // identity). The PSB identity (EmoteFile::uid) is REQUIRED: a game reuses
     // one layer id while swapping the character's file ([fg] file="mit_0" ->

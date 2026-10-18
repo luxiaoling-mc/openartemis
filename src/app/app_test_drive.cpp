@@ -6017,6 +6017,28 @@ static void ad_emote_dump(AppState* s, const char* tag) {
                 wh = int((*r)[3]);
             }
         }
+        // Pose geometry in canvas pixels: the layer rect can stay identical
+        // while the parts are drawn at the wrong scale/offset (the "only the
+        // feet" report), so dump the union bbox of this pose's vertices.
+        double bx0 = 1e9, by0 = 1e9, bx1 = -1e9, by1 = -1e9;
+        size_t nparts = 0;
+        if (st.player) {
+            std::vector<oa::emote::EmoteDrawPart> parts;
+            std::string err;
+            if (st.player->collect_pose_parts(&parts, &err)) {
+                nparts = parts.size();
+                for (const auto& pt : parts)
+                    for (const auto& v : pt.verts) {
+                        bx0 = std::min(bx0, v.x);
+                        by0 = std::min(by0, v.y);
+                        bx1 = std::max(bx1, v.x);
+                        by1 = std::max(by1, v.y);
+                    }
+            }
+        }
+        std::printf("[confret]   pose parts=%zu bbox=(%.0f,%.0f)-(%.0f,%.0f)\n",
+                    nparts, nparts ? bx0 : 0.0, nparts ? by0 : 0.0,
+                    nparts ? bx1 : 0.0, nparts ? by1 : 0.0);
         std::printf("[confret]   id=%s canvas=%dx%d rev=%llu vis=%d alpha=%.2f "
                     "left=%.1f top=%.1f scale=%.1f/%.1f anchor=%.0f/%.0f "
                     "clip=%d(%.0f,%.0f,%.0fx%.0f) world=(%d,%d %dx%d)\n",
@@ -6048,6 +6070,15 @@ static void ad_conf_inventory(AppState* s) {
 }
 static bool ad_confret_drive(AppState* s) {
     oa::runtime::GameRuntime* rt = s->rt.get();
+    // Disarm the legacy P1b title probe: it latches onto the first
+    // bt_start-keyed layer, and once the synthetic pointer happens to hover it
+    // it ends the run 900 frames later ("P1b fallback end"), which is not this
+    // journey's business.
+    s->probe_id.clear();
+    s->hover_end_armed = false;
+    // P1b only runs when --frames is set; this journey ends the run itself, so
+    // drop the target and keep the probe machinery out of the way.
+    s->opt.frames_target = 0;
     static int sub = 0, waits = 0;
     static uint64_t t_stage = 0;
     const uint64_t now = SDL_GetTicks();
@@ -6066,19 +6097,31 @@ static bool ad_confret_drive(AppState* s) {
             const bool title_up = ad_find_clickable(s, "bt_start", "", false) ||
                                   ad_find_clickable(s, "bt_continue", "", false);
             if (title_up || now - t_stage > 25000) {
+                s->ad_hover = false; // release the synthetic hover (P1b probe)
                 sub = 1;
                 t_stage = now;
                 waits = 0;
                 return false;
             }
-            if (waits % 30 == 0) {
-                // Hold the button a few frames like a real press: the select
-                // page reacts on the held state, and a one-frame synthetic
-                // press can be sampled before the page's own timer runs.
-                ad_arm_drag(s, sw / 2, int(sh * 0.40), sw / 2, int(sh * 0.40), 6);
-                s->ad_press_key = 13; // Enter: some select pages confirm on the key
-                std::printf("[confret] language row press (%d,%d) via page catcher\n",
-                            sw / 2, int(sh * 0.40));
+            // Row layers first (1.80.120.<n>...: name=select, key=CLICK):
+            // hover them for a few frames like the tests do — the cursor
+            // model's rollover arms the row — then press and hold.
+            const oa::render::Layer* row = nullptr;
+            for (const oa::render::Layer* l : rt->scene().draw_order()) {
+                if (l->id.rfind("1.80.120.", 0) != 0) continue;
+                if (!rt->scene().is_effectively_visible(l->id)) continue;
+                if (l->event_handlers.find("click") == l->event_handlers.end()) continue;
+                if (!row || l->id < row->id) row = l;
+            }
+            int cx = sw / 2, cy = int(sh * 0.40);
+            if (row) ad_layer_center(s, row, &cx, &cy);
+            s->ad_hover = true;
+            s->ad_cx = cx;
+            s->ad_cy = cy;
+            if (waits % 30 == 29) {
+                ad_arm_drag(s, cx, cy, cx, cy, 6);
+                std::printf("[confret] language row press (%d,%d) row=%s\n", cx, cy,
+                            row ? row->id.c_str() : "(catcher)");
             }
         }
         if (cn) {
@@ -6119,18 +6162,6 @@ static bool ad_confret_drive(AppState* s) {
         return false;
     }
     if (sub == 2) { // quicksave load first, then advance until an emote layer exists
-        static bool tried_qload = false;
-        if (!tried_qload && waits > 45 && waits % 60 == 0) {
-            const oa::render::Layer* ql = ad_find_clickable(s, "bt_qload", "", false);
-            if (!ql) ql = ad_find_clickable(s, "tb_qload", "", false);
-            if (ql) {
-                tried_qload = true;
-                ad_click_layer(s, ql);
-                std::printf("[confret] quicksave load clicked ('%s')\n", ql->id.c_str());
-                t_stage = now;
-                return false;
-            }
-        }
         if (rt->emote_layers().size() >= 1 && waits > 30) {
             std::printf("[confret] story page with %zu emote layer(s)\n",
                         rt->emote_layers().size());
@@ -6139,6 +6170,7 @@ static bool ad_confret_drive(AppState* s) {
             if (!s->ad_out.empty()) ad_png_shot(s, "confret_before");
             sub = 3;
             waits = 0;
+            t_stage = now;
             return false;
         }
         if (now - t_stage > 240000 || ++waits > 24000) {
@@ -6185,10 +6217,29 @@ static bool ad_confret_drive(AppState* s) {
         }
         return false;
     }
-    if (sub == 3) { // open config
+    if (sub == 3) { // reveal the story dock, then open config
         const oa::render::Layer* cfg = ad_find_clickable(s, "bt_config", "", false);
         if (!cfg) cfg = ad_find_clickable(s, "bt_conf", "", false);
         if (!cfg) cfg = ad_find_clickable(s, "", "config", true);
+        if (!cfg && ++waits < 900) {
+            // uija-family story dock is a hover-revealed hotspot along the
+            // bottom edge: park the synthetic pointer there and wait.
+            const int sw = rt->project_.config.stage_width;
+            const int sh = rt->project_.config.stage_height;
+            s->ad_hover = true;
+            s->ad_cx = sw / 2;
+            s->ad_cy = sh - 8;
+            if (waits == 240) { // hover alone did not reveal it: click the strip
+                s->ad_click = true;
+                std::printf("[confret] clicking the bottom strip for the dock\n");
+            }
+            if (waits % 120 == 0) {
+                ad_conf_inventory(s);
+                std::printf("[confret] dock probe t=%llums waits=%d\n",
+                            (unsigned long long)(now - t_stage), waits);
+            }
+            return false;
+        }
         if (cfg && ++waits > 30) {
             ad_click_layer(s, cfg);
             std::printf("[confret] config button '%s' clicked\n", cfg->id.c_str());
@@ -6197,7 +6248,7 @@ static bool ad_confret_drive(AppState* s) {
             waits = 0;
             return false;
         }
-        if (now - t_stage > 8000) {
+        if (now - t_stage > 45000) {
             std::printf("[confret] VERDICT FAIL (no config button)\n");
             return true;
         }

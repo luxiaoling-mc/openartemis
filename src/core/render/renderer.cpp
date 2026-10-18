@@ -150,6 +150,7 @@ void RenderEngine::release_all()
         if (t) backend_->destroy_texture(t);
     group_tex_cache.clear();
     emote_canvas_.clear();
+    emote_canvas_size_.clear();
     emote_atlases_.clear();
     textures.clear();
     trans_capture_tex = nullptr;
@@ -888,6 +889,22 @@ bool RenderEngine::emote_render_parts(const oa::render::TextureKey& key,
     TextureRef canvas = nullptr;
     const auto ct = emote_canvas_.find(key);
     if (ct != emote_canvas_.end()) canvas = ct->second;
+    // A canvas is only valid for the size it was created with.
+    const auto sz = emote_canvas_size_.find(key);
+    if (canvas && (sz == emote_canvas_size_.end() || sz->second.first != w ||
+                   sz->second.second != h)) {
+        if (std::getenv("OA_EMOTE_DEBUG"))
+            std::fprintf(stderr,
+                         "[emote] canvas '%s' size %dx%d -> %dx%d: rebuild\n",
+                         key.name.c_str(), sz == emote_canvas_size_.end() ? 0 : sz->second.first,
+                         sz == emote_canvas_size_.end() ? 0 : sz->second.second, w, h);
+        const auto tx = textures.find(key);
+        if (tx != textures.end() && tx->second == canvas) textures.erase(tx);
+        backend_->destroy_texture(canvas);
+        emote_canvas_.erase(key);
+        emote_canvas_size_.erase(key);
+        canvas = nullptr;
+    }
     if (!canvas) {
         canvas = backend_->create_texture(w, h, TextureAccess::Target);
         if (!canvas) return false;
@@ -900,6 +917,7 @@ bool RenderEngine::emote_render_parts(const oa::render::TextureKey& key,
             textures.erase(old);
         }
         emote_canvas_[key] = canvas;
+        emote_canvas_size_[key] = {w, h};
         textures[key] = canvas;
     }
     // draw into the canvas: clear transparent, then parts in draw order.
