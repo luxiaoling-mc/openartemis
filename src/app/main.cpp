@@ -384,6 +384,86 @@ static std::string host_save_root(const std::string& pfs_path, bool is_dir) {
     return save_root;
 }
 
+// ---------------------------------------------------------------------------
+// OA_FRAME_STATS=1 — per-iteration timing probe (diagnostic; no behaviour
+// change).
+//
+// The window is presented WITHOUT vsync and the loop paces itself with
+// SDL_Delay, so a headline fps does not describe how the game feels: the eye
+// sees the INTERVAL distribution, and one 40 ms frame among 16 ms ones reads as
+// a hitch. This records every iteration in microseconds — loop interval, engine
+// tick, host-frame pump (video/emote uploads), draw pass, present — and prints
+// percentiles plus the slowest iterations with their split at exit, so a "卡"
+// report can be attributed to a phase instead of guessed at.
+// ---------------------------------------------------------------------------
+struct FrameStat {
+    uint32_t interval = 0; // start-to-start (includes the pacing sleep)
+    uint32_t work = 0;     // start-to-end of the iteration body
+    uint32_t tick = 0;     // input + engine tick
+    uint32_t pump = 0;     // host-frame pump (video/emote texture uploads)
+    uint32_t draw = 0;     // dirty gate + text layout + draw pass
+    uint32_t present = 0;  // render_end (present / readback)
+    bool repaint = false;
+    uint64_t frame = 0;
+};
+static bool s_fstats = false; // OA_FRAME_STATS
+static std::vector<FrameStat> s_fstat_log;
+static FrameStat s_fstat_cur;
+static std::chrono::steady_clock::time_point s_fstat_start{}, s_fstat_mark{},
+    s_fstat_prev{};
+static inline uint32_t fstat_us(std::chrono::steady_clock::time_point a,
+                                std::chrono::steady_clock::time_point b) {
+    return uint32_t(std::chrono::duration_cast<std::chrono::microseconds>(b - a).count());
+}
+/// Close the current phase into `slot` and start the next one.
+static inline void fstat_mark(uint32_t* slot) {
+    if (!s_fstats) return;
+    const auto t = std::chrono::steady_clock::now();
+    *slot = fstat_us(s_fstat_mark, t);
+    s_fstat_mark = t;
+}
+static void frame_stats_report() {
+    if (!s_fstats || s_fstat_log.size() < 2) return;
+    std::vector<FrameStat> v = s_fstat_log;
+    auto pct = [&](double p, uint32_t FrameStat::*f) {
+        std::vector<uint32_t> vals;
+        vals.reserve(v.size());
+        for (const auto& s : v) vals.push_back(s.*f);
+        std::sort(vals.begin(), vals.end());
+        return vals[std::min(vals.size() - 1, size_t(p * double(vals.size())))];
+    };
+    double isum = 0, wsum = 0;
+    size_t over33 = 0, over50 = 0, repaints = 0;
+    for (const auto& s : v) {
+        isum += s.interval;
+        wsum += s.work;
+        if (s.interval > 33333) ++over33;
+        if (s.interval > 50000) ++over50;
+        if (s.repaint) ++repaints;
+    }
+    const double n = double(v.size());
+    std::printf("[fstats] frames=%zu repaint=%zu mean_interval=%.2fms "
+                "mean_work=%.2fms | p50=%.2f p90=%.2f p99=%.2f max=%.2fms | "
+                ">33ms=%zu (%.1f%%) >50ms=%zu\n",
+                v.size(), repaints, isum / n / 1000.0, wsum / n / 1000.0,
+                pct(0.50, &FrameStat::interval) / 1000.0,
+                pct(0.90, &FrameStat::interval) / 1000.0,
+                pct(0.99, &FrameStat::interval) / 1000.0,
+                pct(0.999, &FrameStat::interval) / 1000.0, over33,
+                100.0 * double(over33) / n, over50);
+    std::sort(v.begin(), v.end(),
+              [](const FrameStat& a, const FrameStat& b) { return a.interval > b.interval; });
+    const size_t show = std::min<size_t>(8, v.size());
+    for (size_t i = 0; i < show; ++i) {
+        const FrameStat& s = v[i];
+        std::printf("[fstats]   #%zu interval=%.1f work=%.1f tick=%.1f pump=%.1f "
+                    "draw=%.1f present=%.1f repaint=%d\n",
+                    i + 1, s.interval / 1000.0, s.work / 1000.0, s.tick / 1000.0,
+                    s.pump / 1000.0, s.draw / 1000.0, s.present / 1000.0,
+                    int(s.repaint));
+    }
+}
+
 SDL_AppResult SDL_AppInit(void** appstate, int argc, char* argv[])
 {
     // the SDL3 main-callback driver runs event-gated when the
@@ -402,6 +482,10 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char* argv[])
     // 创建app
     AppState* state = new AppState();
     *appstate = state;
+
+    // OA_FRAME_STATS=1: per-iteration timing (see frame_stats_report).
+    s_fstats = std::getenv("OA_FRAME_STATS") != nullptr;
+    if (s_fstats) s_fstat_log.reserve(240000);
 
     const int parsed = parse_args(argc, argv, state->opt);
     if (parsed == 1) return SDL_APP_SUCCESS; // --help printed
@@ -1136,6 +1220,17 @@ SDL_AppResult SDL_AppIterate(void* appstate)
 {
     AppState* state = static_cast<AppState*>(appstate);
 
+    // OA_FRAME_STATS: open this iteration's record (start-to-start interval,
+    // phase marks below, work closed at the pacing tail).
+    if (s_fstats) {
+        s_fstat_start = std::chrono::steady_clock::now();
+        s_fstat_cur = FrameStat{};
+        if (s_fstat_prev.time_since_epoch().count())
+            s_fstat_cur.interval = fstat_us(s_fstat_prev, s_fstat_start);
+        s_fstat_prev = s_fstat_start;
+        s_fstat_mark = s_fstat_start;
+    }
+
     // Finish a tap that started in a previous frame: the press was pushed then,
     // the release goes out now so the engine sees the button held for a frame
     // instead of a press/release pair collapsed into one tick.
@@ -1341,6 +1436,7 @@ SDL_AppResult SDL_AppIterate(void* appstate)
         std::fprintf(stderr, "[app] tick error: %s\n", e.what());
         return SDL_APP_FAILURE;
     }
+    fstat_mark(&s_fstat_cur.tick);
     // per-frame edge lifecycle: everything this frame appended (SDL events
     // and synthetic wheel-pulse up edges) is consumed by the tick above and
     // must not leak into the next frame when no new events arrive.
@@ -1357,6 +1453,7 @@ SDL_AppResult SDL_AppIterate(void* appstate)
     // player keeps breathing underneath.
     bool emote_active = false;
     const bool video_active = state->oaRender->pump_host_frames(&emote_active);
+    fstat_mark(&s_fstat_cur.pump);
 #if OA_TEST_BUILD
     // OA_STATE_LOG=1: fine-grained headless-style state heartbeat (every 120
     // frames) for external drivers (Xvfb UX journeys): wait kind, layer count
@@ -1545,6 +1642,7 @@ SDL_AppResult SDL_AppIterate(void* appstate)
         // background-freeze hotspot).
         const oa::render::Compositor& sc = state->rt->scene();
         const size_t drawn = state->oaRender->draw_scene(sc, global_fade);
+        fstat_mark(&s_fstat_cur.draw);
 
         // L2 M3: glyphs painted at their node slots inside draw_scene (the
         // old scene-wide trailing text pass is gone — every drawable message
@@ -1583,6 +1681,8 @@ SDL_AppResult SDL_AppIterate(void* appstate)
         // content (pre-present) when a takess request is pending.
         state->rt->post_frame_capture();
         state->oaRender->render_end();
+        fstat_mark(&s_fstat_cur.present);
+        s_fstat_cur.repaint = true;
 #if OA_TEST_BUILD
         // auto-drive: sample the just-presented pixels (tail stage) and
         // note that a fresh frame exists for the driver's residue counting.
@@ -1861,6 +1961,8 @@ SDL_AppResult SDL_AppIterate(void* appstate)
     // reports the failure).
     video_demo_end(state, &state->quit);
 #endif
+    if (s_fstats)
+        s_fstat_cur.work = fstat_us(s_fstat_start, std::chrono::steady_clock::now());
     if (state->opt.fps > 0) {
         // --fps N: pace each frame to ~1000/N ms of wall time (keeps the
         // real-time delta semantics, just with a target frame interval).
@@ -1870,6 +1972,18 @@ SDL_AppResult SDL_AppIterate(void* appstate)
     }
     else {
         SDL_Delay(8); // legacy default pacing (~60 fps ballpark)
+    }
+    if (s_fstats) {
+        s_fstat_cur.frame = state->frames;
+        if (std::getenv("OA_FRAME_STATS")[0] == '2' && s_fstat_cur.interval > 25000)
+            std::printf("[fstats] slow f=%llu interval=%.1f work=%.1f tick=%.1f "
+                        "pump=%.1f draw=%.1f present=%.1f repaint=%d\n",
+                        (unsigned long long)s_fstat_cur.frame,
+                        s_fstat_cur.interval / 1000.0, s_fstat_cur.work / 1000.0,
+                        s_fstat_cur.tick / 1000.0, s_fstat_cur.pump / 1000.0,
+                        s_fstat_cur.draw / 1000.0, s_fstat_cur.present / 1000.0,
+                        int(s_fstat_cur.repaint));
+        s_fstat_log.push_back(s_fstat_cur);
     }
 #if OA_TEST_BUILD
     // OA_DIRTY_AB: 旅程/运行结束汇总(退出帧的 A/B 已在上面跑完)
@@ -1913,6 +2027,7 @@ void SDL_AppQuit(void* appstate, SDL_AppResult result)
             // delivery summary (water levels / dry hits / push gaps over the
             // run; no-op unless the diagnostics were enabled).
             state->rt->media_players().print_audio_diag("run");
+            frame_stats_report();
             state->rt->media_players().release();
         }
         SDL_DestroyWindow(state->window);

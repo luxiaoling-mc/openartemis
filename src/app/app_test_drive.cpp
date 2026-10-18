@@ -5869,6 +5869,7 @@ static size_t ad_hover_targets(AppState* s, int (*out)[2], size_t cap) {
 }
 static bool ad_hover_drive(AppState* s) {
     static int sub = 0, left = -1, step = 24, beat = 60, hold = 0, row_prev = -1;
+    static int park = -1; // OA_HOVER_PARK=n: stay on row n (no sweep)
     static uint64_t t0 = 0, last = 0, worst = 0, under0 = 0, lvl_min = UINT64_MAX;
     static uint64_t t_stage = 0, t_beat = 0;
     static unsigned long long lvl_sum = 0, lvl_n = 0;
@@ -5879,6 +5880,7 @@ static bool ad_hover_drive(AppState* s) {
         left = ((v = std::getenv("OA_HOVER_FRAMES")) && *v) ? std::max(1, std::atoi(v)) : 900;
         step = ((v = std::getenv("OA_HOVER_STEP")) && *v) ? std::max(1, std::atoi(v)) : 24;
         beat = ((v = std::getenv("OA_HOVER_BEAT")) && *v) ? std::max(1, std::atoi(v)) : 60;
+        if ((v = std::getenv("OA_HOVER_PARK")) && *v) park = std::atoi(v) - 1;
         if ((v = std::getenv("OA_HOVER_MUTE")) && *v && std::atoi(v) != 0) {
             s->rt->audio().set_master_volume(0.0f);
             std::printf("[hover] master volume 0 (queue behaviour unchanged)\n");
@@ -5932,14 +5934,15 @@ static bool ad_hover_drive(AppState* s) {
         t0 = last = SDL_GetTicks();
         worst = 0;
         s->ad_hover = true;
-        s->ad_cx = targets[0][0];
-        s->ad_cy = targets[0][1];
+        cur = (park >= 0 && size_t(park) < ntargets) ? size_t(park) : 0;
+        s->ad_cx = targets[cur][0];
+        s->ad_cy = targets[cur][1];
         hold = step;
         sub = 2;
         return false;
     }
     // Stage 2: sweep the pointer across the rows for `left` frames.
-    if (--hold <= 0) {
+    if (park < 0 && --hold <= 0) {
         cur = (cur + 1) % ntargets;
         hold = step;
         s->ad_cx = targets[cur][0];

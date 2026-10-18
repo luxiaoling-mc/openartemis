@@ -586,6 +586,34 @@ void RenderEngine::draw_group_node(const oa::render::Compositor& sc,
     const oa::render::Layer& layer = node.layer;
     // ---- offscreen group composite (node-local strategy) ----------
     GroupPlan p = resolve_group_plan(sc, layer, scissor);
+    // Identity composite → draw the subtree inline instead of baking.
+    //
+    // Artemis marks the scene's top container `intermediate_render=2`
+    // ("opaque" mode), and for it the offscreen pass buys nothing: alpha 1, no
+    // colour op / mask, alpha blend, and a clip that covers the whole stage
+    // (which the stage target already enforces). What it costs is a full-stage
+    // GPU readback, a 2-megapixel CPU composite and an 8 MB upload — measured
+    // 20-45 ms per bake on test3's title, and the bake cache is dropped on
+    // EVERY animated frame (tween / video / emote / text reveal), so such a
+    // scene ran at 10-15 fps. "Over" is associative, so inline drawing is
+    // pixel-identical.
+    const bool identity_composite =
+        !p.mask && !p.grayscale && !p.negative && p.group_alpha >= 1.0 - 1e-9 &&
+        p.blend == BlendMode::Blend &&
+        std::abs(p.color_multiply[0] - 1.0) < 1e-9 &&
+        std::abs(p.color_multiply[1] - 1.0) < 1e-9 &&
+        std::abs(p.color_multiply[2] - 1.0) < 1e-9 &&
+        (!p.clip || (p.clip->x <= 0 && p.clip->y <= 0 &&
+                     p.clip->w >= stage_w_ && p.clip->h >= stage_h_));
+    // OA_NO_GROUP_INLINE=1: A/B switch — take the old offscreen path even for
+    // an identity composite, so a run can diff the two drawings pixel-for-pixel.
+    static const bool no_inline = std::getenv("OA_NO_GROUP_INLINE") != nullptr;
+    if (identity_composite && !no_inline) {
+        // intermediate mode keeps the group's own alpha out of the subtree,
+        // which is 1 here anyway.
+        draw_plain_node(sc, node, world, 1, parent_op, scissor, drawn_out);
+        return;
+    }
     const bool had_clip = backend_->clip_enabled();
     IRect old_clip{};
     if (had_clip) old_clip = backend_->clip_rect();
@@ -617,6 +645,8 @@ void RenderEngine::draw_group_node(const oa::render::Compositor& sc,
     for (const oa::render::SceneNode* c : node.children)
         draw_node(sc, *c, world, parent_op, p.clip, drawn_out);
     // read the group target back for the CPU composite
+    static const bool bake_log = std::getenv("OA_BAKE_LOG") != nullptr;
+    const auto bake_t0 = std::chrono::steady_clock::now();
     int gw = 0, gh = 0;
     std::vector<uint8_t> px;
     if (!backend_->read_target(&gw, &gh, &px) || gw != stage_w_ ||
@@ -628,6 +658,7 @@ void RenderEngine::draw_group_node(const oa::render::Compositor& sc,
     // CPU composite → straight RGBA (bake content only; alpha at draw time)
     std::vector<uint8_t> out_px(size_t(stage_w_) * stage_h_ * 4, 0);
     group_composite_cpu(px, stage_w_, stage_h_, p, &out_px);
+    const auto bake_t1 = std::chrono::steady_clock::now();
     end_offscreen_pass(saved_target, had_clip, old_clip);
     // upload the baked texture into the cache and blend once
     TextureRef baked = upload_baked_texture(out_px, stage_w_, stage_h_);
@@ -636,6 +667,27 @@ void RenderEngine::draw_group_node(const oa::render::Compositor& sc,
         composite_group_bake(baked, p, had_clip, old_clip);
     }
     backend_->destroy_texture(group_tex);
+    if (bake_log) {
+        const auto bake_t2 = std::chrono::steady_clock::now();
+        const double read_ms =
+            std::chrono::duration<double, std::milli>(bake_t1 - bake_t0).count();
+        const double rest_ms =
+            std::chrono::duration<double, std::milli>(bake_t2 - bake_t1).count();
+        const std::string* lm = layer_prop(layer, "layermode");
+        const std::string* cmv = layer_prop(layer, "colormultiply");
+        std::printf("[bake] id=%s stage=%dx%d read+cpu=%.1fms upload=%.1fms "
+                    "mode=%d mask=%d gray=%d neg=%d alpha=%.2f cm=%s lm=%s "
+                    "crop=%d\n",
+                    layer.id.c_str(), stage_w_, stage_h_, read_ms, rest_ms,
+                    intermediate_mode(layer), int(p.mask != nullptr),
+                    int(p.grayscale), int(p.negative), p.group_alpha,
+                    cmv ? cmv->c_str() : "-", lm ? lm->c_str() : "-",
+                    int(oa::render::content_role_of(layer).clip_crop_window(layer)));
+        std::printf("[bake]   clip=%d,%d,%dx%d blend=%d\n",
+                    p.clip ? p.clip->x : -1, p.clip ? p.clip->y : -1,
+                    p.clip ? p.clip->w : -1, p.clip ? p.clip->h : -1,
+                    int(p.blend));
+    }
 }
 
 void RenderEngine::draw_node(const oa::render::Compositor& sc,
