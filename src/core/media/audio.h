@@ -312,9 +312,10 @@ public:
     /// bounded; `OA_AUDIO_NO_BOUND=1` does the same from the environment.
     void set_audio_bound_enabled(bool on);
 
-    /// queued level the mix pacer aims at (one device
-    /// period + the producer's own tick chunk, floored at 2 periods and
-    /// capped at 4; 0 without a device). Diagnostics/tests only.
+    /// queued level the mix pacer aims at: the jitter cushion
+    /// (AudioSink::kMixJitterFrames) plus the producer's own tick chunk, so a
+    /// frame hitch drains the cushion instead of the queue (0 without a
+    /// device). Diagnostics/tests only.
     size_t mix_target_frames() const;
     /// Ticks whose mix frames were withheld because the stream still carried
     /// more than the target (the latency-drain counter).

@@ -1476,13 +1476,26 @@ void MediaPlayers::set_mix_refill_enabled(bool on) { mix_refill_enabled_ = on; }
 /// device — clicks 2-3 times a second in every game.
 ///
 /// So the target the producer AIMS at must cover one device period plus the
-/// producer's own cadence (the drain a callback can see between two pushes),
-/// and the producer must be allowed to produce the missing frames instead of
-/// only ever withholding. Both stay bounded:
+/// producer's own cadence (the drain a callback can see between two pushes)
+/// plus the STALLS of the thread the producer shares with everything else.
+/// The last term is the one that used to be missing: the mixer runs on the tick
+/// thread, so a frame that takes 70-100 ms — a rollover texture upload plus a
+/// fresh SE channel (asset read, vorbis open, prefetch thread) is exactly what
+/// moving the pointer over a title menu does — is also 70-100 ms with no PCM
+/// produced. With a mark of two device periods (~29 ms) the device drained the
+/// queue every time: measured on test3's title, walking the pointer across the
+/// menu rows produced 144 device underruns in 47 s (4-5 per hover change,
+/// ~3/s), i.e. the "断断续续" report; the Rust runtime, whose device ring holds
+/// 250 ms and which opens with an 80 ms prebuffer, is smooth on the same scene.
+///
+/// So the mark carries a fixed jitter cushion on top of the cadence term:
+///   * the cushion is 160 ms — every measured hitch (worst steady-state frame
+///     25 ms, title rollover 71-95 ms, one 130 ms outlier) leaves the queue
+///     above two device periods, i.e. the device never has to pad;
 ///   * the cadence term is capped at 4 periods (a single long hitch cannot
 ///     inflate the mark),
-///   * the whole target is capped at 8 periods (186 ms at 1024), so a standing
-///     level stays in the "tens to ~180 ms" class — two orders of magnitude
+///   * the whole target is capped at half the safety valve (750 ms), so a
+///     standing level stays in the "sub-second" class — two orders of magnitude
 ///     below the 700-1500 ms standing delay the earlier one-sided pacer
 ///     produced — and above the target the pacer withholds EXACTLY as that
 ///     pacer did (no ratchet: any backlog still drains at 1x).
@@ -1495,9 +1508,9 @@ size_t MediaPlayers::mix_target_frames() const {
     if (!mix_refill_enabled_) return 2 * dev; // one-sided law (negative control)
     const size_t chunk = last_tick_frames_ ? last_tick_frames_ : dev;
     const size_t capped = std::min(chunk, 4 * dev);
-    size_t target = dev + capped + dev / 4; // period + cadence + jitter slack
-    if (target < 2 * dev) target = 2 * dev; // the original value stays the floor
-    if (target > 8 * dev) target = 8 * dev; // latency ceiling (186 ms @1024)
+    size_t target = AudioSink::kMixJitterFrames + capped; // cushion + cadence
+    if (target < 2 * dev) target = 2 * dev;    // the original value stays the floor
+    if (target > AudioSink::kMixSafetyFrames / 2) target = AudioSink::kMixSafetyFrames / 2;
     return target;
 }
 

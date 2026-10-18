@@ -58,8 +58,11 @@ constexpr size_t kTickFrames = size_t(44100 * kTickMs / 1000); // 705
 constexpr uint64_t kHitchMs = 400;
 constexpr size_t kHitchFrames = size_t(44100 * kHitchMs / 1000); // 17640
 /// AudioSink's research/118 bound (mix stream). The test asserts against the
-/// contract, not the constant: a standing level above one bound + one chunk
-/// means the queue is carrying a delay that production cannot drain.
+/// contract, not the constant: a standing level above the pacer's own mark
+/// (+ its cadence) means the queue is carrying a delay that production cannot
+/// drain. The mark itself is the jitter cushion (research/133: the mixer shares
+/// the tick thread, so a 70-100 ms frame hitch must not reach the device) plus
+/// one tick chunk — the level sits one chunk above it right after a push.
 constexpr size_t kBoundFrames = 4410; // AudioSink::kMixBoundFrames
 
 std::vector<float> silence(size_t frames) { return std::vector<float>(frames * 2, 0.0f); }
@@ -125,7 +128,10 @@ int main() {
                 (unsigned long long)ms_of(l_hitch), l_drain_mid, l_after,
                 (unsigned long long)ms_of(l_after), target,
                 (unsigned long long)mp.paced_out_ticks());
-    check(l_before <= kBoundFrames, "arm1: idle ticking keeps the level bounded");
+    check(l_before <= target + 2 * kTickFrames,
+          "arm1: idle ticking keeps the level at the pacer's mark (level=%zu "
+          "target=%zu)",
+          l_before, target);
     check(l_hitch >= kHitchFrames - kTickFrames,
           "arm1: the hitch chunk itself is what lands in the stream (level=%zu)",
           l_hitch);
@@ -134,18 +140,19 @@ int main() {
           l_drain_mid, l_hitch);
     check(mp.paced_out_ticks() > 0,
           "arm1: the pacer withheld frames instead of deepening the delay");
-    // The standing level after the hitch must be back at the producer's
-    // cadence, never the hitch. The bound is the target + TWO chunks: the
-    // level is sampled right after the tick's push, and research/125's pacer
-    // holds the level AT the mark from below too (the pre-125 one-sided rule
-    // only ever parked under it), so the sample sits one chunk above the mark
-    // (the drain that chunk covers). It is still 6.4x below the 400 ms hitch
-    // burst, which is what this assertion has teeth for.
+    // The standing level after the hitch must be back at the pacer's mark,
+    // never the hitch. The bound is the target + TWO chunks: the level is
+    // sampled right after the tick's push, and research/125's pacer holds the
+    // level AT the mark from below too (the pre-125 one-sided rule only ever
+    // parked under it), so the sample sits one chunk above the mark (the drain
+    // that chunk covers). The mark itself is the 160 ms jitter cushion plus the
+    // cadence; it is still less than half of the 400 ms hitch burst, which is
+    // what this assertion has teeth for.
     check(l_after <= target + 2 * kTickFrames,
           "arm1: the hitch left no standing delay (level=%zu frames = %llums, "
           "hitch was %llums)",
           l_after, (unsigned long long)ms_of(l_after), (unsigned long long)kHitchMs);
-    check(l_after < kHitchFrames / 4,
+    check(l_after < kHitchFrames / 2,
           "arm1: standing level is nowhere near the hitch burst (%zu)", l_after);
 
     // ---- arm 2: negative control (bound off = pre-fix) -------------------

@@ -275,10 +275,22 @@ public:
         kMovieBoundFrames = 5292, // 120 ms
     };
     /// safety valve for the channel mix. The mix pacer in
-    /// MediaPlayers::update already keeps the level at ~2 device periods; this
-    /// only fires for a genuine multi-second backlog (an app freeze), where
-    /// draining is no longer the better trade and an instant resync is.
+    /// MediaPlayers::update already keeps the level at the jitter cushion
+    /// below; this only fires for a genuine multi-second backlog (an app
+    /// freeze), where draining is no longer the better trade and an instant
+    /// resync is.
     enum : size_t { kMixSafetyFrames = 66150 }; // 1.5 s
+    /// Jitter cushion the mix pacer holds ON TOP of the producer's own
+    /// cadence. The mixer runs on the tick thread, so an app stall is an audio
+    /// stall: moving the pointer across a title menu costs 70-100 ms per
+    /// rollover (rollover texture upload + a fresh SE channel: asset read,
+    /// vorbis open, prefetch thread), and a two-device-period mark left the
+    /// device dry 3x/s on that scene (measured: 144 dropouts in 47 s, 4-5 per
+    /// hover change — the "断断续续" report). 160 ms keeps the queue above two
+    /// device periods through every hitch measured on the real packages (worst
+    /// steady frame 25 ms, rollover 71-95 ms, one 130 ms outlier); the Rust
+    /// runtime's 250 ms device ring is the same trade made the other way.
+    enum : size_t { kMixJitterFrames = 44100 * 160 / 1000 }; // 160 ms
     ~AudioSink() { close(); }
     bool open() {
         SDL_AudioSpec spec;

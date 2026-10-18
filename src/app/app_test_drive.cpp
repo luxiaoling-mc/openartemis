@@ -5819,6 +5819,172 @@ static bool ad_slnywalk_drive(AppState* s) {
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// OA_AUTODRIVE=hover — title-menu hover probe (audio stutter).
+//
+// The reported defect: the title's BGM/SE goes 断断续续 while the pointer moves
+// over the menu rows. A hover change is the cheapest burst of work the app can
+// do inside ONE tick (rollover texture swap + a fresh SE channel: asset read,
+// vorbis open, prefetch thread), and the device queue is the only cushion the
+// producer has: a burst longer than the queue makes the device pad the
+// shortfall with silence, which is the hole the listener hears.
+//
+// The journey gets to the title the way a first boot does (language row ->
+// title), then walks the synthetic pointer between the title's clickable rows.
+// Every OA_HOVER_BEAT frames it prints frame / wall clock / worst single-frame
+// time / mix queue level / device underruns, so the mechanism is visible in the
+// numbers: frame times spike on a hover change and the underrun count follows.
+// It is a probe, not an assertion: the run always ends with the summary.
+//   OA_HOVER_FRAMES (default 900)  sweep length in frames
+//   OA_HOVER_STEP   (default 24)   frames the pointer rests on one row
+//   OA_HOVER_BEAT   (default 60)   heartbeat interval in frames
+//   OA_HOVER_MUTE=1                master volume 0 (the mix and the queue keep
+//                                  running; only the speakers stay quiet)
+// ---------------------------------------------------------------------------
+/// Distinct clickable row centres of the current page (full-stage catchers are
+/// skipped: the title's transparent overlay is not a menu row).
+static size_t ad_hover_targets(AppState* s, int (*out)[2], size_t cap) {
+    size_t n = 0;
+    const int sw = s->rt->project_.config.stage_width;
+    const int sh = s->rt->project_.config.stage_height;
+    for (const oa::render::Layer* l : s->rt->scene().draw_order()) {
+        if (n >= cap) break;
+        if (l->event_handlers.find("click") == l->event_handlers.end()) continue;
+        if (!s->rt->scene().is_effectively_visible(l->id)) continue;
+        const auto r = s->oaRender->layer_world_rect(*l);
+        if (!r) continue;
+        if ((*r)[2] >= double(sw) * 0.9 || (*r)[3] >= double(sh) * 0.9) continue;
+        const int cx = int((*r)[0] + (*r)[2] / 2);
+        const int cy = int((*r)[1] + (*r)[3] / 2);
+        bool dup = false;
+        for (size_t i = 0; i < n && !dup; ++i) {
+            dup = std::abs(out[i][0] - cx) < 12 && std::abs(out[i][1] - cy) < 12;
+        }
+        if (dup) continue;
+        out[n][0] = cx;
+        out[n][1] = cy;
+        ++n;
+    }
+    return n;
+}
+static bool ad_hover_drive(AppState* s) {
+    static int sub = 0, left = -1, step = 24, beat = 60, hold = 0, row_prev = -1;
+    static uint64_t t0 = 0, last = 0, worst = 0, under0 = 0, lvl_min = UINT64_MAX;
+    static uint64_t t_stage = 0, t_beat = 0;
+    static unsigned long long lvl_sum = 0, lvl_n = 0;
+    static int targets[8][2] = {};
+    static size_t ntargets = 0, cur = 0;
+    if (left < 0) {
+        const char* v;
+        left = ((v = std::getenv("OA_HOVER_FRAMES")) && *v) ? std::max(1, std::atoi(v)) : 900;
+        step = ((v = std::getenv("OA_HOVER_STEP")) && *v) ? std::max(1, std::atoi(v)) : 24;
+        beat = ((v = std::getenv("OA_HOVER_BEAT")) && *v) ? std::max(1, std::atoi(v)) : 60;
+        if ((v = std::getenv("OA_HOVER_MUTE")) && *v && std::atoi(v) != 0) {
+            s->rt->audio().set_master_volume(0.0f);
+            std::printf("[hover] master volume 0 (queue behaviour unchanged)\n");
+        }
+        t0 = last = t_stage = t_beat = SDL_GetTicks();
+        std::printf("[hover] frames=%d step=%d beat=%d\n", left, step, beat);
+    }
+    const uint64_t now = SDL_GetTicks();
+    if (sub == 0) { // first boot: language row -> title (skip when absent)
+        const oa::render::Layer* cn = ad_find_clickable(s, "bt_cn", "", false);
+        if (!cn) cn = ad_find_clickable(s, "", "bt_cn", true);
+        if (cn) {
+            ad_click_layer(s, cn);
+            std::printf("[hover] language row '%s' clicked (%d,%d)\n", cn->id.c_str(),
+                        s->ad_cx, s->ad_cy);
+            sub = 1;
+            t_stage = now;
+        } else if (now - t_stage > 30000) {
+            std::printf("[hover] no language page after 30 s; using the current page\n");
+            sub = 1;
+            t_stage = now;
+        }
+        return false;
+    }
+    if (sub == 1) { // wait for the title's menu rows (language select re-boots the VM,
+                    // so the brand/caution sequence runs first)
+        ntargets = ad_hover_targets(s, targets, 8);
+        if (now - t_stage > 45000) {
+            std::printf("[hover] VERDICT FAIL (no clickable rows after 45 s; "
+                        "targets=%zu layers=%zu wait=%s)\n", ntargets,
+                        s->rt->scene().size(),
+                        wait_desc(s->rt->current_wait()).c_str());
+            return true;
+        }
+        if (ntargets < 2 || now - t_stage < 800) {
+            if (now - t_beat > 3000) {
+                t_beat = now;
+                std::printf("[hover] waiting title: t=%llums rows=%zu layers=%zu bgm=%d "
+                            "wait=%s\n", (unsigned long long)(now - t_stage), ntargets,
+                            s->rt->scene().size(), (int)s->rt->audio().is_bgm_playing(),
+                            wait_desc(s->rt->current_wait()).c_str());
+            }
+            return false;
+        }
+        std::printf("[hover] menu rows=%zu bgm=%d:", ntargets,
+                    (int)s->rt->audio().is_bgm_playing());
+        for (size_t i = 0; i < ntargets; ++i)
+            std::printf(" (%d,%d)", targets[i][0], targets[i][1]);
+        std::printf("\n");
+        under0 = s->rt->media_players().device_underruns(0);
+        t0 = last = SDL_GetTicks();
+        worst = 0;
+        s->ad_hover = true;
+        s->ad_cx = targets[0][0];
+        s->ad_cy = targets[0][1];
+        hold = step;
+        sub = 2;
+        return false;
+    }
+    // Stage 2: sweep the pointer across the rows for `left` frames.
+    if (--hold <= 0) {
+        cur = (cur + 1) % ntargets;
+        hold = step;
+        s->ad_cx = targets[cur][0];
+        s->ad_cy = targets[cur][1];
+        s->ad_hover = true;
+        if (int(cur) != row_prev) {
+            row_prev = int(cur);
+            std::printf("[hover]   -> row %zu/%zu at (%d,%d) t=%llums\n", cur + 1,
+                        ntargets, s->ad_cx, s->ad_cy,
+                        (unsigned long long)(now - t0));
+        }
+    }
+    const uint64_t d = now > last ? now - last : 0;
+    last = now;
+    if (d > worst) worst = d;
+    const size_t lvl = s->rt->media_players().audio_level_frames(0);
+    lvl_sum += lvl;
+    ++lvl_n;
+    if (lvl < lvl_min) lvl_min = lvl;
+    if (now - t_beat >= uint64_t(beat) * 16) {
+        t_beat = now;
+        std::printf("[hover] wall=%llums worst_frame=%llums row=%zu/%zu "
+                    "hovered=%zu level=%zu target=%zu underruns=%llu\n",
+                    (unsigned long long)(now - t0), (unsigned long long)worst,
+                    cur + 1, ntargets, s->rt->hovered_layers().size(), lvl,
+                    s->rt->media_players().mix_target_frames(),
+                    (unsigned long long)s->rt->media_players().device_underruns(0));
+        worst = 0;
+    }
+    if (--left <= 0) {
+        const uint64_t run = SDL_GetTicks() - t0;
+        const uint64_t under = s->rt->media_players().device_underruns(0) - under0;
+        std::printf("[hover] summary frames=%llu wall=%llums rows=%zu mean_level=%llu "
+                    "min_level=%llu underruns=%llu (%.2f/s)\n",
+                    (unsigned long long)(lvl_n), (unsigned long long)run, ntargets,
+                    (unsigned long long)(lvl_n ? lvl_sum / lvl_n : 0),
+                    (unsigned long long)(lvl_min == UINT64_MAX ? 0 : lvl_min),
+                    (unsigned long long)under,
+                    run ? double(under) * 1000.0 / double(run) : 0.0);
+        s->ad_hover = false;
+        return true;
+    }
+    return false;
+}
+
 bool ad_drive(AppState* s) {
     oa::runtime::GameRuntime* rt = s->rt.get();
     ++s->ad_stage_f;
@@ -5841,6 +6007,7 @@ bool ad_drive(AppState* s) {
     if (s->ad_flow == "rrconf") return ad_rrconf_drive(s);
     if (s->ad_flow == "fontscan") return ad_fontscan_drive(s);
     if (s->ad_flow == "langidle") return ad_langidle_drive(s);
+    if (s->ad_flow == "hover") return ad_hover_drive(s);
 #endif
     switch (s->ad_stage) {
         case 0: { // wait for the parked title with bt_start, then enter story
