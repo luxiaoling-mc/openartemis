@@ -8,6 +8,8 @@
 #include <cmath>
 #include <cstdint>
 #include <map>
+#include <set>
+#include <utility>
 #include <memory>
 #include <optional>
 #include <string>
@@ -211,6 +213,43 @@ struct PixelMarker {
 };
 
 // ---------------------------------------------------------------------------
+// physics rules (metadata.bustControl / hairControl / partsControl)
+// ---------------------------------------------------------------------------
+/// One point-mass rule (bust): the authored `param` block is also the REST
+/// state, so a player that just loaded has the oscillation at its equilibrium.
+struct EmoteBustRule {
+    std::string label, baseLayer, varLR, varUD;
+    bool enabled = true;
+    double friction = 0.125, gravity = 0.3, spring = 0.03125;
+    double scaleX = 1, scaleY = 1;
+    double ofs = 0;
+    double op[3] = {0, 0, 0};  // anchor offset in the rule's own space
+    double p[3] = {0, 0, 0};   // rest position / initial state
+    double pv[3] = {0, 0, 0};  // initial velocity
+};
+
+/// One segment of a chain rule (hair strand / dangling part).
+struct EmoteChainSegment {
+    double bp[3] = {0, 0, 0};  // bind pose position (own space)
+    double p[3] = {0, 0, 0};   // rest position
+    double pv[3] = {0, 0, 0};  // rest velocity
+    double scaleX = 1, scaleY = 1;
+    double length = 0;
+};
+
+/// Chain rule: a 2+-segment spring chain that outputs LR / LR_M / UD.
+struct EmoteChainRule {
+    std::string label, baseLayer, varLR, varLRM, varUD;
+    bool enabled = true;
+    double bRate = 0.00390625, gravity = 0.5;
+    double frictionX = 0.03125, frictionY = 0.09375;
+    double bendSpd = 0, bendVol = 0, bendR = 0, bendS = 0, ofs = 0;
+    double udEft = 0, vBound = 1;
+    double op[3] = {0, 0, 0};
+    std::vector<EmoteChainSegment> segments;
+};
+
+// ---------------------------------------------------------------------------
 // whole emote file
 // ---------------------------------------------------------------------------
 class EmoteFile {
@@ -253,6 +292,13 @@ public:
     std::map<std::string, double> variableDefaults; // label -> 0
     std::vector<EyeControl> eyeControls;
     std::vector<SelectorControl> selectors;
+    /// Physics rules (metadata.bustControl / hairControl / partsControl).
+    /// Each rule anchors on a NODE LABEL (baseLayer) and WRITES the axis
+    /// variables it names — the hair/bust quake is not a node animation but a
+    /// per-frame writer into the variable domain (see emote_physics.h).
+    std::vector<EmoteBustRule> bustControls;
+    std::vector<EmoteChainRule> hairControls;
+    std::vector<EmoteChainRule> partsControls;
 
     std::vector<std::string> sourceOrder; // source names (metadata order)
     std::vector<std::unique_ptr<EmoteSource>> sources;
@@ -306,9 +352,28 @@ struct StaticRenderOptions {
 /// Returns false when no content key exists at or before `t`.
 bool emote_sample_track(const TimeVar& track, double t, bool legacy, double* out);
 
+/// Loop-timeline sample (待機 idles): the reference model, where a key's value
+/// is the TARGET to reach just before the next key (`prev -> cur` over
+/// [cur.time, next.time-1]), not a value held at its own time. With the
+/// hold model a loop whose last key sits at t=204 holds that value through the
+/// 300-frame tail and then snaps to the t=0 key, which reads as
+/// "swing left, swing right, pause, jump". `initial` is the value before the
+/// first key (the reference's initialVariables entry, 0 for a delta layer).
+bool emote_sample_track_loop(const TimeVar& track, double t, double initial, double* out);
+
 bool render_static_frame(const EmoteFile& file, const std::map<std::string, double>& vars,
                          int canvasW, int canvasH, const StaticRenderOptions& opt,
                          std::vector<uint8_t>* rgba, std::string* err = nullptr);
+
+/// World position (model px, cumulative translation) of the named nodes — the
+/// anchors the physics rules hang off (metadata.*Control[].baseLayer). Sampled
+/// from the pose evaluation itself, so a label that never appears in a drawn
+/// chain is simply absent from `out` (its rule then stays unanchored).
+bool emote_collect_anchors(const EmoteFile& file,
+                           const std::map<std::string, double>& vars,
+                           const std::set<std::string>& labels,
+                           std::map<std::string, std::pair<double, double>>* out,
+                           std::string* err = nullptr);
 
 /// Morph-warp patch sample. `bp` is a 4x4 grid of (u,v) control pairs covering
 /// the warp region's [0,1]x[0,1]; the field is defined there, but a part may

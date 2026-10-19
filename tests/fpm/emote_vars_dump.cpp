@@ -364,18 +364,22 @@ int main(int argc, char** argv) {
         auto dump = [&](const std::string& tag) {
             std::printf("[seq] == %s\n", tag.c_str());
             const auto v = p.variables();
+            const bool all = std::getenv("OA_DUMP_ALL") != nullptr;
             for (const auto& [k, val] : v)
-                if (k.rfind("face_", 0) == 0 || k.rfind("head_", 0) == 0 ||
+                if (all ||
+                    k.rfind("face_", 0) == 0 || k.rfind("head_", 0) == 0 ||
                     k.rfind("body_", 0) == 0 || k.rfind("act_", 0) == 0 ||
                     k.rfind("arm_type", 0) == 0 || k.rfind("move_", 0) == 0 ||
-                    k.rfind("hair_", 0) == 0)
+                    k.rfind("hair_", 0) == 0 || k.rfind("bust_", 0) == 0 ||
+                    k.rfind("quake_", 0) == 0)
                     std::printf("[seq]   %-16s %.2f\n", k.c_str(), val);
             const auto slots = p.foreground_slots();
             std::printf("[seq]   playing=%zu", slots.size());
             for (const auto& s : slots)
                 std::printf(" '%s'/%d", s.label.c_str(), s.flags);
             const std::string idle = p.idle_timeline();
-            if (!idle.empty()) std::printf(" idle:'%s'", idle.c_str());
+            if (!idle.empty())
+                std::printf(" idle:'%s' t=%.1f", idle.c_str(), p.idle_time());
             std::printf("\n");
         };
         dump("create");
@@ -455,6 +459,90 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    if (sub == "icon") {
+        // dump one atlas icon to PPM: icon <srcIndex> <iconName> <out.ppm>
+        const int si = argc > 3 ? std::atoi(argv[3]) : 0;
+        const std::string nm = argc > 4 ? argv[4] : "";
+        const std::string out = argc > 5 ? argv[5] : "icon.ppm";
+        if (si < 0 || si >= int(f.sources.size())) { std::fprintf(stderr, "bad src\n"); return 1; }
+        auto* srcp = f.sources[size_t(si)].get();
+        std::string e2;
+        if (!f.ensure_atlas(srcp, &e2)) { std::fprintf(stderr, "atlas: %s\n", e2.c_str()); return 1; }
+        const oa::emote::EmoteIcon* ic = nullptr;
+        for (const auto& c : srcp->icons) if (c.name == nm) ic = &c;
+        if (!ic) { std::fprintf(stderr, "no icon %s\n", nm.c_str()); return 1; }
+        const int iw = int(ic->width), ih = int(ic->height);
+        std::printf("[icon] %s rect=(%g,%g %gx%g) origin=(%g,%g) attr=%d\n",
+                    ic->name.c_str(), ic->left, ic->top, ic->width, ic->height,
+                    ic->originX, ic->originY, ic->attr);
+        std::vector<uint8_t> rgb(size_t(iw) * ih * 3);
+        for (int y = 0; y < ih; ++y)
+            for (int x = 0; x < iw; ++x) {
+                const size_t so = (size_t(ic->top + y) * srcp->textureWidth + size_t(ic->left + x)) * 4;
+                const size_t dofs = (size_t(y) * iw + x) * 3;
+                const int al = srcp->rgba[so + 3];
+                auto over = [&](int c) { return int((c * al + 255 * (255 - al)) / 255); };
+                rgb[dofs] = uint8_t(over(srcp->rgba[so]));
+                rgb[dofs + 1] = uint8_t(over(srcp->rgba[so + 1]));
+                rgb[dofs + 2] = uint8_t(over(srcp->rgba[so + 2]));
+            }
+        FILE* fp = std::fopen(out.c_str(), "wb");
+        if (!fp) return 1;
+        std::fprintf(fp, "P6\n%d %d\n255\n", iw, ih);
+        std::fwrite(rgb.data(), 1, rgb.size(), fp);
+        std::fclose(fp);
+        std::printf("[icon] wrote %s\n", out.c_str());
+        return 0;
+    }
+    if (sub == "parts") {
+        // GPU-path pose geometry: how the stencil groups actually come out.
+        // A pupil that never joins a group is drawn unclipped (the "eyeball
+        // escapes the eye while blinking" symptom).
+        oa::emote::EmotePlayer p;
+        if (!p.load(*bytes, 1920, 1620, &err)) return 1;
+        p.set_external_pose(true);
+        p.fade_in_timeline("通常待機");
+        const std::string script = argc > 3 ? argv[3] : std::string();
+        std::vector<std::pair<std::string,double>> sets;
+        for (size_t pos = 0; pos < script.size();) {
+            const size_t semi = script.find(';', pos);
+            const std::string cmd = script.substr(pos, semi == std::string::npos ? semi : semi - pos);
+            const size_t eq = cmd.find('=');
+            if (eq != std::string::npos) sets.emplace_back(cmd.substr(0, eq), std::atof(cmd.c_str() + eq + 1));
+            if (semi == std::string::npos) break;
+            pos = semi + 1;
+        }
+        for (const auto& [k, v] : sets) p.set_variable(k, v);
+        std::vector<oa::emote::EmoteDrawPart> parts;
+        if (!p.collect_pose_parts(&parts, &err)) return 1;
+        std::map<int, int> masks, content;
+        int plain = 0;
+        for (const auto& pt : parts) {
+            if (pt.mask_role == 1) ++masks[pt.mask_group];
+            else if (pt.stencil_group >= 0) ++content[pt.stencil_group];
+            else ++plain;
+        }
+        std::printf("[parts] total=%zu plain=%d\n", parts.size(), plain);
+        for (const auto& [g, n] : content)
+            std::printf("[parts] group %d content=%d mask=%d\n", g, n, masks[g]);
+        for (const auto& pt : parts) {
+            const bool all_parts = std::getenv("OA_EMOTE_PARTS_ALL") != nullptr;
+            if (!all_parts && pt.stencil_group < 0 && pt.mask_role != 1) continue;
+            double bx0 = 1e9, by0 = 1e9, bx1 = -1e9, by1 = -1e9;
+            for (const auto& v : pt.verts) {
+                bx0 = std::min(bx0, v.x); by0 = std::min(by0, v.y);
+                bx1 = std::max(bx1, v.x); by1 = std::max(by1, v.y);
+            }
+            std::string iname = "?";
+            if (pt.source >= 0 && pt.source < int(f.sources.size()) && pt.icon >= 0 &&
+                pt.icon < int(f.sources[size_t(pt.source)]->icons.size()))
+                iname = f.sources[size_t(pt.source)]->icons[size_t(pt.icon)].name;
+            std::printf("[part] sg=%d mr=%d mask=%d src=%d icon=%d(%s) alpha=%.2f bbox=(%.1f,%.1f)-(%.1f,%.1f) path=%s\n",
+                        pt.stencil_group, pt.mask_role, pt.mask_group, pt.source, pt.icon,
+                        iname.c_str(), pt.alpha, bx0, by0, bx1, by1, pt.nodePath.c_str());
+        }
+        return 0;
+    }
     if (sub == "nodes") {
         // dump the per-node morph flags — meshTransform decides whether a
         // blank carrier's patch deforms its children per vertex or only

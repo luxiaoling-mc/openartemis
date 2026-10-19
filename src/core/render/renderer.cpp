@@ -950,9 +950,21 @@ bool RenderEngine::emote_render_parts(const oa::render::TextureKey& key,
     // list. Compositing every group after all plain parts put the eye/cheek
     // content on top of the hand and hid its fingers.
     std::map<int, std::vector<const oa::emote::EmoteDrawPart*>> group_content;
-    for (const auto& part : parts)
-        if (part.mask_role != 1 && part.stencil_group >= 0)
+    for (const auto& part : parts) {
+        if (part.mask_role == 1) {
+            // Masks are collected UP FRONT, not during the ordered walk: a mask
+            // shape often sits AFTER the group's first content part (the eyelid
+            // and the eye-white both do), so a single-pass walk composited the
+            // pupil against an empty mask and the eyeball escaped the eye —
+            // visible while blinking. A mask that is ITSELF inside a stencil
+            // group is content of that group too (drawn clipped, in order).
+            stencil[part.mask_group].mask.push_back(&part);
+            if (part.stencil_group >= 0)
+                group_content[part.stencil_group].push_back(&part);
+        } else if (part.stencil_group >= 0) {
             group_content[part.stencil_group].push_back(&part);
+        }
+    }
     (void)plain;
 
     // one part draw, translated by (ox,oy) scratch-space offset
@@ -1104,13 +1116,10 @@ bool RenderEngine::emote_render_parts(const oa::render::TextureKey& key,
     // group composites at its first content part.
     std::map<int, char> group_done;
     for (const auto& p : parts) {
-        if (p.mask_role == 1) {
-            // A type-12 mask shape only feeds its group's stencil; it is not
-            // artwork of its own (drawing it leaked the eye-white / face
-            // outline onto the canvas and made pupils escape their sockets).
-            stencil[p.mask_group].mask.push_back(&p);
-            continue;
-        }
+        // Mask layers are collected up front (see above) AND drawn here: a
+        // stencil mask is real artwork (the eye-white is both the pupil's clip
+        // shape and the white of the eye). Never a bare `continue` — that
+        // erased the eye-white and left the iris floating on skin.
         if (p.stencil_group < 0) {
             draw_part(p, 0.0f, 0.0f);
             continue;

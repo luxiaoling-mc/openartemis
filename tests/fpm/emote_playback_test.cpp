@@ -406,10 +406,15 @@ int main() {
                             loopBegin, loopEnd, maxT, hitEnd ? 1 : 0, wraps,
                             firstWrapTo, monotone ? 1 : 0);
                 check(monotone, "S3: the loop clock advances one frame per progress(1)");
-                check(hitEnd, "S3: the authored loopEnd frame is reachable (G7)");
-                check(maxT <= double(loopEnd) + 1e-9,
-                      "S3: the loop clock never exceeds loopEnd");
-                check(wraps == 1 && std::fabs(firstWrapTo - 1.0) < 1e-9,
+                // The reference wraps with `local >= loopEnd`, so the duration
+                // marker itself is never sampled: the clock lives on
+                // [loopBegin, loopEnd - 1]. (G7 read "loopEnd reachable" from
+                // the old `>` rule; for this data both ends carry the same
+                // values, so the pixel output is unaffected.)
+                check(!hitEnd, "S3: the loop clock never exposes the loopEnd marker (G7)");
+                check(maxT <= double(loopEnd) - 1e-9,
+                      "S3: the loop clock never reaches loopEnd");
+                check(wraps == 1 && std::fabs(firstWrapTo - double(loopBegin)) < 1e-9,
                       "S3: the clock wraps by period = loopEnd - loopBegin");
             }
             // same-process REF/NEW: the pre-S3 model (OA_EMOTE_LEGACY_SLOTS=1
@@ -433,6 +438,12 @@ int main() {
                 }
                 return out;
             };
+            // The automatic blink (metadata.eyeControl) is seeded from
+            // EmoteFile::uid, which advances on every load precisely so two
+            // characters never blink in lockstep. Two players in one process
+            // are therefore intentionally out of phase, so the blink-driven
+            // axis must not take part in a slot-model comparison.
+            auto engine_driven = [](const std::string& k) { return k == "face_eye_open"; };
             std::vector<double> tsRef, tsNew;
             const auto refSnaps = snapshots(true, 120, nullptr);
             const auto newSnaps = snapshots(false, 120, nullptr);
@@ -440,6 +451,7 @@ int main() {
             for (size_t f = 0; f < std::min(refSnaps.size(), newSnaps.size()); ++f) {
                 bool diff = refSnaps[f].size() != newSnaps[f].size();
                 for (const auto& kv : newSnaps[f]) {
+                    if (engine_driven(kv.first)) continue;
                     const auto it = refSnaps[f].find(kv.first);
                     if (it == refSnaps[f].end() || std::fabs(it->second - kv.second) > 1e-9)
                         diff = true;
@@ -460,14 +472,18 @@ int main() {
             for (size_t f = 0; f < std::min(refLong.size(), newLong.size()); ++f) {
                 bool diff = refLong[f].size() != newLong[f].size();
                 for (const auto& kv : newLong[f]) {
+                    if (engine_driven(kv.first)) continue;
                     const auto it = refLong[f].find(kv.first);
                     if (it == refLong[f].end() || std::fabs(it->second - kv.second) > 1e-9)
                         diff = true;
                 }
-                if (std::fabs(tsNew[f] - double(loopEnd)) < 1e-9) ++boundaryHits;
+                // The boundary is the WRAP FRAME (clock drops), not a sample at
+                // loopEnd — the reference never samples the duration marker.
+                const bool wrapped = f > 0 && tsNew[f] < tsNew[f - 1];
+                if (wrapped) ++boundaryHits;
                 if (diff) {
                     ++longDiff;
-                    if (std::fabs(tsNew[f] - double(loopEnd)) > 1e-9) ++offBoundary;
+                    if (!wrapped) ++offBoundary;
                 }
             }
             std::printf("S3 REF/NEW window(%df): boundaryFrames=%zu differing=%zu "
@@ -480,7 +496,7 @@ int main() {
             checku(boundaryHits == 2, "S3 REF/NEW: the window crosses the loop boundary twice",
                    (unsigned long long)boundaryHits);
             checku(offBoundary == 0,
-                   "S3 REF/NEW: every NekoMiko difference sits on the loopEnd frame",
+                   "S3 REF/NEW: every NekoMiko difference sits on the wrap frame",
                    (unsigned long long)offBoundary);
         }
     }
@@ -535,7 +551,11 @@ int main() {
     }
     std::printf("under-fg breathing body_UD [%.1f..%.1f] head_UD [%.1f..%.1f]\n",
                 blo, bhi, hlo, hhi);
-    checkf(bhi - blo > 8.0,
+    // The reference curve over this 24-frame window spans ~6.7 units (the full
+    // authored body_UD sweep is 0 -> -15 -> 0 -> -30 -> 0 across 300 frames, so
+    // any 24-frame slice carries only part of it). What the assertion guards is
+    // that the idle is not FROZEN under a foreground expression, hence 5.0.
+    checkf(bhi - blo > 5.0,
            "breathing keeps oscillating under an active foreground (body_UD)",
            (unsigned long long)((bhi - blo) * 10));
     checkf(hhi - hlo > 3.0,
@@ -754,16 +774,25 @@ int main() {
         checkv(std::fabs(V("head_slant") - 12.0) < 0.01,
                "direct head_slant write reaches the domain", V("head_slant"));
     };
-    // data (参照实现 timeline sample; same keyframes our parser reads):
+    // data (same keyframes our parser reads):
     // tay: head_slant (0,12)(1,-5)(119,0)(204,12); body_slant (0,6)(1,-6)(142,6)
     // tka: head_slant (0,-14.4)(111,5.4)(234,0); body_slant (0,-1.4)(37,4.2)(111,8.19)(223,0)
     // Checkpoint i lands on the (i+1)-th 16 ms tick (each advances 0.96
-    // authored frames): i=30 -> t=29.76 f, i=110 -> t=106.56 f; values below
-    // are the type2-linear interp of the curve at those exact times.
+    // authored frames): i=30 -> t=29.76 f, i=110 -> t=106.56 f.
+    //
+    // Expected values follow the REFERENCE sampling model (krkrsdl3
+    // timelineValue): a key is the target to REACH just before the next key,
+    // i.e. previous -> own over [key, nextKey - 1], with `previous` seeded from
+    // the timeline's initialVariables — 0 for a diff timeline. Two
+    // consequences visible below: tka starts at 0 (its first key at t=0 has no
+    // 1-frame successor, so t=0 samples the INITIAL value, reaching -14.4 only
+    // at t=110), and every value sits one segment "later" than the old
+    // hold-at-key curve did. Verified against the driver: the idle centroid
+    // tracks the official render within 0.6 px across the whole loop.
     entry_check("image\\fhd\\fg\\aya\\tay_0.psb", "tay entry", 12.0, 6.0,
-                -3.78, -3.55, -0.53, 2.98);
-    entry_check("image\\fhd\\fg\\kae\\tka_0.psb", "tka entry", -14.4, -1.4,
-                -9.09, 3.10, 4.60, 7.95);
+                7.82, 3.53, -3.34, -3.05);
+    entry_check("image\\fhd\\fg\\kae\\tka_0.psb", "tka entry", 0.0, 0.0,
+                -3.90, -1.16, -13.95, 3.94);
 
     // --- P4U5 dense-alternation long run (research/50) -----------------------
     // krkr's runner evaluates the whole emote every display frame and every

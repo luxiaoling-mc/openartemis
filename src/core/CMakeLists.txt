@@ -35,6 +35,7 @@ add_library(libopenartemis STATIC
   emote/emote_file.cpp
   emote/emote_render.cpp
   emote/emote_player.cpp
+  emote/emote_physics.cpp
   # Vendored BC7/BPTC block decoder (richgel999/bc7enc, MIT/public domain;
   # provenance + license pointers in emote/bc7decomp.h / .cpp). Only the
   # E-mote atlas path uses it, so it lives beside its single consumer

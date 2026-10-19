@@ -183,13 +183,28 @@ inline double bez_b1(double t) { return 3 * t * (1 - t) * (1 - t); }
 inline double bez_b2(double t) { return 3 * t * t * (1 - t); }
 inline double bez_b3(double t) { return t * t * t; }
 
+// Diagnostic per-node switches set by eval_node (see OA_* knobs there).
+thread_local bool g_bezier_transpose = false;
+// OA_TICK_OFFSET=<n> + OA_TICK_OFFSET_LABEL=<label>: per-node tick nudge.
+thread_local double g_tick_offset = 0.0;
+inline bool emote_tick_offset_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("OA_TICK_OFFSET_LABEL");
+        return e && *e;
+    }();
+    return on;
+}
+
 void bezier_patch(const float bp[32], double u, double v, double* bx, double* by) {
     const double bu[4] = {bez_b0(u), bez_b1(u), bez_b2(u), bez_b3(u)};
     const double bv[4] = {bez_b0(v), bez_b1(v), bez_b2(v), bez_b3(v)};
     double rx = 0, ry = 0;
+    // OA_BEZIER_UV=transpose swaps the u/v axis assignment for an A/B test of
+    // the control-grid orientation (reference: basis = bu[row]*bv[col]).
+    const bool transpose = g_bezier_transpose;
     for (int r = 0; r < 4; ++r) {
         for (int c = 0; c < 4; ++c) {
-            const double wgt = bu[c] * bv[r]; // columns -> u, rows -> v
+            const double wgt = transpose ? bu[r] * bv[c] : bu[c] * bv[r];
             rx += double(bp[(r * 4 + c) * 2 + 0]) * wgt;
             ry += double(bp[(r * 4 + c) * 2 + 1]) * wgt;
         }
@@ -519,6 +534,12 @@ double lerp(double va, double vb, double ta, double tb, double tick) {
 }
 
 void fill_identity_grid(float bp[32]);
+// OA_BP_HOLD=<label substring>: hold the current key's grid instead of
+// interpolating (diagnostic for "does the driver blend bp at all").
+thread_local bool g_bp_hold_active = false;
+// OA_BP_MIX=<r> + OA_BP_MIX_LABEL=<label substring>: force the bp blend ratio
+// for one node (diagnostic).
+thread_local double g_bp_mix = -1.0;
 float grid_identity(int i);
 
 // interpolated frame values at tick (krkr progress(): linear between cur/next
@@ -628,8 +649,10 @@ FrameVals frame_vals(const std::vector<EmoteFrame>& frames, int cur, int next,
             // guard killed the blend and the whole warp collapsed to identity
             // between the keys — the face then lagged the official by ~17 px at
             // head_UD=20 while matching at both ends (30 = full).
-            if (f.hasBp || g.hasBp) {
-                for (int i = 0; i < 32; ++i) v.bp[i] = float(lerp(f.hasBp ? f.bp[i] : grid_identity(i), g.hasBp ? g.bp[i] : grid_identity(i), ta, tb, tick));
+            if ((f.hasBp || g.hasBp) && !g_bp_hold_active) {
+                double bpt = tick;
+                if (g_bp_mix >= 0) bpt = ta + (tb - ta) * g_bp_mix;
+                for (int i = 0; i < 32; ++i) v.bp[i] = float(lerp(f.hasBp ? f.bp[i] : grid_identity(i), g.hasBp ? g.bp[i] : grid_identity(i), ta, tb, bpt));
                 v.hasBp = true;
             }
         }
@@ -728,6 +751,19 @@ inline void apply_level_op(const LevelOp& o, double* x, double* y) {
 //   unset / "1" / "all"  -> every carrier
 //   "0" / ""             -> none (the old per-vertex behaviour)
 //   "<substr>[,<substr>]"-> carriers whose node label contains a substring
+// A TEXTURED node that carries a mesh patch warps its subtree as well as its
+// own icon. The reference keeps ONE list of surfaces per chain and applies
+// every ancestor's bezier patch to the shared point (emotegeometry.h
+// evaluate), so the eyelid's patch squeezes the eye-white and the iris
+// underneath it. OA_WARP_TEX=0 restores the old own-icon-only behaviour.
+bool emote_warp_tex() {
+    static const bool on = [] {
+        const char* e = std::getenv("OA_WARP_TEX");
+        return !(e && *e && std::strcmp(e, "0") == 0);
+    }();
+    return on;
+}
+
 bool warp_is_rigid(const std::string& label, int meshCombine,
                    const std::string* region, uint32_t syncMask = 0,
                    int childIndex = -1) {
@@ -1114,7 +1150,61 @@ void eval_node(EvalCtx& ctx, const EmoteMotion& motion, int nodeIdx, double inco
         chain.pop_back();
         return;
     }
-    const double tick = node_tick(motion, node, incomingTick, ctx);
+    {
+        // Diagnostic knobs (all default-off; the whole block compiles down to
+        // one predictable branch when none of the env vars is set):
+        //   OA_TICK_OFFSET_LABEL/_OFFSET   per-node tick nudge
+        //   OA_BP_HOLD=<label>             hold the current key's grid
+        //   OA_BP_MIX_LABEL/_MIX           per-node grid blend ratio
+        //   OA_BEZIER_UV=transpose + _LABEL per-node u/v axis swap
+        static const bool any_knob = [] {
+            return std::getenv("OA_TICK_OFFSET_LABEL") || std::getenv("OA_BP_HOLD") ||
+                   std::getenv("OA_BP_MIX_LABEL") || std::getenv("OA_BEZIER_UV_LABEL");
+        }();
+        if (any_knob) {
+            static const std::string tickLabel = [] {
+                const char* e = std::getenv("OA_TICK_OFFSET_LABEL");
+                return e ? std::string(e) : std::string();
+            }();
+            static const double tickOffset = [] {
+                const char* e = std::getenv("OA_TICK_OFFSET");
+                return e ? std::atof(e) : 0.0;
+            }();
+            static const std::string holdPat = [] {
+                const char* e = std::getenv("OA_BP_HOLD");
+                return (e && std::string(e) != "0") ? std::string(e) : std::string();
+            }();
+            static const std::string mixLabel = [] {
+                const char* e = std::getenv("OA_BP_MIX_LABEL");
+                return e ? std::string(e) : std::string();
+            }();
+            static const double mixValue = [] {
+                const char* e = std::getenv("OA_BP_MIX");
+                return e ? std::atof(e) : -1.0;
+            }();
+            static const std::string uvMode = [] {
+                const char* e = std::getenv("OA_BEZIER_UV");
+                return e ? std::string(e) : std::string();
+            }();
+            static const std::string uvLabel = [] {
+                const char* e = std::getenv("OA_BEZIER_UV_LABEL");
+                return e ? std::string(e) : std::string();
+            }();
+            const auto hit = [&](const std::string& pat) {
+                return !pat.empty() && node.label.find(pat) != std::string::npos;
+            };
+            g_tick_offset = hit(tickLabel) ? tickOffset : 0.0;
+            g_bp_hold_active = hit(holdPat);
+            g_bp_mix = (hit(mixLabel) && mixValue >= 0) ? mixValue : -1.0;
+            g_bezier_transpose = uvMode == "transpose" && hit(uvLabel);
+        }
+    }
+
+    // per-node tick nudge (diagnostic: OA_TICK_OFFSET / _LABEL) — applied
+    // BEFORE the key is picked, so it can move the selection across a key.
+    const double tick0 = node_tick(motion, node, incomingTick, ctx);
+    const bool tick_knob = emote_tick_offset_enabled();
+    const double tick = tick0 + (tick_knob ? g_tick_offset : 0.0);
     int next = -1;
     // shapeNode: the reference passes `type == 1` (emoterunner.cpp:167).
     const int cur = pick_frame(node.frames, tick, &next, node.type == 1);
@@ -1249,6 +1339,24 @@ void eval_node(EvalCtx& ctx, const EmoteMotion& motion, int nodeIdx, double inco
             std::memcpy(lv.bp, fv.bp, sizeof(lv.bp));
             lv.any = true;
         }
+    } else if (fv.hasBp && srcPre && icPre && emote_warp_tex()) {
+        // A TEXTURED node's patch deforms its own icon AND its subtree: the
+        // reference keeps one surface list per chain and applies every
+        // ancestor's bezier patch to the shared point (emotegeometry.h
+        // evaluate), so the eyelid's bp squeezes the eye-white and the iris
+        // under it. Only the own-icon half used to be implemented, which left
+        // the iris fully open beneath a closed lid (the "eyeball escapes while
+        // blinking" symptom). Control points are normalised to the node's icon
+        // rect, so the patch span is (width,height) centred at the icon origin.
+        lv.hasWarp = true;
+        lv.hasBp = true;
+        lv.ww = icPre->width;
+        lv.wh = icPre->height;
+        lv.wox = icPre->originX;
+        lv.woy = icPre->originY;
+        lv.region = &f.icon;
+        std::memcpy(lv.bp, fv.bp, sizeof(lv.bp));
+        lv.any = true;
     }
     const double nodeOpa = opaMul * std::clamp(fv.opa, 0.0, 1.0);
 
@@ -1259,7 +1367,12 @@ void eval_node(EvalCtx& ctx, const EmoteMotion& motion, int nodeIdx, double inco
         en.levels.assign(levels.begin(), levels.end()); // chain above this node
         en.iconOx = fv.ox;
         en.iconOy = fv.oy;
-        if (fv.hasBp && !f.src.empty()) {
+        static const std::string noIconWarp = [] {
+            const char* e = std::getenv("OA_NO_ICONWARP_LABEL");
+            return e ? std::string(e) : std::string();
+        }();
+        if (fv.hasBp && !f.src.empty() &&
+            (noIconWarp.empty() || node.label.find(noIconWarp) == std::string::npos)) {
             // icon shape keyframe (face parts); applied in icon uv space
             en.iconWarp = true;
             std::memcpy(en.iconBp, fv.bp, sizeof(en.iconBp));
@@ -1375,11 +1488,25 @@ void eval_node(EvalCtx& ctx, const EmoteMotion& motion, int nodeIdx, double inco
             }
         }
         // win trees put at most tiny accessory subtrees below icon leaves;
-        // walk them without adding an icon level.
-        for (int ch : node.children)
-            eval_node(ctx, motion, ch, tick, levels, opaMul, depth + 1,
-                      type12Depth + (node.type == 12 ? 1 : 0), path, chain,
-                      stencil_group);
+        // walk them without adding an icon level. EXCEPT when this icon node
+        // carries a mesh patch: the reference applies a chain's bezier
+        // surfaces to the whole subtree (emotegeometry.h evaluate), so the
+        // patch must ride along for the children.
+        if (lv.hasWarp && lv.hasBp) {
+            std::vector<Level> childLevels = levels;
+            childLevels.push_back(lv);
+            for (size_t ci = 0; ci < node.children.size(); ++ci) {
+                childLevels.back().childIndex = int(ci);
+                eval_node(ctx, motion, node.children[ci], tick, childLevels, opaMul,
+                          depth + 1, type12Depth + (node.type == 12 ? 1 : 0), path,
+                          chain, stencil_group);
+            }
+        } else {
+            for (int ch : node.children)
+                eval_node(ctx, motion, ch, tick, levels, opaMul, depth + 1,
+                          type12Depth + (node.type == 12 ? 1 : 0), path, chain,
+                          stencil_group);
+        }
         path.pop_back();
         chain.pop_back();
         return;
@@ -1957,7 +2084,8 @@ bool static_content_bounds(const EmoteFile& file, const std::map<std::string, do
 static bool evaluate_entries(const EmoteFile& file,
                              const std::map<std::string, double>& vars,
                              std::vector<DrawEntry>* entries, std::string* err,
-                             std::vector<StencilGroup>* stencil_groups = nullptr) {
+                             std::vector<StencilGroup>* stencil_groups = nullptr,
+                             bool light = false) {
     // selectorControl: the option-label variables (fade_a..fade_e) are DERIVED
     // from the selector variable (arm_type) every frame — the official host
     // ignores SetVariable("fade_c") entirely (A/B on emotedriver: --var
@@ -2002,7 +2130,7 @@ static bool evaluate_entries(const EmoteFile& file,
     }
     // pre-scan stencil groups so mask nodes drawn before their stencil can
     // still be tagged (the eye-white precedes the eye stencil in tree order)
-    if (emote_stencil_enabled()) {
+    if (!light && emote_stencil_enabled()) {
         for (int root : file.motions[midx].layer)
             scan_stencil_groups(ctx, file.motions[midx], root,
                                 std::vector<StencilFrame>{});
@@ -2043,6 +2171,7 @@ static bool evaluate_entries(const EmoteFile& file,
                      entries->size(), ctx.minX, ctx.maxX, ctx.minY, ctx.maxY);
     }
     if (entries->empty()) return true; // nothing drawn; canvas stays transparent
+    if (light) return true; // anchor sampling: geometry only, no atlas work
     // decode atlases for the used sources
     for (const DrawEntry& en : *entries) {
         for (auto& s : file.sources) {
@@ -2051,6 +2180,82 @@ static bool evaluate_entries(const EmoteFile& file,
             }
         }
     }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// physics anchors: the world position of a few named nodes, taken from the same
+// evaluation the renderer uses (each draw entry carries its ancestor Level
+// chain, so a blank carrier that parents real artwork is always in there).
+// ---------------------------------------------------------------------------
+bool emote_collect_anchors(const EmoteFile& file,
+                           const std::map<std::string, double>& vars,
+                           const std::set<std::string>& labels,
+                           std::map<std::string, std::pair<double, double>>* out,
+                           std::string* err) {
+    if (!out) return false;
+    out->clear();
+    if (labels.empty()) return true;
+    EvalCtx ctx{file, vars, nullptr, err};
+    ctx.s2 = emote_s2_policy();
+    ctx.debug = false;
+    ctx.wantBounds = false;
+    const int midx = file.find_motion(file.baseChara, file.baseMotion);
+    if (midx < 0) {
+        if (err) *err = "emote: base motion not found";
+        return false;
+    }
+    // Anchor nodes are MARKERS (type-1 shape nodes with no artwork and no
+    // children), so they never show up in a draw entry's Level chain — walk
+    // the tree itself with the renderer's own tick/frame selection.
+    std::vector<Level> levels;
+    std::function<void(const EmoteMotion&, int, double, int)> walk =
+        [&](const EmoteMotion& m, int idx, double parentTick, int depth) {
+            if (idx < 0 || idx >= int(m.nodes.size()) || depth > 64) return;
+            const EmoteNode& node = m.nodes[idx];
+            if (node.removed || node.frames.empty()) return;
+            const double tick = node_tick(m, node, parentTick, ctx);
+            int next = -1;
+            const int cur = pick_frame(node.frames, tick, &next, node.type == 1);
+            if (cur < 0) return;
+            const FrameVals fv = frame_vals(node.frames, cur, next, tick, ctx.s2, nullptr);
+            Level lv = (next >= 0)
+                           ? Level::from_frame_vals(*fv.frame, node.frames[size_t(next)], fv)
+                           : Level::from_frame(*fv.frame, true);
+            lv.inheritMask = node.inheritMask;
+            lv.name = &node.label;
+            levels.push_back(lv);
+            if (labels.count(node.label) != 0 && out->count(node.label) == 0) {
+                double la = 1, lb = 0, lc = 0, ld = 1, le = 0, lf = 0;
+                for (const Level& l : levels) {
+                    if (l.angle == 0 && l.sx == 0 && l.sy == 0 && l.zx == 1 && l.zy == 1) {
+                        le += la * l.cx + lb * l.cy;
+                        lf += lc * l.cx + ld * l.cy;
+                    } else {
+                        const Mat op = l.op();
+                        const double nla = la * op.a + lb * op.b;
+                        const double nlb = la * op.c + lb * op.d;
+                        const double nlc = lc * op.a + ld * op.b;
+                        const double nld = lc * op.c + ld * op.d;
+                        const double nle = la * op.e + lb * op.f + le;
+                        const double nlf = lc * op.e + ld * op.f + lf;
+                        la = nla; lb = nlb; lc = nlc; ld = nld; le = nle; lf = nlf;
+                    }
+                }
+                (*out)[node.label] = {le, lf};
+            }
+            if (fv.frame->isSubMotion) {
+                const int sm = file.find_motion(fv.frame->subObject, fv.frame->subMotion);
+                if (sm >= 0) {
+                    const EmoteMotion& sub = file.motions[size_t(sm)];
+                    for (int root : sub.layer) walk(sub, root, tick, depth + 1);
+                }
+            }
+            for (int ch : node.children) walk(m, ch, tick, depth + 1);
+            levels.pop_back();
+        };
+    const EmoteMotion& base = file.motions[size_t(midx)];
+    for (int root : base.layer) walk(base, root, 0, 0);
     return true;
 }
 
@@ -2203,8 +2408,20 @@ bool render_static_frame(const EmoteFile& file, const std::map<std::string, doub
                          en.stencil_group, en.mask_for_group, int(en.warped),
                          en.source ? en.source->rgba.size() : size_t(0));
         if (en.mask_for_group >= 0) {
+            // A stencil mask layer is REAL ARTWORK as well as a clip source:
+            // the eye-white (shirome) is both the pupil's mask and the white of
+            // the eye, and the face outline feeds the head stencil while being
+            // the face. The reference never hides these — its stencil target is
+            // built by calling draw() on the same layer nodes, and those nodes
+            // are drawn once more in normal tree order (krkr
+            // emotenoderef::draw: maskTarget pass + the ordinary canvas pass).
+            // Skipping the canvas pass erased the eye-white, which read as the
+            // iris floating on bare skin ("眼珠飘出去") at every eye_open pose.
+            const uint8_t* own =
+                en.stencil_group >= 0 ? mask_bits_of(en.stencil_group) : nullptr;
             paint_entry(en, fit, canvasW, canvasH, rgba, nullptr,
                         mask_bits_of(en.mask_for_group));
+            paint_entry(en, fit, canvasW, canvasH, rgba, own, nullptr);
             continue;
         }
         const uint8_t* ma =

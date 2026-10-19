@@ -104,6 +104,7 @@
 #include <vector>
 
 #include "core/emote/emote_file.h"
+#include "core/emote/emote_physics.h"
 
 namespace oa::emote {
 
@@ -415,6 +416,12 @@ private:
     std::map<std::string, double> base_;
     // composed per-frame values fed to the pose evaluation
     std::map<std::string, double> vars_;
+    // Physics (hair/bust/part sway): rules parsed from the PSB write their
+    // axis variables into physics_vars_ every tick, and compose() layers them
+    // over the timeline domain (the reference treats them as engine-owned).
+    EmotePhysics physics_;
+    std::map<std::string, double> physics_vars_;
+    void tick_physics(double frames);
     std::map<std::string, double> rendered_vars_; // snapshot at last render
 
     uint64_t revision_ = 1;

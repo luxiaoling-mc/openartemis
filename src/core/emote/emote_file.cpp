@@ -225,8 +225,121 @@ bool EmoteFile::parse_metadata(uint32_t off, std::string* err) {
             eyeControls.push_back(std::move(c));
         }
     }
-    if (read_labeled_list("selectorControl", &items)) {
+    // ---- physics rules -----------------------------------------------------
+    // metadata.bustControl / hairControl / partsControl. A rule anchors on a
+    // node LABEL (baseLayer) and WRITES the axis variables it names; the
+    // per-frame integration lives in emote_physics.cpp.
+    auto member_of = [&](uint32_t o, const char* k) { return psb_.object_member(o, k); };
+    auto num_of = [&](uint32_t o, const char* k, double* out) {
+        if (auto v = member_of(o, k)) psb_.read_double(*v, out);
+    };
+    auto str_of = [&](uint32_t o, const char* k, std::string* out) {
+        if (auto v = member_of(o, k)) {
+            if (auto s = psb_.read_string(*v)) *out = *s;
+        }
+    };
+    auto bool_of = [&](uint32_t o, const char* k, bool* out, bool dflt) {
+        *out = dflt;
+        if (auto v = member_of(o, k)) {
+            double d = dflt ? 1.0 : 0.0;
+            if (psb_.read_double(*v, &d)) *out = d != 0.0;
+        }
+    };
+    auto vec3_of = [&](uint32_t o, const char* k, double v[3]) {
+        auto m = member_of(o, k);
+        if (!m || psb_.kind_at(*m) != Kind::Objects) return;
+        if (auto c = psb_.object_member(*m, "x")) psb_.read_double(*c, &v[0]);
+        if (auto c = psb_.object_member(*m, "y")) psb_.read_double(*c, &v[1]);
+        if (auto c = psb_.object_member(*m, "z")) psb_.read_double(*c, &v[2]);
+    };
+    if (read_labeled_list("bustControl", &items)) {
         for (uint32_t it : items) {
+            if (psb_.kind_at(it) != Kind::Objects) continue;
+            EmoteBustRule r;
+            str_of(it, "label", &r.label);
+            str_of(it, "baseLayer", &r.baseLayer);
+            str_of(it, "var_lr", &r.varLR);
+            str_of(it, "var_ud", &r.varUD);
+            bool_of(it, "enabled", &r.enabled, true);
+            num_of(it, "friction", &r.friction);
+            num_of(it, "gravity", &r.gravity);
+            num_of(it, "spring", &r.spring);
+            num_of(it, "scale_x", &r.scaleX);
+            num_of(it, "scale_y", &r.scaleY);
+            if (auto prm = member_of(it, "param")) {
+                if (psb_.kind_at(*prm) == Kind::Objects) {
+                    num_of(*prm, "ofs", &r.ofs);
+                    vec3_of(*prm, "op", r.op);
+                    vec3_of(*prm, "p", r.p);
+                    vec3_of(*prm, "pv", r.pv);
+                }
+            }
+            bustControls.push_back(std::move(r));
+        }
+    }
+    auto parse_chain_list = [&](const char* key, std::vector<EmoteChainRule>* out) {
+        std::vector<uint32_t> list;
+        if (!read_labeled_list(key, &list)) return;
+        for (uint32_t it : list) {
+            if (psb_.kind_at(it) != Kind::Objects) continue;
+            EmoteChainRule r;
+            str_of(it, "label", &r.label);
+            str_of(it, "baseLayer", &r.baseLayer);
+            str_of(it, "var_lr", &r.varLR);
+            str_of(it, "var_lrm", &r.varLRM);
+            str_of(it, "var_ud", &r.varUD);
+            bool_of(it, "enabled", &r.enabled, true);
+            num_of(it, "b_rate", &r.bRate);
+            num_of(it, "gravity", &r.gravity);
+            num_of(it, "friction_x", &r.frictionX);
+            num_of(it, "friction_y", &r.frictionY);
+            num_of(it, "bend_spd", &r.bendSpd);
+            num_of(it, "bend_vol", &r.bendVol);
+            num_of(it, "ud_eft", &r.udEft);
+            num_of(it, "v_bound", &r.vBound);
+            // scale_x / scale_y / length live on the RULE; bp / p / pv inside
+            // `param` (the reference reads them from exactly those levels).
+            std::vector<uint32_t> sx, sy, ln;
+            if (auto v = member_of(it, "scale_x")) psb_.list_items(*v, &sx);
+            if (auto v = member_of(it, "scale_y")) psb_.list_items(*v, &sy);
+            if (auto v = member_of(it, "length")) psb_.list_items(*v, &ln);
+            if (auto prm = member_of(it, "param")) {
+                if (psb_.kind_at(*prm) == Kind::Objects) {
+                    num_of(*prm, "ofs", &r.ofs);
+                    num_of(*prm, "bendR", &r.bendR);
+                    num_of(*prm, "bendS", &r.bendS);
+                    vec3_of(*prm, "op", r.op);
+                    std::vector<uint32_t> bp, pp, pv;
+                    if (auto v = psb_.object_member(*prm, "bp")) psb_.list_items(*v, &bp);
+                    if (auto v = psb_.object_member(*prm, "p")) psb_.list_items(*v, &pp);
+                    if (auto v = psb_.object_member(*prm, "pv")) psb_.list_items(*v, &pv);
+                    const size_t n = std::min({bp.size(), pp.size(), pv.size(),
+                                               sx.size(), sy.size(), ln.size()});
+                    auto vec_at = [&](const std::vector<uint32_t>& l, size_t i, double o[3]) {
+                        if (i >= l.size() || psb_.kind_at(l[i]) != Kind::Objects) return;
+                        if (auto c = psb_.object_member(l[i], "x")) psb_.read_double(*c, &o[0]);
+                        if (auto c = psb_.object_member(l[i], "y")) psb_.read_double(*c, &o[1]);
+                        if (auto c = psb_.object_member(l[i], "z")) psb_.read_double(*c, &o[2]);
+                    };
+                    for (size_t i = 0; i < n; ++i) {
+                        EmoteChainSegment seg;
+                        vec_at(bp, i, seg.bp);
+                        vec_at(pp, i, seg.p);
+                        vec_at(pv, i, seg.pv);
+                        psb_.read_double(sx[i], &seg.scaleX);
+                        psb_.read_double(sy[i], &seg.scaleY);
+                        psb_.read_double(ln[i], &seg.length);
+                        r.segments.push_back(seg);
+                    }
+                }
+            }
+            out->push_back(std::move(r));
+        }
+    };
+    parse_chain_list("hairControl", &hairControls);
+    parse_chain_list("partsControl", &partsControls);
+
+    if (read_labeled_list("selectorControl", &items)) {        for (uint32_t it : items) {
             if (psb_.kind_at(it) != Kind::Objects) continue;
             SelectorControl c;
             if (auto l = psb_.object_member(it, "label"))

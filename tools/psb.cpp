@@ -1246,13 +1246,179 @@ void nodetree_rec(const emote::EmoteMotion& m, int idx, int depth, const std::st
     }
     if (n.children.size() > 12) kids += ",...";
     std::string reg = region.empty() ? std::string("-") : region;
+    std::string par;
+    if (n.isParameterized && n.parameterIndex >= 0 &&
+        n.parameterIndex < int(m.parameter.size()))
+        par = " par=" + m.parameter[size_t(n.parameterIndex)].id;
     std::printf("%-14s %*s[%d] %-22s type=%d tf=%d mc=%d sync=0x%-4X div=%-2d inh=0x%X "
-                "nch=%zu ch=[%s] reg=%s\n",
+                "nch=%zu ch=[%s] reg=%s%s\n",
                 motion.c_str(), depth * 2, "", idx, n.label.c_str(), n.type, n.meshTransform,
                 n.meshCombine, n.meshSyncChildMask, n.meshDivision, n.inheritMask,
-                n.children.size(), kids.c_str(), reg.c_str());
+                n.children.size(), kids.c_str(), reg.c_str(), par.c_str());
     if (++*shown >= 4000) return;
     for (int ch : n.children) nodetree_rec(m, ch, depth + 1, filter, motion, shown, only_idx);
+}
+
+int cmd_physics(const std::string& path) {
+    std::vector<uint8_t> bytes;
+    if (!read_file(path, &bytes)) { std::fprintf(stderr, "cannot read: %s\n", path.c_str()); return 1; }
+    emote::EmoteFile ef;
+    std::string err;
+    if (!ef.load(bytes, &err)) { std::fprintf(stderr, "load: %s\n", err.c_str()); return 1; }
+    std::printf("bustControl: %zu\n", ef.bustControls.size());
+    for (const auto& r : ef.bustControls)
+        std::printf("  %-16s base=%-18s lr=%-14s ud=%-14s en=%d spring=%.5f fric=%.5f grav=%.3f "
+                    "scale=(%.3f,%.3f) ofs=%.3f op=(%.2f,%.2f,%.2f) p=(%.2f,%.2f,%.2f)\n",
+                    r.label.c_str(), r.baseLayer.c_str(), r.varLR.c_str(), r.varUD.c_str(),
+                    int(r.enabled), r.spring, r.friction, r.gravity, r.scaleX, r.scaleY,
+                    r.ofs, r.op[0], r.op[1], r.op[2], r.p[0], r.p[1], r.p[2]);
+    for (const auto* pair : {&ef.hairControls, &ef.partsControls}) {
+        std::printf("%s: %zu\n", pair == &ef.hairControls ? "hairControl" : "partsControl",
+                    pair->size());
+        for (const auto& r : *pair) {
+            std::printf("  %-14s base=%-18s lr=%-16s lrm=%-18s ud=%-16s segs=%zu len=[",
+                        r.label.c_str(), r.baseLayer.c_str(), r.varLR.c_str(),
+                        r.varLRM.c_str(), r.varUD.c_str(), r.segments.size());
+            for (size_t i = 0; i < r.segments.size(); ++i)
+                std::printf("%s%.1f", i ? "," : "", r.segments[i].length);
+            std::printf("] grav=%.3f fric=(%.4f,%.4f) b_rate=%.6f bend=(%.3f,%.3f) ud_eft=%.2f "
+                        "ofs=%.3f bendR=%.3f bendS=%.3f op=(%.1f,%.1f)\n",
+                        r.gravity, r.frictionX, r.frictionY, r.bRate, r.bendSpd, r.bendVol,
+                        r.udEft, r.ofs, r.bendR, r.bendS, r.op[0], r.op[1]);
+        }
+    }
+    return 0;
+}
+
+int cmd_sample(const std::string& path, const std::string& tl_sel, double t) {
+    std::vector<uint8_t> bytes;
+    if (!read_file(path, &bytes)) { std::fprintf(stderr, "cannot read: %s\n", path.c_str()); return 1; }
+    emote::EmoteFile ef;
+    std::string err;
+    if (!ef.load(bytes, &err)) { std::fprintf(stderr, "load: %s\n", err.c_str()); return 1; }
+    int idx = -1;
+    if (!tl_sel.empty() && tl_sel[0] == '#') idx = std::atoi(tl_sel.c_str() + 1);
+    else
+        for (size_t i = 0; i < ef.timelines.size(); ++i)
+            if (ef.timelines[i].label == tl_sel) idx = int(i);
+    if (idx < 0 || idx >= int(ef.timelines.size())) {
+        std::fprintf(stderr, "no such timeline '%s'\n", tl_sel.c_str());
+        return 1;
+    }
+    const auto& tl = ef.timelines[size_t(idx)];
+    std::printf("timeline '%s' t=%g loop=[%d..%d] last=%d\n", tl.label.c_str(), t,
+                tl.loopBegin, tl.loopEnd, tl.lastTime);
+    for (const auto& tr : tl.variables) {
+        double v = 0;
+        const bool ok = emote::emote_sample_track(tr, t, std::getenv("OA_SAMPLE_LEGACY") != nullptr, &v);
+        if (std::getenv("OA_SAMPLE_ALL"))
+            std::printf("  %-20s frames=%zu first=(%.1f) last=(%.1f) ok=%d\n", tr.label.c_str(),
+                        tr.frames.size(), tr.frames.empty() ? -1 : tr.frames.front().time,
+                        tr.frames.empty() ? -1 : tr.frames.back().time, int(ok));
+        if (!ok) { std::printf("  %-20s (no sample)\n", tr.label.c_str()); continue; }
+        if (std::fabs(v) < 1e-9) continue;
+        std::printf("  %-20s %.4f\n", tr.label.c_str(), v);
+    }
+    return 0;
+}
+
+// Sweep a looping timeline's target model: `sample-loop <psb> <timeline> <t0> <t1> <step> <label>`
+// prints one line per tick so a Python transcription of the reference
+// timelineValue() can be diffed against the engine. `label` may be empty to
+// print every track.
+int cmd_sample_loop(const std::string& path, const std::string& tl_sel, double t0,
+                    double t1, double step, const std::string& want) {
+    std::vector<uint8_t> bytes;
+    if (!read_file(path, &bytes)) { std::fprintf(stderr, "cannot read: %s\n", path.c_str()); return 1; }
+    emote::EmoteFile ef;
+    std::string err;
+    if (!ef.load(bytes, &err)) { std::fprintf(stderr, "load: %s\n", err.c_str()); return 1; }
+    int idx = -1;
+    if (!tl_sel.empty() && tl_sel[0] == '#') idx = std::atoi(tl_sel.c_str() + 1);
+    else
+        for (size_t i = 0; i < ef.timelines.size(); ++i)
+            if (ef.timelines[i].label == tl_sel) idx = int(i);
+    if (idx < 0 || idx >= int(ef.timelines.size())) {
+        std::fprintf(stderr, "no such timeline '%s'\n", tl_sel.c_str());
+        return 1;
+    }
+    const auto& tl = ef.timelines[size_t(idx)];
+    if (std::getenv("OA_FRAMES")) {
+        for (const auto& tr : tl.variables) {
+            if (!want.empty() && tr.label != want) continue;
+            std::printf("# %s\n", tr.label.c_str());
+            for (const auto& f : tr.frames)
+                std::printf("#   t=%.3f type=%d has=%d easing=%.3f v=%.4f\n", f.time, f.type,
+                            int(f.hasContent), f.easing, f.value);
+        }
+    }
+    if (step <= 0) step = 1;
+    for (double t = t0; t <= t1 + 1e-9; t += step) {
+        for (const auto& tr : tl.variables) {
+            if (!want.empty() && tr.label != want) continue;
+            double v = 0;
+            if (!emote::emote_sample_track_loop(tr, t, 0.0, &v)) continue;
+            std::printf("t=%.1f %s=%.4f\n", t, tr.label.c_str(), v);
+        }
+    }
+    return 0;
+}
+
+int cmd_param(const std::string& path, const std::string& want) {
+    std::vector<uint8_t> bytes;
+    if (!read_file(path, &bytes)) { std::fprintf(stderr, "cannot read: %s\n", path.c_str()); return 1; }
+    emote::EmoteFile ef;
+    std::string err;
+    if (!ef.load(bytes, &err)) { std::fprintf(stderr, "load: %s\n", err.c_str()); return 1; }
+    for (const auto& obj : ef.objects)
+        for (const auto& [mname, midx] : obj.motions) {
+            if (midx < 0 || midx >= int(ef.motions.size())) continue;
+            const auto& m = ef.motions[size_t(midx)];
+            for (const auto& v : m.parameter) {
+                if (!want.empty() && v.id != want) continue;
+                std::printf("%s/%s  %-18s range=[%g,%g] div=%g  tick(v)=clamp01((v-%g)/%g)*%g\n",
+                            obj.name.c_str(), mname.c_str(), v.id.c_str(), v.rangeBegin,
+                            v.rangeEnd, v.division, v.rangeBegin, v.rangeEnd - v.rangeBegin,
+                            v.division);
+            }
+        }
+    return 0;
+}
+
+int cmd_nodeframes(const std::string& path, const std::string& label) {
+    std::vector<uint8_t> bytes;
+    if (!read_file(path, &bytes)) { std::fprintf(stderr, "cannot read: %s\n", path.c_str()); return 1; }
+    emote::EmoteFile ef;
+    std::string err;
+    if (!ef.load(bytes, &err)) { std::fprintf(stderr, "load: %s\n", err.c_str()); return 1; }
+    for (const auto& obj : ef.objects)
+        for (const auto& [mname, midx] : obj.motions) {
+            if (midx < 0 || midx >= int(ef.motions.size())) continue;
+            const auto& m = ef.motions[size_t(midx)];
+            for (const auto& n : m.nodes) {
+                if (n.label != label) continue;
+                std::printf("--- %s / %s node '%s' frames=%zu param=%s\n", obj.name.c_str(),
+                            mname.c_str(), n.label.c_str(), n.frames.size(),
+                            n.isParameterized && n.parameterIndex >= 0 &&
+                                    n.parameterIndex < int(m.parameter.size())
+                                ? m.parameter[size_t(n.parameterIndex)].id.c_str()
+                                : "-");
+                for (const auto& fr : n.frames) {
+                    double mn = 9, mx = -9;
+                    if (fr.hasBp)
+                        for (int i = 0; i < 32; ++i) {
+                            mn = std::min(mn, double(fr.bp[i]));
+                            mx = std::max(mx, double(fr.bp[i]));
+                        }
+                    std::printf("   t=%-6g type=%d coord=(%g,%g) ang=%g z=(%g,%g) bp=%s%s src=%s icon=%s\n",
+                                fr.time, fr.type, fr.coordX, fr.coordY, fr.angle, fr.zx, fr.zy,
+                                fr.hasBp ? "y" : "-",
+                                fr.hasBp ? ("[" + std::to_string(mn) + ".." + std::to_string(mx) + "]").c_str() : "",
+                                fr.src.c_str(), fr.icon.c_str());
+                }
+            }
+        }
+    return 0;
 }
 
 int cmd_nodetree(const std::string& path, const std::string& motion_filter,
@@ -1435,6 +1601,15 @@ int main(int argc, char** argv) {
             return cmd_patch_motion(path, argv[3], argv[4], argv[5], argv[6]);
         }
         if (cmd == "strings") return cmd_strings(path);
+        if (cmd == "physics") return cmd_physics(path);
+        if (cmd == "param") return cmd_param(path, argc > 3 ? argv[3] : "");
+        if (cmd == "nodeframes") return cmd_nodeframes(path, argc > 3 ? argv[3] : "");
+        if (cmd == "sample") return cmd_sample(path, argc > 3 ? argv[3] : "#0", argc > 4 ? std::atof(argv[4]) : 0.0);
+        if (cmd == "sample-loop")
+            return cmd_sample_loop(path, argc > 3 ? argv[3] : "#0", argc > 4 ? std::atof(argv[4]) : 0.0,
+                                   argc > 5 ? std::atof(argv[5]) : 300.0,
+                                   argc > 6 ? std::atof(argv[6]) : 1.0,
+                                   argc > 7 ? argv[7] : "");
         if (cmd == "nodetree")
             return cmd_nodetree(path, argc > 3 ? argv[3] : "", argc > 4 ? argv[4] : "");
         if (cmd == "patch-int") {

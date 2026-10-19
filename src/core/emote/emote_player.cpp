@@ -108,6 +108,8 @@ bool EmotePlayer::load(const uint8_t* data, size_t size, int canvasW, int canvas
                      file_.motions.size(), reordered);
     }
     init_defaults();
+    physics_.reset(file_); // hair/bust/part rules hang off node labels
+    physics_vars_.clear();
     // initial static pose (evidence; the game fades the idle timeline in
     // right after creation, so the static pose only shows for a frame or two)
     dirty_ = true;
@@ -265,6 +267,53 @@ bool emote_sample_track(const TimeVar& track, double t, bool legacy, double* out
     return true;
 }
 
+bool emote_sample_track_loop(const TimeVar& track, double t, double initial, double* out) {
+    const auto& fr = track.frames;
+    if (fr.empty()) return false;
+    int cur = -1;
+    int next = -1;
+    double prev = initial;
+    for (size_t i = 0; i < fr.size(); ++i) {
+        if (fr[i].time > t) {
+            next = int(i);
+            break;
+        }
+        if (cur >= 0 && fr[size_t(cur)].hasContent) prev = fr[size_t(cur)].value;
+        cur = int(i);
+    }
+    if (cur < 0) return false;
+    // Terminal empty key only delimits the duration: the last content key's
+    // value is what the loop rests on (reference timelineValue).
+    if (!fr[size_t(cur)].hasContent) {
+        if (cur + 1 != int(fr.size())) return false;
+        for (int i = cur; i >= 0; --i)
+            if (fr[size_t(i)].hasContent) {
+                *out = fr[size_t(i)].value;
+                return true;
+            }
+        return false;
+    }
+    double v = fr[size_t(cur)].value;
+    // A timeline key names the value to REACH just before the next key, so its
+    // segment runs previous -> own over [cur.time, next.time - 1]. `next` may
+    // be an EMPTY key (the terminal duration marker): the reference still uses
+    // its time as the segment end — that is precisely what makes the tail ease
+    // into the wrap value instead of holding the last key and snapping. Two
+    // consequences that the earlier revision got wrong:
+    //   * at tick == cur.time the sampled value is `prev`, not `v` (r starts
+    //     at 0), so the curve is continuous across every key, and
+    //   * an empty `next` must NOT suppress interpolation.
+    if (next >= 0 && fr[size_t(next)].time > fr[size_t(cur)].time + 1.0) {
+        const double span = fr[size_t(next)].time - fr[size_t(cur)].time - 1.0;
+        double r = std::clamp((t - fr[size_t(cur)].time) / span, 0.0, 1.0);
+        const double e = fr[size_t(cur)].easing;
+        if (e != 0.0) r = std::pow(r, e >= 0 ? 1 + e : 1 / (1 - e));
+        v = prev + (v - prev) * r;
+    }
+    *out = v;
+    return true;
+}
+
 bool EmotePlayer::track_value(const TimeVar& track, double t, double* out) const {
     return emote_sample_track(track, t, s2_legacy_, out);
 }
@@ -323,7 +372,9 @@ void EmotePlayer::settle_slot(Slot& slot, const EmoteTimeline* tl) {
             const double hi = double(tl->loopEnd);
             const double period = hi - lo;
             if (period > 0) {
-                while (slot.t > hi) slot.t -= period;
+                // reference: `local >= loopEnd` wraps, so t == loopEnd lands on
+                // loopBegin rather than lingering on the duration marker.
+                while (slot.t >= hi) slot.t -= period;
                 if (slot.t < lo) slot.t = lo;
             } else {
                 slot.active = false; // degenerate [loopBegin..loopEnd]
@@ -478,6 +529,7 @@ void EmotePlayer::progress(double frames) {
         last_advance_ms_ += uint64_t(frames * 1000.0 / double(kFps) + 0.5);
     }
     step_slots(frames);
+    tick_physics(frames);
     compose();
     schedule_render(false);
 }
@@ -563,10 +615,37 @@ void EmotePlayer::compose() {
     if (idle_.active) {
         const EmoteTimeline* tl = find_timeline(idle_.label);
         if (tl) {
+            // The idle is the one LOOPING timeline in this format, and it uses
+            // the reference's target model (emote_sample_track_loop): a key is
+            // the value to REACH just before the next key, so the 300-frame
+            // tail eases into the wrap value instead of holding the last
+            // authored key and snapping at t=loopEnd. Measured on the driver:
+            // the centroid tracks the official render within 0.6 px across the
+            // whole loop, and the wrap step is 0.02 px (the hold model popped
+            // 9.3 px at the wrap and lagged the official curve by one frame
+            // everywhere).
+            // OA_EMOTE_IDLE_TARGET=0 restores the old hold model (A/B arm).
+            static const bool target_env = [] {
+                const char* e = std::getenv("OA_EMOTE_IDLE_TARGET");
+                return !(e && *e && std::strcmp(e, "0") == 0);
+            }();
+            // Note: NOT tied to wrap_is_legacy() — the legacy arm exists to A/B
+            // the SLOT model, and keeping the sampler constant is what lets
+            // that comparison isolate slot semantics.
+            const bool target_model = target_env;
             for (const auto& track : tl->variables) {
                 if (!track_label_writable(track.label)) continue;
                 double v = 0;
-                if (!track_value(track, idle_.t, &v)) continue;
+                const bool ok = target_model ? emote_sample_track_loop(track, idle_.t, 0.0, &v)
+                                             : track_value(track, idle_.t, &v);
+                if (!ok) continue;
+                if (std::getenv("OA_DEBUG_IDLE") && track.label == "body_slant")
+                    std::fprintf(stderr,
+                                 "[idle] '%s' n=%zu t=%.1f sample=%.3f first=(%.1f,%.3f) base=%.3f\n",
+                                 tl->label.c_str(), track.frames.size(), idle_.t, v,
+                                 track.frames.empty() ? -1 : track.frames.front().time,
+                                 track.frames.empty() ? 0 : track.frames.front().value,
+                                 base_.count("body_slant") ? base_["body_slant"] : 0.0);
                 total[track.label] += v; // delta layer; never folded into base_
             }
         }
@@ -575,6 +654,10 @@ void EmotePlayer::compose() {
         total[k] = v;
         base_[k] = v;
     }
+    // Physics output (hair_LR/hair_UD/bust_*/quake_*): engine-owned axis
+    // variables, written every tick. They override anything a timeline or
+    // setVariable put there — the driver treats these as read-only outputs.
+    for (const auto& [k, v] : physics_vars_) total[k] = v;
     for (const auto& sel : file_.selectors) {
         if (sel.options.empty()) continue;
         const auto it = total.find(sel.label);
@@ -660,8 +743,41 @@ void EmotePlayer::advance_ms(uint64_t delta_ms) {
     last_advance_ms_ += delta_ms;
     const double frames = double(delta_ms) * double(kFps) / 1000.0;
     step_slots(frames);
+    tick_physics(frames);
     compose();
     if (dirty_) schedule_render(false);
+}
+
+// One physics step: sample the anchors of the pose the last compose produced
+// (the reference resolves the anchor<->output loop with the same one-frame
+// lag), then integrate and keep the written variables for compose().
+void EmotePlayer::tick_physics(double frames) {
+    // OA_EMOTE_PHYS=0 disables the whole system (A/B arm, and a safety valve if
+    // a future PSB authors something the integrator handles badly).
+    static const bool enabled = [] {
+        const char* v = std::getenv("OA_EMOTE_PHYS");
+        return !(v && *v && std::strcmp(v, "0") == 0);
+    }();
+    if (!enabled) return;
+    if (physics_.empty()) return;
+    if (!(frames > 0)) return;
+    std::set<std::string> want(physics_.anchor_labels().begin(),
+                               physics_.anchor_labels().end());
+    std::map<std::string, std::pair<double, double>> anchors;
+    std::string err;
+    emote_collect_anchors(file_, vars_, want, &anchors, &err);
+    if (std::getenv("OA_DEBUG_PHYS")) {
+        static long long n = 0;
+        if ((n++ % 30) == 0) {
+            std::fprintf(stderr, "[phys] frames=%.2f anchors=%zu", frames, anchors.size());
+            for (const auto& [k, v] : anchors)
+                std::fprintf(stderr, " %s=(%.1f,%.1f)", k.c_str(), v.first, v.second);
+            std::fprintf(stderr, "\n");
+        }
+    }
+    physics_.begin_frame();
+    for (const auto& [label, pos] : anchors) physics_.set_anchor(label, pos.first, pos.second);
+    physics_.update(frames, [&](const std::string& name, double v) { physics_vars_[name] = v; });
 }
 
 void EmotePlayer::schedule_render(bool force) {
