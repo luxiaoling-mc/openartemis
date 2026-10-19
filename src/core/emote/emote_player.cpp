@@ -95,6 +95,18 @@ bool EmotePlayer::load(const uint8_t* data, size_t size, int canvasW, int canvas
     if (std::getenv("OA_EMOTE_DEBUG"))
         std::fprintf(stderr, "[emote] load req=%dx%d buf=%dx%d scale=%.2f\n", w, h,
                      width_, height_, scale);
+    if (std::getenv("OA_EMOTE_PRIO_LOG")) {
+        size_t reordered = 0;
+        for (const auto& m : file_.motions) {
+            if (m.drawOrder.empty() || m.drawOrder == m.nodeListDfs) continue;
+            ++reordered;
+            if (reordered <= 3)
+                std::fprintf(stderr, "[prio] motion '%s' order differs (%zu nodes)\n",
+                             m.name.c_str(), m.drawOrder.size());
+        }
+        std::fprintf(stderr, "[prio] motions=%zu with-priority-reorder=%zu\n",
+                     file_.motions.size(), reordered);
+    }
     init_defaults();
     // initial static pose (evidence; the game fades the idle timeline in
     // right after creation, so the static pose only shows for a frame or two)
@@ -133,6 +145,29 @@ void EmotePlayer::init_defaults() {
     }
     base_ = defaults_;
     vars_ = defaults_;
+    // eyeControl (目パチ): the metadata entry names the eye-open variable and
+    // the authored blink shape. Initialised idle with a random wait, seeded
+    // per file so two layers created on the same frame (the two heroines)
+    // never blink in lockstep.
+    blink_label_.clear();
+    blink_value_ = 0;
+    blink_t_ = -1;
+    blink_wait_ = 0;
+    blink_frames_ = 0;
+    blink_rng_ ^= uint32_t(file_.uid() * 2654435761u);
+    if (!file_.eyeControls.empty()) {
+        const EyeControl& ec = file_.eyeControls.front();
+        if (ec.blinkFrameCount > 0 && !ec.label.empty()) {
+            blink_label_ = ec.label;
+            blink_begin_ = ec.beginFrame;
+            blink_end_ = ec.endFrame;
+            blink_frames_ = ec.blinkFrameCount;
+            blink_interval_min_ = std::max(1.0, ec.blinkIntervalMin);
+            blink_interval_max_ = std::max(blink_interval_min_, ec.blinkIntervalMax);
+            blink_wait_ = blink_interval_min_ +
+                          blink_rand01() * (blink_interval_max_ - blink_interval_min_);
+        }
+    }
     // the reference filters timeline-track writes
     // against the file's variable domain (E:emoterunner.cpp:1483-1487) and
     // skips selector option labels explicitly (1428-1442). `known_labels_` is
@@ -187,7 +222,7 @@ const EmoteTimeline* EmotePlayer::find_timeline(const std::string& label) const 
 // keeps its current domain value — official SDK variable-domain semantics).
 // Linear interpolation between two type-2 keyframes.
 // ---------------------------------------------------------------------------
-bool EmotePlayer::track_value(const TimeVar& track, double t, double* out) const {
+bool emote_sample_track(const TimeVar& track, double t, bool legacy, double* out) {
     if (track.frames.empty()) return false;
     int cur = -1;
     for (size_t i = 0; i < track.frames.size(); ++i) {
@@ -195,8 +230,18 @@ bool EmotePlayer::track_value(const TimeVar& track, double t, double* out) const
         else break;
     }
     if (cur < 0) return false;
+    // A type-0 frame only marks the END of a segment; the previous content key
+    // keeps holding (the Rust sampler does the same walk-back). Sampling must
+    // skip those tails instead of reporting "no write": a fractional clock can
+    // otherwise jump straight over a short content window. NekoMiko's 照れ
+    // timeline keeps arm_type=1 only in authored frames [3,4); at 60 fps with
+    // fractional deltas the samples landed at 0, 2.2, 4.3 ... and the key was
+    // never read — the shy pose kept the default arm_type=0 (hands down) while
+    // the t=0 face keys still applied, which is exactly the reported
+    // "pose/eyes/mouth wrong" frame.
+    while (cur >= 0 && !track.frames[size_t(cur)].hasContent) --cur;
+    if (cur < 0) return false;
     const TimeVarFrame& f = track.frames[size_t(cur)];
-    if (!f.hasContent) return false; // type-0 tail: no write (value persists)
     double v = f.value;
     if (cur + 1 < int(track.frames.size())) {
         const TimeVarFrame& g = track.frames[size_t(cur) + 1];
@@ -210,14 +255,18 @@ bool EmotePlayer::track_value(const TimeVar& track, double t, double* out) const
         // by a content frame is a content-LESS gap key (type 0) that never
         // writes, so the aligned predicate is inert on the shipped data.
         // `OA_EMOTE_S2_LEGACY=1` (s2_legacy_) restores the old predicate.
-        const bool interp = s2_legacy_ ? (f.type == 2 && g.type == 2)
-                                       : (f.type != 2 || g.type == 2);
+        const bool interp = legacy ? (f.type == 2 && g.type == 2)
+                                   : (f.type != 2 || g.type == 2);
         if (g.hasContent && interp && g.time > f.time) {
             v = f.value + (g.value - f.value) * (t - f.time) / (g.time - f.time);
         }
     }
     *out = v;
     return true;
+}
+
+bool EmotePlayer::track_value(const TimeVar& track, double t, double* out) const {
+    return emote_sample_track(track, t, s2_legacy_, out);
 }
 
 // ---------------------------------------------------------------------------
@@ -239,6 +288,9 @@ void EmotePlayer::fold_end_pose(const EmoteTimeline* tl) {
         for (auto it = track.frames.rbegin(); it != track.frames.rend(); ++it) {
             if (!it->hasContent) continue;
             base_[track.label] = it->value;
+            if (std::getenv("OA_DEBUG_FOLD"))
+                std::fprintf(stderr, "[fold] %-20s <- %.3f (t=%.0f, last=%zu)\n",
+                             track.label.c_str(), it->value, it->time, track.frames.size());
             break;
         }
     }
@@ -348,10 +400,67 @@ void EmotePlayer::step_slots(double frames) {
         return slot.active;
     };
     step_one(idle_);
+    // landed Pass()es: the stage-end samples apply with this clock step, in
+    // the order the entries were passed (later wins for a shared variable)
+    for (const PendingPass& pp : pending_pass_) {
+        const EmoteTimeline* tl = find_timeline(pp.label);
+        if (!tl) continue;
+        for (const auto& track : tl->variables) {
+            if (!track_label_writable(track.label)) continue;
+            double v = 0;
+            if (!track_value(track, pp.t, &v)) continue;
+            base_[track.label] = v;
+        }
+    }
+    pending_pass_.clear();
     for (auto it = fg_list_.begin(); it != fg_list_.end();) {
         if (step_one(*it)) ++it;
         else it = fg_list_.erase(it);
     }
+    blink_advance(frames);
+}
+
+// The automatic blink clock (metadata.eyeControl). Authored shape: over
+// `blink_frame_count` frames the eye-open variable travels begin -> end ->
+// begin; the controller then idles for a random interval inside
+// [blinkIntervalMin .. blinkIntervalMax]. The closing half is slightly faster
+// than the opening half, like a real lid; a smoothstep keeps the endpoints
+// quiet so the lid never pops.
+void EmotePlayer::blink_advance(double frames) {
+    if (blink_label_.empty() || blink_frames_ <= 0 || frames <= 0) return;
+    double left = frames;
+    while (left > 0) {
+        if (blink_t_ < 0) {
+            if (blink_wait_ > left) {
+                blink_wait_ -= left;
+                left = 0;
+            } else {
+                left -= blink_wait_;
+                blink_wait_ = 0;
+                blink_t_ = 0;
+            }
+        } else {
+            const double rem = blink_frames_ - blink_t_;
+            if (left < rem) {
+                blink_t_ += left;
+                left = 0;
+            } else {
+                left -= rem;
+                blink_t_ = -1;
+                blink_wait_ = blink_interval_min_ +
+                              blink_rand01() * (blink_interval_max_ - blink_interval_min_);
+            }
+        }
+    }
+    if (blink_t_ < 0) {
+        blink_value_ = blink_begin_;
+        return;
+    }
+    const double p = std::clamp(blink_t_ / blink_frames_, 0.0, 1.0);
+    double tri = p < 0.45 ? p / 0.45 : (1.0 - p) / 0.55;
+    tri = std::clamp(tri, 0.0, 1.0);
+    tri = tri * tri * (3.0 - 2.0 * tri); // smoothstep
+    blink_value_ = blink_begin_ + (blink_end_ - blink_begin_) * tri;
 }
 
 void EmotePlayer::progress(double frames) {
@@ -377,6 +486,38 @@ void EmotePlayer::progress(double frames) {
 // compose: persistent absolute domain (base_) + per-frame idle delta layer
 // + explicit + selectors; diff against the last rendered snapshot.
 // ---------------------------------------------------------------------------
+// OA_EMOTE_CTRL_FIX=1 — corrected transport semantics for the Artemis e-mote
+// wrapper (system/adv/emote.lua):
+//   layer:pass()                 before/after playTimeline  -> NO-OP (Pass()
+//                                only passes a timeline stage; NekoMiko's
+//                                expression tracks have none, and ending the
+//                                slot here would kill the expression the game
+//                                just started)
+//   layer:step()                 after a save load          -> NO-OP (Step()
+//                                settles the fade blend, not the timeline)
+//   expression end                                          -> release
+// Until now pass() cleared the whole foreground list and step() folded the
+// timeline's END pose into the persistent domain, which is why a finished
+// expression stayed on screen forever (eyes 特殊4 / brows 特殊1 instead of the
+// 通常 state the reference capture shows).
+static bool ctrl_fix() {
+    static const bool on = [] {
+        const char* e = std::getenv("OA_EMOTE_CTRL_FIX");
+        return e && *e == '1';
+    }();
+    return on;
+}
+
+// See compose(): expression timelines are released at their end instead of
+// being folded into the persistent domain. Opt-in for A/B verification.
+static bool expr_release() {
+    static const bool on = [] {
+        const char* e = std::getenv("OA_EMOTE_EXPR_RELEASE");
+        return e && *e == '1';
+    }();
+    return on;
+}
+
 void EmotePlayer::compose() {
     // persistent absolute domain — initialised to defaults; the foreground
     // (absolute) timelines write their samples INTO the domain while active,
@@ -408,7 +549,14 @@ void EmotePlayer::compose() {
             if (!track_label_writable(track.label)) continue;
             double v = 0;
             if (!track_value(track, slot.t, &v)) continue;
-            base_[track.label] = v; // absolute write into the persistent domain
+            // OA_EMOTE_EXPR_RELEASE=1: an absolute (expression) timeline only
+            // contributes while it plays. Without the fold the pose returns to
+            // the base/default state when the timeline ends — the behaviour the
+            // reference capture shows after 照れ finishes (wide eyes + thin
+            // brows) and the behaviour `pass()`/natural end should produce.
+            // Kept opt-in until the remaining screens are re-verified: the
+            // persistent domain is what the arm/selector poses were tuned on.
+            if (!expr_release()) base_[track.label] = v;
             total[track.label] = v;
         }
     }
@@ -446,6 +594,25 @@ void EmotePlayer::compose() {
     // write — see set_variable_diff). Empty map for frameworks that never
     // call it, so the composed frame is bit-identical to before.
     for (const auto& [k, v] : diff_) vars_[k] += v;
+    // eyeControl blink: a runtime lid overlay on the eye-open variable. MAX,
+    // not add — an expression that already closed the eye (笑顔/照れ/悲しみ all
+    // sit above the blink's end value on the lid axis) keeps its own lid; a
+    // 通常 eye at 0 still blinks through the authored range.
+    if (!blink_label_.empty() && blink_value_ > 0.0) {
+        auto bit = vars_.find(blink_label_);
+        if (bit == vars_.end()) vars_[blink_label_] = blink_value_;
+        else bit->second = std::max(bit->second, blink_value_);
+    }
+    if (std::getenv("OA_DUMP_VARS")) {
+        static long long dumpTick = 0;
+        if ((dumpTick++ % 30) == 0) {
+            std::fprintf(stdout, "[vars] #%lld f=%.0f", dumpTick,
+                         double(last_advance_ms_) * double(kFps) / 1000.0);
+            for (const auto& kv : vars_)
+                std::fprintf(stdout, " %s=%.3f", kv.first.c_str(), kv.second);
+            std::fprintf(stdout, "\n");
+        }
+    }
     // change detection vs the last rendered snapshot
     bool changed = vars_.size() != rendered_vars_.size();
     if (!changed) {
@@ -456,6 +623,36 @@ void EmotePlayer::compose() {
         }
     }
     if (changed) dirty_ = true;
+}
+
+void EmotePlayer::copy_state_from(const EmotePlayer& other) {
+    if (&other == this) return;
+    base_ = other.base_;
+    explicit_ = other.explicit_;
+    diff_ = other.diff_;
+    fg_list_ = other.fg_list_;
+    // The copied slots carry the *old* player's domain snapshot. Rebase them
+    // on the state we just inherited: Pass() rolls a fresh play back to this
+    // snapshot, and a stale one (the all-zero domain from when 照れ first
+    // started) is exactly what zeroed the expression again right after a
+    // scene rebuild.
+    for (Slot& s : fg_list_) {
+        s.base_before = base_;
+        s.start_t = s.t;
+    }
+    idle_ = other.idle_;
+    blink_value_ = other.blink_value_;
+    blink_t_ = other.blink_t_;
+    compose();
+    dirty_ = true;
+}
+
+bool EmotePlayer::has_playback_state() const {
+    for (const auto& kv : base_)
+        if (std::fabs(kv.second) > 1e-6) return true;
+    for (const auto& s : fg_list_)
+        if (s.active) return true;
+    return false;
 }
 
 void EmotePlayer::advance_ms(uint64_t delta_ms) {
@@ -490,7 +687,13 @@ void EmotePlayer::render_now() {
 
 oa::emote::StaticRenderOptions EmotePlayer::view_options() const {
     oa::emote::StaticRenderOptions opt;
-    const double s = view_scale_ > 0 ? view_scale_ : 0.6;
+    // OA_EMOTE_SCALE_MUL: A/B multiplier on the view scale (the report's
+    // characters render ~15% larger than the original engine's).
+    static const double scale_mul = [] {
+        const char* v = std::getenv("OA_EMOTE_SCALE_MUL");
+        return (v && *v) ? std::atof(v) : 1.0;
+    }();
+    const double s = (view_scale_ > 0 ? view_scale_ : 0.6) * scale_mul;
     const double reqW = req_width_ > 0 ? double(req_width_) : double(width_);
     const double reqH = req_height_ > 0 ? double(req_height_) : double(height_);
     const double fw = double(width_) / reqW;
@@ -555,10 +758,18 @@ void EmotePlayer::play_timeline(const std::string& label, int flags) {
     Slot slot;
     slot.label = label;
     slot.t = start_phase(tl);
+    slot.start_t = slot.t;
+    slot.base_before = base_;
     slot.active = true;
     slot.flags = flags;
     fg_list_.push_back(std::move(slot));
-    compose();
+    // Do NOT fold the t=0 sample into the persistent domain here. The game
+    // calls playTimeline and Pass() in the same beat (emote.lua), and the
+    // reference applies nothing in between: playing 通常 over an existing
+    // 照れ pose leaves the pose untouched. An eager compose wrote 通常's
+    // t0=0 before Pass() could skip the timeline (the face snapped to 通常
+    // at a scene reset). The next advance_ms() evaluates the slot normally.
+    dirty_ = true;
     render_now();
 }
 
@@ -577,18 +788,40 @@ void EmotePlayer::fade_in_timeline(const std::string& label) {
 }
 
 void EmotePlayer::pass() {
-    // (api_skip.html): Pass() skips the INTERNAL playback state
-    // while the displayed picture must not jump. With the persistent
-    // variable domain, ending the foreground entries is enough: the domain
-    // keeps the last written samples (expression stays on screen), the idle
-    // diff loop keeps breathing under it, and explicit writes (e.g. the
-    // game's per-click face_talk reset) still override; the next
-    // playTimeline replaces the domain values wholesale. Every entry of
-    // the foreground list ends (per-entry removal is stop_timeline()).
+    if (ctrl_fix()) {
+        compose();
+        render_now();
+        return;
+    }
+    // Pass() advances the playhead to the end of the timeline's current stage
+    // and ENDS the entry — but the stage-end sample lands on the NEXT clock
+    // step, not at the call. Re-verified against the official driver
+    // (emote_official --seq):
+    //   play 照れ,1 ; Pass                    -> values unchanged at Pass,
+    //                                            Progress(1) leaves 36.5/50/40
+    //   ... over that pose: play 通常,1 ; Pass -> still 36.5/50/40 at Pass,
+    //                                            Progress(1) writes 0/0/0
+    //   (通常's tracks DO have content — all zeros — at their end, so the
+    //    official write is a real write. The earlier "only land non-zero ends,
+    //    roll the rest back to the pre-play snapshot" rule left the previous
+    //    expression's mouth/head/arm axes on the face, which is the reported
+    //    "mouth and nose sit somewhere else".)
     if (fg_list_.empty()) return;
+    for (const Slot& slot : fg_list_) {
+        if (!slot.active) continue;
+        const EmoteTimeline* tl = find_timeline(slot.label);
+        if (!tl) continue;
+        double end = tl->lastTime > 0 ? double(tl->lastTime) : 0.0;
+        for (const auto& track : tl->variables)
+            if (!track.frames.empty() && track.frames.back().time > end)
+                end = track.frames.back().time;
+        if (std::getenv("OA_DEBUG_PASS"))
+            std::fprintf(stderr, "[pass] slot '%s' -> t=%.0f (slots=%zu)\n",
+                         slot.label.c_str(), end, fg_list_.size());
+        pending_pass_.push_back({slot.label, end > 0 ? end : slot.t});
+    }
     fg_list_.clear();
-    compose();
-    render_now();
+    dirty_ = true; // the pose lands with the next clock step
 }
 
 // Fold every foreground entry's authored END pose into the persistent domain
@@ -621,6 +854,12 @@ void EmotePlayer::fold_foreground_end() {
 }
 
 void EmotePlayer::step() {
+    if (ctrl_fix()) {
+        // Step() settles the fade-in blend, not the timeline itself.
+        compose();
+        render_now();
+        return;
+    }
     // (api_skip.html): Step() skips to the stage where the
     // transitions have settled. With the persistent domain the foreground's
     // END pose is folded into the domain (fold_foreground_end — the
@@ -678,6 +917,9 @@ void EmotePlayer::stop_idle_timeline() {
     idle_.label.clear();
     idle_.t = 0;
     compose();
+    if (std::getenv("OA_DEBUG_PASS"))
+        std::fprintf(stderr, "[pass] after rollback eye=%.1f brow=%.1f\n",
+                     vars_["face_eye_open"], vars_["face_eyebrow"]);
     render_now();
 }
 

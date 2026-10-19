@@ -81,6 +81,10 @@ struct EmoteNode {
     int parameterIndex = -1; // index into motion.parameter
     uint32_t inheritMask = 0x20007FC;
     int meshCombine = 0, meshDivision = 0, meshTransform = 0;
+    /// Bitmask of which CHILDREN receive this node's mesh deformation. A node
+    /// whose mask is 0 does not warp its subtree per vertex — the driver only
+    /// moves the node's own frame (the "rigid offset" class).
+    uint32_t meshSyncChildMask = 0;
     bool removed = false;
     bool isMaskNode = false; // type 12 (stencil composite)
     // stencilCompositeMaskLayerList — node LABELS whose drawn alpha masks
@@ -284,9 +288,25 @@ struct StaticRenderOptions {
                              // the whole figure into the canvas before scale
     double headMargin = 0;   // extra canvas px below the top after fitting
 };
+/// Timeline track sample at `t` authored frames. A content-less (type 0) frame
+/// only marks the END of a segment, so the sample walks back to the previous
+/// content key and holds it — a fractional clock must not lose a short content
+/// window (NekoMiko's 照れ keeps arm_type=1 only in frames [3,4)). Between two
+/// content keys the value interpolates under the reference's type-2 rule
+/// (`legacy` restores the pre-alignment predicate, OA_EMOTE_S2_LEGACY=1).
+/// Returns false when no content key exists at or before `t`.
+bool emote_sample_track(const TimeVar& track, double t, bool legacy, double* out);
+
 bool render_static_frame(const EmoteFile& file, const std::map<std::string, double>& vars,
                          int canvasW, int canvasH, const StaticRenderOptions& opt,
                          std::vector<uint8_t>* rgba, std::string* err = nullptr);
+
+/// Morph-warp patch sample. `bp` is a 4x4 grid of (u,v) control pairs covering
+/// the warp region's [0,1]x[0,1]; the field is defined there, but a part may
+/// reach past it. `bezier_patch_ext` keeps such samples on the field by
+/// continuing linearly from the border (clamping them folded whole parts onto
+/// the border — see emote_render.cpp). Exposed for the asset-free regression.
+void bezier_patch_ext(const float bp[32], double u, double v, double* bx, double* by);
 
 /// Content bounds of the static frame in *psb* coordinates (after motion
 /// evaluation, before the canvas mapping) — diagnostics/calibration.

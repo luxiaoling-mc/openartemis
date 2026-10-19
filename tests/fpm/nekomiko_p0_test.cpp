@@ -1011,9 +1011,56 @@ int main() {
                                 ws(pw));
                 }
             }
-            if (clicks <= 6)
+            if (clicks <= 6 || std::getenv("OA_LOG_ALL_PAGES"))
                 std::printf("[neko] page turn #%zu f=%zu ch='%s' sample='%s'\n", clicks, t,
                             chapter.c_str(), sample(rt).c_str());
+            // OA_DUMP_EMOTE_PAGE=<n>: write every emote layer's canvas as a PPM
+            // at page turn n (A/B against the official renderer: same pose, same
+            // camera, pixels side by side).
+            auto dump_emotes = [&](const char* suffix) {
+                {
+                    for (const auto& [lid, st] : rt.emote_layers()) {
+                        if (!st.player) continue;
+                        const int w = st.player->width(), h = st.player->height();
+                        const auto& px = st.player->rgba();
+                        if (w <= 0 || h <= 0 || px.size() < size_t(w) * size_t(h) * 4)
+                            continue;
+                        std::string path = "page" + std::to_string(clicks) + suffix + "_";
+                        for (char c : lid) path += (c == '.' || c == ':') ? '_' : c;
+                        path += ".ppm";
+                        if (FILE* fp = std::fopen(path.c_str(), "wb")) {
+                            std::fprintf(fp, "P6\n%d %d\n255\n", w, h);
+                            for (int y = 0; y < h; ++y)
+                                for (int x = 0; x < w; ++x) {
+                                    const unsigned char* s = &px[(size_t(y) * w + x) * 4];
+                                    const unsigned a = s[3];
+                                    const unsigned char rgb[3] = {
+                                        (unsigned char)((s[0] * a + 60 * (255 - a)) / 255),
+                                        (unsigned char)((s[1] * a + 60 * (255 - a)) / 255),
+                                        (unsigned char)((s[2] * a + 60 * (255 - a)) / 255)};
+                                    std::fwrite(rgb, 1, 3, fp);
+                                }
+                            std::fclose(fp);
+                            std::printf("[neko] dumped emote '%s' -> %s (%dx%d)\n",
+                                        lid.c_str(), path.c_str(), w, h);
+                        }
+                    }
+                }
+            };
+            if (const char* dp = std::getenv("OA_DUMP_EMOTE_PAGE")) {
+                if (size_t(std::atoll(dp)) == clicks) {
+                    dump_emotes("");
+                    // OA_DUMP_EMOTE_LATE=<frames>: dump again after that many
+                    // idle frames — the [delay] chain (悲しみ -> 呆れ ...) lands
+                    // a second or two after the page turn, so the page-turn
+                    // frame is NOT the pose the player sees for the whole line.
+                    if (const char* late = std::getenv("OA_DUMP_EMOTE_LATE")) {
+                        const long n = std::atol(late);
+                        for (long i = 0; i < n && !rt.exit_requested(); ++i) tickg(rt, idle);
+                        dump_emotes("_late");
+                    }
+                }
+            }
             if (sample(rt) != "-") story_body = true;
             // P2 (research/43): with OA_P2DEEP the journey keeps turning until
             // an emote (立絵) layer event fires or the click budget runs out

@@ -97,6 +97,17 @@ public:
     std::optional<std::string> read_string(uint32_t off) const; // StringN*
     bool read_resource(uint32_t off, int32_t* index, bool* extra) const;
 
+    // -- container patching (tools/psb patch-*) ------------------------------
+    /// Index of an existing pool string (exact match) or -1.
+    int string_index(std::string_view s) const {
+        for (size_t i = 0; i < strings_.size(); ++i)
+            if (strings_[i] == s) return int(i);
+        return -1;
+    }
+    /// Mutable byte view: same-size in-place edits keep every offset/table
+    /// valid, so a patched file is a legal PSB without a full re-serializer.
+    std::vector<uint8_t>& mutable_bytes() { return data_; }
+
     // -- resources -----------------------------------------------------------
     /// Absolute byte range of a resource (resolved against the right chunk
     /// data base). `out` spans into the source buffer.

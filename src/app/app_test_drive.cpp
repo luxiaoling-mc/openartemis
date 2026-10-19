@@ -6003,6 +6003,34 @@ static bool ad_hover_drive(AppState* s) {
 //   OA_CONFRET_SLIDER=x,y   drag start (stage coords) when no slider handler
 //                           is registered yet
 // ---------------------------------------------------------------------------
+/// Story dock is a hover-revealed hotspot along the bottom edge; park the
+/// synthetic pointer there so its buttons (qsave/qload/config) register.
+static void ad_dock_reveal(AppState* s) {
+    const int sw = s->rt->project_.config.stage_width;
+    const int sh = s->rt->project_.config.stage_height;
+    s->ad_hover = true;
+    s->ad_cx = sw / 2;
+    s->ad_cy = sh - 8;
+}
+
+// Visible layers with alpha + world rect: proves which layer sits on top of
+// the message window (an opaque window hides the figure's arms).
+static void ad_layer_alpha_dump(AppState* s, const char* tag) {
+    oa::runtime::GameRuntime* rt = s->rt.get();
+    std::printf("[alpha] %s://n", tag);
+    int n = 0;
+    for (const oa::render::Layer* l : rt->scene().draw_order()) {
+        if (!rt->scene().is_effectively_visible(l->id)) continue;
+        const auto r = s->oaRender->layer_world_rect(*l);
+        if (!r) continue;
+        if ((*r)[3] < 20) continue;
+        std::printf("[alpha]   %-28s a=%.3f rect=(%.0f,%.0f %.0fx%.0f) file=%s\n",
+                    l->id.c_str(), l->alpha, (*r)[0], (*r)[1], (*r)[2], (*r)[3],
+                    l->file.c_str());
+        if (++n > 22) break;
+    }
+}
+
 static void ad_emote_dump(AppState* s, const char* tag) {
     oa::runtime::GameRuntime* rt = s->rt.get();
     std::printf("[confret] %s emote_layers=%zu\n", tag, rt->emote_layers().size());
@@ -6027,6 +6055,29 @@ static void ad_emote_dump(AppState* s, const char* tag) {
             std::string err;
             if (st.player->collect_pose_parts(&parts, &err)) {
                 nparts = parts.size();
+                {
+                    size_t inv = 0;
+                    for (const auto& pt : parts)
+                        if (pt.alpha < 0.01) ++inv;
+                    std::printf("[confret]   alpha0 parts=%zu/%zu\n", inv, nparts);
+                }
+                if (std::getenv("OA_EMOTE_PART_LOG")) {
+                    for (size_t i = 0; i < parts.size(); ++i) {
+                        double cx = 0, cy = 0;
+                        for (const auto& v : parts[i].verts) {
+                            cx += v.x;
+                            cy += v.y;
+                        }
+                        if (!parts[i].verts.empty()) {
+                            cx /= double(parts[i].verts.size());
+                            cy /= double(parts[i].verts.size());
+                        }
+                        std::printf("[part] %2zu z? path='%s' a=%.2f c=(%.0f,%.0f) "
+                                    "sg=%d mr=%d\n",
+                                    i, parts[i].nodePath.c_str(), parts[i].alpha, cx, cy,
+                                    parts[i].stencil_group, parts[i].mask_role);
+                    }
+                }
                 for (const auto& pt : parts)
                     for (const auto& v : pt.verts) {
                         bx0 = std::min(bx0, v.x);
@@ -6034,6 +6085,28 @@ static void ad_emote_dump(AppState* s, const char* tag) {
                         bx1 = std::max(bx1, v.x);
                         by1 = std::max(by1, v.y);
                     }
+            }
+        }
+        if (std::getenv("OA_EMOTE_PART_LOG") && st.player) {
+            std::vector<oa::emote::EmoteDrawPart> parts;
+            std::string err;
+            if (st.player->collect_pose_parts(&parts, &err)) {
+                for (size_t i = 0; i < parts.size(); ++i) {
+                    double cx = 0, cy = 0, y0 = 1e9, y1 = -1e9;
+                    for (const auto& v : parts[i].verts) {
+                        cx += v.x;
+                        cy += v.y;
+                        y0 = std::min(y0, v.y);
+                        y1 = std::max(y1, v.y);
+                    }
+                    if (!parts[i].verts.empty()) {
+                        cx /= double(parts[i].verts.size());
+                        cy /= double(parts[i].verts.size());
+                    }
+                    std::printf("[p] %-22s %2zu c=(%.0f,%.0f) y=[%.0f..%.0f] sg=%d mr=%d %s\n",
+                                id.c_str(), i, cx, cy, y0, y1, parts[i].stencil_group,
+                                parts[i].mask_role, parts[i].nodePath.c_str());
+                }
             }
         }
         std::printf("[confret]   pose parts=%zu bbox=(%.0f,%.0f)-(%.0f,%.0f)\n",
@@ -6081,7 +6154,25 @@ static bool ad_confret_drive(AppState* s) {
     s->opt.frames_target = 0;
     static int sub = 0, waits = 0;
     static uint64_t t_stage = 0;
+    static int save_stage = -1, save_wait = 0;
     const uint64_t now = SDL_GetTicks();
+    if (save_stage >= 0) { // numbered-save helper: open page -> slot1 -> yes
+        if (++save_wait % 40) return false;
+        if (save_stage == 0) {
+            const oa::render::Layer* t = ad_find_clickable(s, "bt_save01", "", false);
+            std::printf("[confret] save slot tile %s\n", t ? t->id.c_str() : "(not found)");
+            if (t) ad_click_layer(s, t);
+        } else if (save_stage == 1) {
+            const oa::render::Layer* y = ad_find_clickable(s, "bt_yes", "", false);
+            if (y) ad_click_layer(s, y);
+            std::printf("[confret] save confirm %s\n", y ? "clicked" : "(none)");
+        } else {
+            std::printf("[confret] SAVE-DONE\n");
+            return true;
+        }
+        ++save_stage;
+        return false;
+    }
     if (sub == 0) { // language row -> title
         const oa::render::Layer* cn = ad_find_clickable(s, "bt_cn", "", false);
         if (!cn) cn = ad_find_clickable(s, "", "bt_cn", true);
@@ -6146,8 +6237,11 @@ static bool ad_confret_drive(AppState* s) {
         }
         if (waits++ < 60) return false;
         if (waits == 61) ad_conf_inventory(s);
-        const oa::render::Layer* start = ad_find_clickable(s, "bt_continue", "", false);
-        const char* which = "bt_continue";
+        const bool load_mode_title = std::getenv("OA_CONFRET_LOAD") != nullptr;
+        const oa::render::Layer* start =
+            load_mode_title ? ad_find_clickable(s, "bt_load", "", false)
+                            : ad_find_clickable(s, "bt_continue", "", false);
+        const char* which = load_mode_title ? "bt_load" : "bt_continue";
         if (!start) {
             start = ad_find_clickable(s, "bt_start", "", false);
             which = "bt_start";
@@ -6161,8 +6255,176 @@ static bool ad_confret_drive(AppState* s) {
         }
         return false;
     }
+    // OA_CONFRET_LOAD=1: quick-load the save written by OA_CONFRET_SAVE and
+    // stop right there — a deterministic scene for pixel work (~40 s/run
+    // instead of walking the whole story).
+    static const bool load_mode = std::getenv("OA_CONFRET_LOAD") != nullptr;
+    if (load_mode && sub == 2) {
+        if (waits == 120) {
+            ad_conf_inventory(s);
+        } else if (waits == 150) {
+            const oa::render::Layer* slot = nullptr;
+            const char* want = std::getenv("OA_CONFRET_SLOT");
+            const int n = (want && *want) ? std::atoi(want) : 1;
+            char key_buf[32];
+            std::snprintf(key_buf, sizeof key_buf, "bt_save%02d", n);
+            for (const oa::render::Layer* l : rt->scene().draw_order()) {
+                const auto it = l->event_handlers.find("click");
+                if (it == l->event_handlers.end()) continue;
+                if (!rt->scene().is_effectively_visible(l->id)) continue;
+                const auto k = it->second.params.find("key");
+                if (k == it->second.params.end()) continue;
+                if (k->second == key_buf) {
+                    slot = l;
+                    break;
+                }
+            }
+            std::printf("[confret] slot tile %s (want key %s)\n",
+                        slot ? slot->id.c_str() : "(not found)", key_buf);
+            if (slot) ad_click_layer(s, slot);
+        } else if (waits == 240) { // the story page needs a few dozen frames to load
+            ad_dock_reveal(s);
+        } else if (waits == 300) {
+            // Match the handler key directly: the dock button's layer id is
+            // generic (1.80.mw.bt.dc.*), only the key names it.
+            const oa::render::Layer* ql = nullptr;
+            for (const oa::render::Layer* l : rt->scene().draw_order()) {
+                const auto it = l->event_handlers.find("click");
+                if (it == l->event_handlers.end()) continue;
+                const auto k = it->second.params.find("key");
+                if (k == it->second.params.end()) continue;
+                if (k->second == "bt_qload" || k->second == "tb_qload") {
+                    ql = l;
+                    break;
+                }
+            }
+            std::printf("[confret] qload %s\n", ql ? ql->id.c_str() : "(not found)");
+            if (ql) ad_click_layer(s, ql);
+            t_stage = now;
+        } else if (waits == 360) { // quick-load may ask for a confirm
+            const oa::render::Layer* ok = nullptr;
+            for (const oa::render::Layer* l : rt->scene().draw_order()) {
+                const auto it = l->event_handlers.find("click");
+                if (it == l->event_handlers.end()) continue;
+                const auto k = it->second.params.find("key");
+                if (k == it->second.params.end()) continue;
+                const std::string& key = k->second;
+                if (key == "bt_yes" || key == "bt_ok" || key == "bt_confirm" ||
+                    key == "ok" || key == "yes") {
+                    ok = l;
+                    std::printf("[confret] confirm via %s (key=%s)\n", l->id.c_str(),
+                                key.c_str());
+                    break;
+                }
+            }
+            if (ok) ad_click_layer(s, ok);
+        } else if (waits > 480) {
+            std::printf("[confret] loaded scene://n");
+            ad_emote_dump(s, "loaded");
+            ad_layer_alpha_dump(s, "loaded");
+            for (const char* want : {"1.0.4.fg.10.p.m.a.b.0", "1.0.4.fg.9.p.m.a.b.0",
+                                     "1.80.mw.0", "1.0.4", "1.80", "1.0.4.fg", "1.0"}) {
+                const oa::render::Layer* L = rt->scene().find(want);
+                if (!L) continue;
+                std::string kv;
+                for (const auto& [k, v] : L->props) kv += k + "=" + v + " ";
+                std::printf("[props] %s :: %s\n", want, kv.c_str());
+            }
+            if (!s->ad_out.empty()) ad_png_shot(s, "confret_loaded");
+            std::printf("[confret] DONE\n");
+            return true;
+        }
+        ++waits;
+        return false;
+    }
     if (sub == 2) { // quicksave load first, then advance until an emote layer exists
         if (rt->emote_layers().size() >= 1 && waits > 30) {
+            // Let the page settle before the snapshot: the first frames after
+            // an emote appears are still inside the scene transition.
+            // Settle AFTER the emote appears (the page arrives with a white
+            // flash; the emote layers show up during it), then walk a few
+            // pages and snapshot each pose — the reported hand/arm cuts are
+            // pose-specific (raised hand in front of the face).
+            static int settle = 0;
+            static int page_dumps = 0;
+            const int pages = 14;
+            ++settle;
+            if (settle == 90 + page_dumps * 150) {
+                {
+                    // Flatten the visible message text so a specific line in
+                    // a report can be found by content instead of by page
+                    // index ("advance until the text contains X").
+                    std::string flat;
+                    for (const std::string& mid : rt->text().visible_content_layers()) {
+                        const oa::render::MessageLayer* ml = rt->text().layer(mid);
+                        if (!ml || ml->page.empty()) continue;
+                        for (const auto& u : ml->page)
+                            if (u.kind != oa::render::PageUnit::Kind::Newline)
+                                flat += u.data;
+                    }
+                    std::printf("[confret] page%d text: %s\n", page_dumps,
+                                flat.substr(0, 160).c_str());
+                }
+                if (std::getenv("OA_EMOTE_PART_LOG")) { // per-page part dump
+                    std::printf("[confret] page%d parts://n", page_dumps);
+                    for (const auto& [id, st] : rt->emote_layers()) {
+                        if (!st.player) continue;
+                        std::vector<oa::emote::EmoteDrawPart> parts;
+                        std::string err;
+                        if (!st.player->collect_pose_parts(&parts, &err)) continue;
+                        for (size_t i = 0; i < parts.size(); ++i) {
+                            double cx = 0, cy = 0;
+                            for (const auto& v : parts[i].verts) {
+                                cx += v.x; cy += v.y;
+                            }
+                            if (!parts[i].verts.empty()) {
+                                cx /= double(parts[i].verts.size());
+                                cy /= double(parts[i].verts.size());
+                            }
+                            std::printf("[p%d] %s %2zu c=(%.0f,%.0f) a=%.2f sg=%d "
+                                        "mr=%d path=%s\n",
+                                        page_dumps, id.c_str(), i, cx, cy,
+                                        parts[i].alpha, parts[i].stencil_group,
+                                        parts[i].mask_role, parts[i].nodePath.c_str());
+                        }
+                    }
+                }
+                if (!s->ad_out.empty()) {
+                    char tag[32];
+                    std::snprintf(tag, sizeof tag, "confret_page%d", page_dumps);
+                    ad_png_shot(s, tag);
+                }
+                // OA_CONFRET_SAVE=<n>: at page n, write a quicksave into the
+                // run's save root so the scene can be reloaded deterministically
+                // instead of walking the whole story每轮.
+                if (const char* sv = std::getenv("OA_CONFRET_SAVE"); sv && *sv) {
+                    const int want_page = std::atoi(sv);
+                    if (page_dumps >= want_page) {
+                        // Numbered save (slot 1): the quicksave slot does not
+                        // restore the emote layers on load, the numbered one
+                        // does. Open the save page, then the slot tile.
+                        ad_dock_reveal(s);
+                        const oa::render::Layer* sv = ad_find_clickable(s, "bt_save", "", false);
+                        if (sv) ad_click_layer(s, sv);
+                        std::printf("[confret] save page %s\n", sv ? "opened" : "NOT FOUND");
+                        save_stage = 0;
+                        save_wait = 0;
+                        return false;
+                    }
+                }
+                ++page_dumps;
+                if (page_dumps < pages) return false;
+            }
+            if (settle < 90 + pages * 150) {
+                if (settle % 150 == 0) { // advance one page
+                    const int sw = rt->project_.config.stage_width;
+                    const int sh = rt->project_.config.stage_height;
+                    s->ad_cx = sw / 2;
+                    s->ad_cy = int(sh * 0.87);
+                    s->ad_click = true;
+                }
+                return false;
+            }
             std::printf("[confret] story page with %zu emote layer(s)\n",
                         rt->emote_layers().size());
             ad_emote_dump(s, "before");

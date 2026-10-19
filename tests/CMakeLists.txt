@@ -40,6 +40,18 @@ add_executable(compositor_test compositor_test.cpp)
 target_link_libraries(compositor_test PRIVATE libopenartemis)
 add_test(NAME compositor_test COMMAND compositor_test)
 
+# E-mote timeline sampling: a type-0 segment end must hold the previous content
+# key (a fractional clock otherwise loses short keys — NekoMiko's shy pose).
+add_executable(emote_track_sample_test emote_track_sample_test.cpp)
+target_link_libraries(emote_track_sample_test PRIVATE libopenartemis)
+add_test(NAME emote_track_sample_test COMMAND emote_track_sample_test)
+
+# E-mote morph warp: samples past a region border must keep following the
+# field instead of folding onto it (raised-hand fingertips / sleeve edge).
+add_executable(emote_warp_test emote_warp_test.cpp)
+target_link_libraries(emote_warp_test PRIVATE libopenartemis)
+add_test(NAME emote_warp_test COMMAND emote_warp_test)
+
 # layer-model S1/S2 (research/105): 分类权威 layer_kind.h kind_of 断言组 +
 # 统一 invalidate 簿记集合/写入口标记面(纯新增;不改任何现有行为)。
 add_executable(layer_kind_test layer_kind_test.cpp)

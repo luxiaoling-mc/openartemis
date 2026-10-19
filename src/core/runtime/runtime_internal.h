@@ -213,6 +213,10 @@ struct GameRuntime::RuntimeState {
     void sound_finished(oa::media::SoundCategory cat, const std::string& id);
     bool media_se_wait_finished(const std::string& id, bool time_given,
                                 uint64_t time_ms) const;
+    // [wait se=ID time=N] when no channel is live (muted host / voice not
+    // loaded): remember the deadline so the tag still paces the voice-cued
+    // `delay` variants instead of collapsing them all into one frame.
+    mutable std::map<std::string, uint64_t> se_wait_deadline_;
 
     // ======================================================================
     // 原 GameRuntime private 段（逐字搬移）
@@ -372,6 +376,14 @@ struct GameRuntime::RuntimeState {
     /// the scale/offset the script asked for ("只剩脚" report: the fresh
     /// player fell back to scale 0.6 / coord 0 and the body left the canvas).
     std::map<std::string, oa::emote::EmotePlayer::ViewState> emote_view_cache_;
+    /// Player parked across the delete+create pair of a scene beat. The
+    /// reference keeps the character's expression there (a bg change runs
+    /// fgdelall -> emote.reset and the next [fg] rebuilds the layer, yet the
+    /// face keeps its previous pose); dropping the player reset every
+    /// variable to 通常. The parked player is only consulted when the same
+    /// layer id is rebuilt from the SAME psb, and dies with the scene
+    /// ([reset]/读档 clear it together with emote_layers_).
+    std::map<std::string, EmoteLayerState> parked_emote_;
     // [C] E: 诊断计数
     size_t emote_layer_events_ = 0;
     // [C] E: 语音 id 发生器（单调；读档不恢复）

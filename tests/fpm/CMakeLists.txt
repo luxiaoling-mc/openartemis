@@ -445,3 +445,11 @@ endif()
 # E-mote stencil/mask structure survey (report-only).
 add_executable(emote_mask_dump emote_mask_dump.cpp)
 target_link_libraries(emote_mask_dump PRIVATE libopenartemis)
+
+# Selector / timeline variable survey (report-only).
+add_executable(emote_vars_dump emote_vars_dump.cpp)
+target_link_libraries(emote_vars_dump PRIVATE libopenartemis)
+
+# Story-walk emote state dump (report-only).
+add_executable(emote_state_probe emote_state_probe.cpp)
+target_link_libraries(emote_state_probe PRIVATE libopenartemis)

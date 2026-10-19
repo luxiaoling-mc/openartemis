@@ -17,6 +17,7 @@
 //   psb render  <file.psb> <out.png> [--size WxH] [--scale S] [--var k=v ...]
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <cstring>
 #include <map>
 #include <span>
@@ -40,17 +41,25 @@ namespace emote = oa::emote;
 
 void print_usage() {
     std::fprintf(stderr,
-        "usage: psb <info|tree|json|motions|sources|icons|extract|render> <file.psb> [args]\n"
+        "usage: psb <info|tree|json|motions|timelines|controls|sources|icons|iconpng|extract|unpack|render|patch-motion> <file.psb> [args]\n"
         "  psb info    <file.psb>\n"
         "  psb tree    <file.psb> [--depth N] [--max N]     container structure\n"
         "  psb json    <file.psb> [out.json]                raw tree as JSON\n"
         "  psb motions <file.psb>                           objects/motions/nodes\n"
         "  psb sources <file.psb>                           atlas sources (type/size)\n"
         "  psb icons   <file.psb> [source]                  icon rects/origins\n"
+        "  psb timelines <file.psb> [substr]                named variable animations\n"
+        "  psb controls <file.psb>                          axes/selectors/eyeControl\n"
+        "  psb iconpng <file.psb> <outdir>                  one PNG per icon + icons.csv\n"
         "  psb extract <file.psb> <outdir>                  atlas PNGs + manifest\n"
+        "  psb unpack  <file.psb> <outdir>                  everything above in one folder\n"
         "  psb render  <file.psb> <out.png> [--size WxH] [--scale S] [--var k=v]\n"
         "      Static (tick-0) pose render; --var sets E-mote variable values\n"
-        "      (e.g. --var face_talk=1 --var face_eye_open=0).\n");
+        "      (e.g. --var face_talk=1 --var face_eye_open=0).\n"
+        "  psb patch-motion <in.psb> <out.psb> <node-label> <old> <new>\n"
+        "      Same-size in-place patch: redirect that node's sub-motion\n"
+        "      reference (frame content.icon) from <old> to <new>. Builds\n"
+        "      differential fixtures for the official driver.\n");
 }
 
 bool read_file(const std::string& path, std::vector<uint8_t>* out) {
@@ -612,6 +621,602 @@ int cmd_render(const std::string& path, const std::string& out, int w, int h, do
     return 0;
 }
 
+
+// ---------------------------------------------------------------------------
+// semantic dumps: controls (parameter axes / selectors / eyeControl), timelines
+// (the named variable animations) and the node tree. These are the three views
+// an expression investigation needs: which axis a face part follows, which
+// timeline key writes it, and which node/icon it selects.
+// ---------------------------------------------------------------------------
+std::string dump_controls(const emote::EmoteFile& ef) {
+    std::string o;
+    char buf[512];
+    std::snprintf(buf, sizeof(buf), "variables: %zu\n\n", ef.variableNames.size());
+    o += buf;
+    o += "== variableList (defaults are all 0; timelines drive them) ==\n";
+    for (const auto& n : ef.variableNames) o += "  " + n + "\n";
+
+    o += "\n== parameter axes (motion / id / range / division -> tick = (v-begin)/(end-begin)*division) ==\n";
+    for (const auto& m : ef.motions) {
+        if (m.parameter.empty()) continue;
+        o += "  motion '" + m.name + "'\n";
+        for (const auto& pa : m.parameter) {
+            std::snprintf(buf, sizeof(buf), "    %-24s range=[%g..%g] div=%g\n", pa.id.c_str(),
+                          pa.rangeBegin, pa.rangeEnd, pa.division);
+            o += buf;
+        }
+    }
+
+    o += "\n== selectorControl (option -> on/off variable values) ==\n";
+    for (const auto& sel : ef.selectors) {
+        o += "  " + sel.label + " (" + std::to_string(sel.options.size()) + " options)\n";
+        for (const auto& op : sel.options) {
+            std::snprintf(buf, sizeof(buf), "    %-24s on=%g off=%g\n", op.label.c_str(),
+                          op.onValue, op.offValue);
+            o += buf;
+        }
+    }
+
+    o += "\n== eyeControl (automatic blink over the named variable) ==\n";
+    for (const auto& ec : ef.eyeControls) {
+        std::snprintf(buf, sizeof(buf),
+                      "  label=%s begin=%g end=%g blinkFrames=%g interval=[%g..%g]\n",
+                      ec.label.c_str(), ec.beginFrame, ec.endFrame, ec.blinkFrameCount,
+                      ec.blinkIntervalMin, ec.blinkIntervalMax);
+        o += buf;
+    }
+    if (ef.eyeControls.empty()) o += "  (none)\n";
+    return o;
+}
+
+std::string dump_timelines(const emote::EmoteFile& ef, const std::string& only) {
+    std::string o;
+    char buf[512];
+    for (size_t ti = 0; ti < ef.timelines.size(); ++ti) {
+        const auto& tl = ef.timelines[ti];
+        if (!only.empty() && tl.label.find(only) == std::string::npos) continue;
+        std::snprintf(buf, sizeof(buf), "[%zu] '%s' diff=%d last=%d loop=[%d..%d] tracks=%zu\n",
+                      ti, tl.label.c_str(), tl.diff, tl.lastTime, tl.loopBegin, tl.loopEnd,
+                      tl.variables.size());
+        o += buf;
+        for (const auto& tr : tl.variables) {
+            std::snprintf(buf, sizeof(buf), "    %-22s %2zu keys", tr.label.c_str(),
+                          tr.frames.size());
+            o += buf;
+            for (const auto& fr : tr.frames) {
+                std::snprintf(buf, sizeof(buf), "  t%g=%g%s", fr.time, fr.value,
+                              fr.hasContent ? "" : "(end)");
+                o += buf;
+            }
+            o += "\n";
+        }
+    }
+    return o;
+}
+
+void dump_nodes(const emote::EmoteMotion& m, int idx, int depth, std::string* o) {
+    if (idx < 0 || idx >= int(m.nodes.size()) || depth > 64) return;
+    const auto& n = m.nodes[idx];
+    char buf[512];
+    std::string pad(size_t(depth) * 2, ' ');
+    std::string par;
+    if (n.isParameterized && n.parameterIndex >= 0 &&
+        n.parameterIndex < int(m.parameter.size()))
+        par = " param=" + m.parameter[size_t(n.parameterIndex)].id;
+    std::snprintf(buf, sizeof(buf), "%s%s [type=%d]%s frames=%zu%s\n", pad.c_str(),
+                  n.label.empty() ? "?" : n.label.c_str(), n.type, par.c_str(),
+                  n.frames.size(), n.removed ? " (removed)" : "");
+    *o += buf;
+    for (const auto& fr : n.frames) {
+        std::string content;
+        if (fr.isSubMotion) content = "sub=" + fr.subObject + "/" + fr.subMotion;
+        else if (!fr.src.empty()) content = "src=" + fr.src + " icon=" + fr.icon;
+        std::snprintf(buf, sizeof(buf),
+                      "%s  t=%-6g type=%d %s coord=(%g,%g,%g) scale=(%g,%g) angle=%g opa=%g%s\n",
+                      pad.c_str(), fr.time, fr.type, content.c_str(), fr.coordX, fr.coordY,
+                      fr.coordZ, fr.zx, fr.zy, fr.angle, fr.opa,
+                      fr.hasBp ? " mesh=bp" : "");
+        *o += buf;
+    }
+    for (int ch : n.children) dump_nodes(m, ch, depth + 1, o);
+}
+
+std::string dump_structure(const emote::EmoteFile& ef, int max_depth) {
+    std::string o;
+    char buf[512];
+    std::snprintf(buf, sizeof(buf),
+                  "base: %s / %s\nobjects=%zu motions=%zu timelines=%zu vars=%zu\n\n",
+                  ef.baseChara.c_str(), ef.baseMotion.c_str(), ef.objects.size(),
+                  ef.motions.size(), ef.timelines.size(), ef.variableNames.size());
+    o += buf;
+    for (const auto& obj : ef.objects) {
+        o += "object '" + obj.name + "'\n";
+        for (const auto& [mname, midx] : obj.motions) {
+            if (midx < 0 || midx >= int(ef.motions.size())) continue;
+            const auto& m = ef.motions[size_t(midx)];
+            std::snprintf(buf, sizeof(buf), "  motion '%s' nodes=%zu params=%zu\n",
+                          mname.c_str(), m.nodes.size(), m.parameter.size());
+            o += buf;
+            if (max_depth <= 0) continue;
+            for (int root : m.layer) {
+                dump_nodes(m, root, 2, &o);
+            }
+        }
+    }
+    return o;
+}
+
+int cmd_timelines(const std::string& path, const std::string& only) {
+    std::vector<uint8_t> bytes;
+    if (!read_file(path, &bytes)) {
+        std::fprintf(stderr, "cannot read: %s\n", path.c_str());
+        return 1;
+    }
+    emote::EmoteFile ef;
+    std::string err;
+    if (!ef.load(bytes, &err)) {
+        std::fprintf(stderr, "not an E-mote PSB: %s\n", err.c_str());
+        return 1;
+    }
+    const std::string s = dump_timelines(ef, only);
+    std::fwrite(s.data(), 1, s.size(), stdout);
+    return 0;
+}
+
+int cmd_controls(const std::string& path) {
+    std::vector<uint8_t> bytes;
+    if (!read_file(path, &bytes)) {
+        std::fprintf(stderr, "cannot read: %s\n", path.c_str());
+        return 1;
+    }
+    emote::EmoteFile ef;
+    std::string err;
+    if (!ef.load(bytes, &err)) {
+        std::fprintf(stderr, "not an E-mote PSB: %s\n", err.c_str());
+        return 1;
+    }
+    const std::string s = dump_controls(ef);
+    std::fwrite(s.data(), 1, s.size(), stdout);
+    return 0;
+}
+
+// crop every icon out of its atlas: icons/<source>/<icon>.png + icons.csv
+int cmd_iconpng(const std::string& path, const std::string& outdir) {
+    std::vector<uint8_t> bytes;
+    if (!read_file(path, &bytes)) {
+        std::fprintf(stderr, "cannot read: %s\n", path.c_str());
+        return 1;
+    }
+    emote::EmoteFile ef;
+    std::string err;
+    if (!ef.load(bytes, &err)) {
+        std::fprintf(stderr, "not an E-mote PSB: %s\n", err.c_str());
+        return 1;
+    }
+    mkdir_p(outdir);
+    std::string csv = "source,icon,left,top,width,height,originX,originY,file\n";
+    size_t total = 0;
+    for (size_t si = 0; si < ef.sources.size(); ++si) {
+        emote::EmoteSource& s = *ef.sources[si];
+        if (!ef.ensure_atlas(&s, &err) || s.rgba.empty()) continue;
+        std::string sname = s.name;
+        for (char& c : sname)
+            if (c == '/' || c == '\\' || c == ':' || c == ' ') c = '_';
+        const std::string sdir = outdir + "/" + sname;
+        mkdir_p(sdir);
+        for (size_t ii = 0; ii < s.icons.size(); ++ii) {
+            const emote::EmoteIcon& ic = s.icons[ii];
+            int x0 = int(std::lround(ic.left)), y0 = int(std::lround(ic.top));
+            int w = int(std::lround(ic.width)), h = int(std::lround(ic.height));
+            if (w <= 0 || h <= 0) continue;
+            if (x0 < 0) { w += x0; x0 = 0; }
+            if (y0 < 0) { h += y0; y0 = 0; }
+            if (x0 + w > s.textureWidth) w = s.textureWidth - x0;
+            if (y0 + h > s.textureHeight) h = s.textureHeight - y0;
+            if (w <= 0 || h <= 0) continue;
+            std::vector<uint8_t> px(size_t(w) * size_t(h) * 4, 0);
+            for (int y = 0; y < h; ++y)
+                std::memcpy(&px[size_t(y) * size_t(w) * 4],
+                            &s.rgba[(size_t(y0 + y) * size_t(s.textureWidth) + size_t(x0)) * 4],
+                            size_t(w) * 4);
+            const std::vector<uint8_t> png =
+                oa::media::encode_png(uint32_t(w), uint32_t(h), px);
+            if (png.empty()) continue;
+            std::string base = ic.name.empty() ? ("icon_" + std::to_string(ii)) : ic.name;
+            for (char& c : base)
+                if (c == '/' || c == '\\' || c == ':' || c == ' ') c = '_';
+            const std::string rel = sname + "/" + base + ".png";
+            if (!write_file(outdir + "/" + rel, png)) continue;
+            char line[512];
+            std::snprintf(line, sizeof(line), "%s,%s,%d,%d,%d,%d,%g,%g,%s\n", s.name.c_str(),
+                          ic.name.c_str(), x0, y0, w, h, ic.originX, ic.originY, rel.c_str());
+            csv += line;
+            ++total;
+        }
+    }
+    write_file(outdir + "/icons.csv", std::vector<uint8_t>(csv.begin(), csv.end()));
+    std::fprintf(stderr, "%zu icons -> %s (icons.csv)\n", total, outdir.c_str());
+    return total == 0 ? 1 : 0;
+}
+
+int cmd_unpack(const std::string& path, const std::string& outdir) {
+    std::vector<uint8_t> bytes;
+    if (!read_file(path, &bytes)) {
+        std::fprintf(stderr, "cannot read: %s\n", path.c_str());
+        return 1;
+    }
+    emote::EmoteFile ef;
+    std::string err;
+    if (!ef.load(bytes, &err)) {
+        std::fprintf(stderr, "not an E-mote PSB: %s\n", err.c_str());
+        return 1;
+    }
+    mkdir_p(outdir);
+
+    size_t icon_total = 0;
+    for (const auto& s : ef.sources) icon_total += s->icons.size();
+    std::string info;
+    {
+        char buf[512];
+        std::snprintf(buf, sizeof(buf),
+                      "file: %s (%zu bytes)\nversion: %g\nscreen: %dx%d\nbase: %s / %s\n"
+                      "objects=%zu motions=%zu timelines=%zu variables=%zu sources=%zu icons=%zu\n",
+                      path.c_str(), bytes.size(), ef.version, ef.screenWidth, ef.screenHeight,
+                      ef.baseChara.c_str(), ef.baseMotion.c_str(), ef.objects.size(),
+                      ef.motions.size(), ef.timelines.size(), ef.variableNames.size(),
+                      ef.sources.size(), icon_total);
+        info += buf;
+    }
+    auto w = [&](const std::string& name, const std::string& body) {
+        write_file(outdir + "/" + name, std::vector<uint8_t>(body.begin(), body.end()));
+    };
+    w("info.txt", info);
+    w("controls.txt", dump_controls(ef));
+    w("timelines.txt", dump_timelines(ef, ""));
+    w("structure.txt", dump_structure(ef, 64));
+
+    // raw container tree as JSON (machine-readable, one line per value)
+    {
+        const std::string json_path = outdir + "/tree.json";
+        cmd_json(path, &json_path);
+    }
+    cmd_extract(path, outdir + "/atlas");
+    cmd_iconpng(path, outdir + "/icons");
+
+    const std::string readme =
+        "PSB unpack / E-mote figure package\r\n"
+        "================================\r\n"
+        "\r\n"
+        "info.txt        container + model summary\r\n"
+        "structure.txt   object -> motion -> node tree (label/type/param/frames/coords)\r\n"
+        "timelines.txt   named variable animations (expression tracks: t=value keys)\r\n"
+        "controls.txt    variableList / parameter axes / selectors / eyeControl\r\n"
+        "tree.json       raw PSB container tree (every object value)\r\n"
+        "atlas/          decoded texture atlases (DXT5 -> RGBA PNG) + manifest.json\r\n"
+        "icons/          every icon cropped from its atlas, icons.csv has the rects\r\n"
+        "\r\n"
+        "How an expression resolves:/r/n"
+        "  timeline track (timelines.txt)  -> variable value\r\n"
+        "  variable -> parameter axis (controls.txt: id/range/division)\r\n"
+        "  tick = (v - rangeBegin) / (rangeEnd - rangeBegin) * division\r\n"
+        "  parameterized node (structure.txt: param=<id>) picks the frame at that tick\r\n"
+        "  frame content -> icon (icons/<source>/<icon>.png)\r\n"
+        "\r\n"
+        "Eye lid example (tka_0.psb): face_eye_open range=[-10..50] div=60, so\r\n"
+        "  v=0 -> tick 10 -> icon 0050 (open); v=5 -> tick 15 -> 0051 (half);\r\n"
+        "  v=10 -> tick 20 -> 0052 (closed).\r\n";
+    w("README.txt", readme);
+    std::fprintf(stderr, "unpacked -> %s\n", outdir.c_str());
+    return 0;
+}
+
+
+// ---------------------------------------------------------------------------
+// container patcher (A/B fixtures)
+//
+// A same-size, in-place edit keeps every table/offset valid, so a patched file
+// is still a legal PSB — no serializer needed. Used to build differential
+// fixtures for the official E-mote driver: e.g. redirect one node's sub-motion
+// reference to a simple motion, so the two runtimes can be compared on a
+// subtree that is known-simple.
+// ---------------------------------------------------------------------------
+struct PatchCtx {
+    std::string label;   // node label to target ("-" = any node)
+    int from_index = -1; // match by pool index (>=0) ...
+    std::string from;    // ... or by text
+    int to_index = -1;   // replacement by pool index (>=0) ...
+    std::string to;      // ... or by text
+    int patched = 0;
+    int frames_seen = 0;
+};
+
+int parse_index_token(const std::string& s) {
+    if (s.size() > 1 && s[0] == '#') return std::atoi(s.c_str() + 1);
+    return -1;
+}
+
+bool patch_string_value(psb::PsbReader& r, uint32_t off, int idx, std::string* err) {
+    const psb::Kind k = r.kind_at(off);
+    if (k < psb::Kind::StringN1 || k > psb::Kind::StringN4) { *err = "not a string value"; return false; }
+    const int w = int(uint8_t(k) - uint8_t(psb::Kind::StringN1)) + 1;
+    if (idx < 0 || idx >= int(r.strings().size())) { *err = "string index out of range"; return false; }
+    if (w < 4 && uint64_t(idx) >= (uint64_t(1) << (8 * w))) { *err = "index does not fit"; return false; }
+    auto& b = r.mutable_bytes();
+    for (int i = 0; i < w; ++i) b[size_t(off) + 1 + size_t(i)] = uint8_t((uint32_t(idx) >> (8 * i)) & 0xff);
+    return true;
+}
+
+void patch_walk(psb::PsbReader& r, uint32_t off, PatchCtx* ctx, int depth, std::string* err) {
+    if (depth > 96 || !err->empty()) return;
+    const psb::Kind k = r.kind_at(off);
+    if (k == psb::Kind::Objects) {
+        std::vector<std::string> keys;
+        std::vector<uint32_t> vals;
+        if (!r.object_entries(off, &keys, &vals)) return;
+        bool is_target = false;
+        uint32_t frame_list = 0;
+        bool has_fl = false;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (keys[i] == "label") {
+                if (auto s = r.read_string(vals[i]); s && (ctx->label == "-" || *s == ctx->label))
+                    is_target = true;
+            } else if (keys[i] == "frameList") {
+                frame_list = vals[i];
+                has_fl = true;
+            }
+        }
+        if ((is_target || ctx->label == "-") && has_fl) {
+            std::vector<uint32_t> frames;
+            if (r.list_items(frame_list, &frames)) {
+                for (uint32_t fr : frames) {
+                    const auto content = r.object_member(fr, "content");
+                    if (!content) continue;
+                    const auto icon = r.object_member(*content, "icon");
+                    if (!icon) continue;
+                    const auto cur = r.read_string(*icon);
+                    if (!cur) continue;
+                    ++ctx->frames_seen;
+                    if (ctx->from_index >= 0) {
+                        const psb::Kind ik = r.kind_at(*icon);
+                        const int iw = int(uint8_t(ik) - uint8_t(psb::Kind::StringN1)) + 1;
+                        int64_t raw = 0;
+                        for (int b = 0; b < iw; ++b)
+                            raw |= int64_t(r.mutable_bytes()[size_t(*icon) + 1 + size_t(b)]) << (8 * b);
+                        if (int(raw) != ctx->from_index) continue;
+                    } else if (*cur != ctx->from) {
+                        continue;
+                    }
+                    const int to_idx = ctx->to_index >= 0 ? ctx->to_index : r.string_index(ctx->to);
+                    if (!patch_string_value(r, *icon, to_idx, err)) return;
+                    ++ctx->patched;
+                }
+            }
+        }
+        for (size_t i = 0; i < vals.size(); ++i) patch_walk(r, vals[i], ctx, depth + 1, err);
+    } else if (k == psb::Kind::List) {
+        std::vector<uint32_t> items;
+        if (r.list_items(off, &items))
+            for (uint32_t v : items) patch_walk(r, v, ctx, depth + 1, err);
+    }
+}
+
+int cmd_strings(const std::string& path) {
+    std::vector<uint8_t> data;
+    if (!read_file(path, &data)) return 1;
+    psb::PsbReader r;
+    std::string err;
+    if (!r.load(data, &err)) { std::fprintf(stderr, "load: %s\n", err.c_str()); return 1; }
+    const auto& pool = r.strings();
+    for (size_t i = 0; i < pool.size(); ++i)
+        std::printf("#%zu\t%s\n", i, pool[i].c_str());
+    std::fprintf(stderr, "%zu strings\n", pool.size());
+    return 0;
+}
+
+int cmd_patch_motion(const std::string& in, const std::string& out, const std::string& label,
+                     const std::string& from, const std::string& to) {
+    std::vector<uint8_t> data;
+    if (!read_file(in, &data)) {
+        std::fprintf(stderr, "cannot read %s\n", in.c_str());
+        return 1;
+    }
+    psb::PsbReader r;
+    std::string err;
+    if (!r.load(data, &err)) {
+        std::fprintf(stderr, "load: %s\n", err.c_str());
+        return 1;
+    }
+    PatchCtx ctx;
+    ctx.label = label;
+    ctx.from_index = parse_index_token(from);
+    ctx.to_index = parse_index_token(to);
+    ctx.from = ctx.from_index >= 0 ? std::string() : from;
+    ctx.to = ctx.to_index >= 0 ? std::string() : to;
+    if (ctx.to_index < 0 && r.string_index(to) < 0) {
+        std::fprintf(stderr, "target string '%s' is not in the pool\n", to.c_str());
+        return 1;
+    }
+    std::string perr;
+    patch_walk(r, r.root_offset(), &ctx, 0, &perr);
+    if (!perr.empty()) {
+        std::fprintf(stderr, "patch failed: %s\n", perr.c_str());
+        return 1;
+    }
+    if (ctx.patched == 0) {
+        std::fprintf(stderr, "no frame matched (label='%s', icon='%s'); frames seen under that label: %d\n",
+                     label.c_str(), from.c_str(), ctx.frames_seen);
+        return 1;
+    }
+    FILE* f = std::fopen(out.c_str(), "wb");
+    if (!f) { std::fprintf(stderr, "cannot write %s\n", out.c_str()); return 1; }
+    auto& bytes = r.mutable_bytes();
+    std::fwrite(bytes.data(), 1, bytes.size(), f);
+    std::fclose(f);
+    std::printf("patched %d frame(s): node '%s' icon '%s' -> '%s'  => %s\n",
+                ctx.patched, label.c_str(), from.c_str(), to.c_str(), out.c_str());
+    return 0;
+}
+
+
+// ---------------------------------------------------------------------------
+// numeric patcher: overwrite every morph grid (mesh.bp) with the identity grid.
+//
+// A differential fixture for "is the deformation the thing that differs?": an
+// all-identity PSB has no morph at all, so both runtimes must agree exactly if
+// their plain transform / compositing path is equivalent. Anything that still
+// differs afterwards is NOT a warp problem.
+// ---------------------------------------------------------------------------
+bool write_real(psb::PsbReader& r, uint32_t off, double value, std::string* err) {
+    const psb::Kind k = r.kind_at(off);
+    auto& b = r.mutable_bytes();
+    switch (k) {
+        // Float0 is the compact encoding of the value 0.0 (one byte, no
+        // payload) — patching it is only possible when the target is 0 too.
+        case psb::Kind::Float0:
+            if (value == 0.0) return true;
+            *err = "Float0 cannot hold a non-zero value";
+            return false;
+        case psb::Kind::Float: {
+            const float f = float(value);
+            std::memcpy(&b[size_t(off) + 1], &f, 4);
+            return true;
+        }
+        case psb::Kind::Double: {
+            std::memcpy(&b[size_t(off) + 1], &value, 8);
+            return true;
+        }
+        default: break;
+    }
+    if (k >= psb::Kind::NumberN0 && k <= psb::Kind::NumberN8) {
+        const int w = int(uint8_t(k) - uint8_t(psb::Kind::NumberN0));
+        const int64_t iv = (int64_t)std::llround(value);
+        for (int i = 0; i < w; ++i)
+            b[size_t(off) + 1 + size_t(i)] = uint8_t((uint64_t(iv) >> (8 * i)) & 0xff);
+        return true;
+    }
+    *err = "bp item is not numeric";
+    return false;
+}
+
+struct IdentCtx {
+    int grids = 0;
+    int items = 0;
+    int skipped = 0;
+    std::string keep;      // keep this node's grids, flatten everything else
+    int keepIndex = -1;    // ... matched by pool index ("#123")
+    int matched = 0;
+};
+
+int label_index(psb::PsbReader& r, uint32_t off) {
+    const psb::Kind k = r.kind_at(off);
+    if (k < psb::Kind::StringN1 || k > psb::Kind::StringN4) return -1;
+    const int w = int(uint8_t(k) - uint8_t(psb::Kind::StringN1)) + 1;
+    int64_t raw = 0;
+    for (int b = 0; b < w; ++b)
+        raw |= int64_t(r.mutable_bytes()[size_t(off) + 1 + size_t(b)]) << (8 * b);
+    return int(raw);
+}
+
+bool write_real(psb::PsbReader& r, uint32_t off, double value, std::string* err);
+
+// flatten every morph grid except the nodes selected by ctx.keep (#index or
+// a UTF-8 substring of the label). One carrier left standing per run is how a
+// chain gets attributed: whichever isolated carrier still differs between the
+// runtimes is the one whose evaluation differs.
+void ident_walk(psb::PsbReader& r, uint32_t off, IdentCtx* ctx, int depth, std::string* err) {
+    if (depth > 96 || !err->empty()) return;
+    const psb::Kind k = r.kind_at(off);
+    if (k == psb::Kind::Objects) {
+        std::vector<std::string> keys;
+        std::vector<uint32_t> vals;
+        if (!r.object_entries(off, &keys, &vals)) return;
+        uint32_t frameList = 0;
+        bool hasFrames = false;
+        bool selected = false;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (keys[i] == "label") {
+                const auto lab = r.read_string(vals[i]);
+                const int idx = label_index(r, vals[i]);
+                if (ctx->keepIndex >= 0)
+                    selected = idx == ctx->keepIndex;
+                else if (!ctx->keep.empty() && lab)
+                    selected = lab->find(ctx->keep) != std::string::npos;
+                if (selected) ++ctx->matched;
+            } else if (keys[i] == "frameList") {
+                frameList = vals[i];
+                hasFrames = true;
+            }
+        }
+        if (hasFrames && ctx->keep.rfind("reg:", 0) == 0) {
+            // select by the blank region text of any frame
+            std::vector<uint32_t> frames;
+            const std::string want = ctx->keep.substr(4);
+            if (r.list_items(frameList, &frames)) {
+                for (uint32_t fr : frames) {
+                    const auto content = r.object_member(fr, "content");
+                    if (!content) continue;
+                    const auto icon = r.object_member(*content, "icon");
+                    if (!icon) continue;
+                    const auto ic = r.read_string(*icon);
+                    if (ic && ic->rfind(want, 0) == 0) { selected = true; ++ctx->matched; break; }
+                }
+            }
+        }
+        if (hasFrames && !selected) {
+            std::vector<uint32_t> frames;
+            if (r.list_items(frameList, &frames)) {
+                for (uint32_t fr : frames) {
+                    const auto content = r.object_member(fr, "content");
+                    if (!content) continue;
+                    const auto mesh = r.object_member(*content, "mesh");
+                    if (!mesh) continue;
+                    const auto bp = r.object_member(*mesh, "bp");
+                    if (!bp) continue;
+                    std::vector<uint32_t> items;
+                    if (!r.list_items(*bp, &items) || items.size() != 32) continue;
+                    bool ok = true;
+                    for (int j = 0; j < 32 && ok; ++j) {
+                        const int row = j / 8, col = (j / 2) % 4;
+                        const double v = (j & 1) ? double(row) / 3.0 : double(col) / 3.0;
+                        std::string e2;
+                        if (!write_real(r, items[size_t(j)], v, &e2)) ok = false;
+                    }
+                    if (ok) { ++ctx->grids; ctx->items += 32; }
+                    else ++ctx->skipped;
+                }
+            }
+        }
+        for (size_t i = 0; i < vals.size(); ++i) ident_walk(r, vals[i], ctx, depth + 1, err);
+    } else if (k == psb::Kind::List) {
+        std::vector<uint32_t> items;
+        if (r.list_items(off, &items))
+            for (uint32_t v : items) ident_walk(r, v, ctx, depth + 1, err);
+    }
+}
+
+int cmd_patch_identity(const std::string& in, const std::string& out,
+                      const std::string& keep) {
+    std::vector<uint8_t> data;
+    if (!read_file(in, &data)) { std::fprintf(stderr, "cannot read %s\n", in.c_str()); return 1; }
+    psb::PsbReader r;
+    std::string err;
+    if (!r.load(data, &err)) { std::fprintf(stderr, "load: %s\n", err.c_str()); return 1; }
+    IdentCtx ctx;
+    ctx.keep = keep;
+    if (!keep.empty() && keep[0] == '#') { ctx.keepIndex = std::atoi(keep.c_str() + 1); ctx.keep.clear(); }
+    ident_walk(r, r.root_offset(), &ctx, 0, &err);
+    if (ctx.keepIndex >= 0 || !ctx.keep.empty())
+        std::printf("kept %d node(s) matching '%s'\n", ctx.matched, keep.c_str());
+    FILE* f = std::fopen(out.c_str(), "wb");
+    if (!f) { std::fprintf(stderr, "cannot write %s\n", out.c_str()); return 1; }
+    auto& bytes = r.mutable_bytes();
+    std::fwrite(bytes.data(), 1, bytes.size(), f);
+    std::fclose(f);
+    std::printf("identity-patched %d grid(s) / %d values, %d non-numeric grid(s) skipped => %s\n",
+                ctx.grids, ctx.items, ctx.skipped, out.c_str());
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -639,6 +1244,32 @@ int main(int argc, char** argv) {
                     max_lines = size_t(std::atoll(argv[i + 1]));
             }
             return cmd_tree(path, depth, max_lines);
+        }
+        if (cmd == "patch-motion") {
+            if (argc < 7) {
+                std::fprintf(stderr,
+                    "usage: psb patch-motion <in.psb> <out.psb> <node-label> <old-motion> <new-motion>\n");
+                return 2;
+            }
+            return cmd_patch_motion(path, argv[3], argv[4], argv[5], argv[6]);
+        }
+        if (cmd == "strings") return cmd_strings(path);
+        if (cmd == "patch-identity") {
+            if (argc < 4) {
+                std::fprintf(stderr, "usage: psb patch-identity <in.psb> <out.psb> [keep-label|#index]\n");
+                return 2;
+            }
+            return cmd_patch_identity(path, argv[3], argc > 4 ? argv[4] : "");
+        }
+        if (cmd == "timelines") return cmd_timelines(path, argc > 3 ? argv[3] : "");
+        if (cmd == "controls") return cmd_controls(path);
+        if (cmd == "iconpng") {
+            if (argc < 4) { print_usage(); return 2; }
+            return cmd_iconpng(path, argv[3]);
+        }
+        if (cmd == "unpack") {
+            if (argc < 4) { print_usage(); return 2; }
+            return cmd_unpack(path, argv[3]);
         }
         if (cmd == "motions") return cmd_motions(path);
         if (cmd == "sources") return cmd_sources(path);

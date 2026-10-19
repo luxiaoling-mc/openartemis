@@ -68,7 +68,32 @@ bool GameRuntime::RuntimeState::media_se_wait_finished(const std::string& id, bo
         const auto jt = state->voice_channels.find(id);
         if (jt != state->voice_channels.end()) channel = &jt->second;
     }
-    if (!channel || !channel->playing) return true;
+    // A channel that exists but is not "playing" (muted host) still carries the
+    // play-start instant the authored offset counts from.
+    if (channel && time_given)
+        return state->clock_ms >= channel->started_at_ms + time_ms;
+    if (!channel || !channel->playing) {
+        // No live sound (muted host, voice missing, already ended): the
+        // reference engine still releases the tag at the requested offset, so
+        // remember this wait's deadline and release on the clock instead of
+        // returning true at once. That "true at once" is what made a
+        // voice-cued delay chain (adv/delay.lua -> vl1/vl2) fire every variant
+        // in the same frame; the last one always won, so a line authored with
+        // three poses only ever showed its last face.
+        if (!time_given) return true;
+        const uint64_t now = state->clock_ms;
+        const auto d = se_wait_deadline_.find(id);
+        if (d == se_wait_deadline_.end()) {
+            se_wait_deadline_[id] = now + time_ms;
+            return time_ms == 0;
+        }
+        if (now >= d->second) {
+            se_wait_deadline_.erase(d);
+            return true;
+        }
+        return false;
+    }
+    se_wait_deadline_.erase(id);
     if (time_given) {
         // time=N counts from the SE's play-start instant (channel clock).
         return state->clock_ms >= channel->started_at_ms + time_ms;
@@ -634,7 +659,17 @@ void GameRuntime::RuntimeState::apply_emote_static(const oa::runtime::Event& e) 
     const std::string first = filesIt->second.substr(0, filesIt->second.find('\x1f'));
     if (first.empty()) return;
 
-    int w = 1920, h = 1620;
+    // Default canvas = the PROJECT STAGE, not a guessed 1920x1620. The view
+    // mapping centres on reqH/2 (view_options), so a taller request pushes the
+    // whole figure down by (reqH - stageH)/2 — the arms then fall below the
+    // visible frame (user report: "the arm is cut off" on the 1920x1080 stage,
+    // characters sitting visibly lower than the original engine's render).
+    int w = 1920, h = 1080;
+    if (interpreter_) {
+        const auto& cfg = interpreter_->config();
+        if (cfg.stage_width > 0) w = cfg.stage_width;
+        if (cfg.stage_height > 0) h = cfg.stage_height;
+    }
     auto pick_int = [&](const char* key, int dflt) {
         const auto it = e.params.find(key);
         if (it == e.params.end()) return dflt;
@@ -647,6 +682,11 @@ void GameRuntime::RuntimeState::apply_emote_static(const oa::runtime::Event& e) 
     };
     w = pick_int("width", w);
     h = pick_int("height", h);
+    // A/B: force the emote canvas size (the view box the pose is cropped to).
+    if (const char* cv = std::getenv("OA_EMOTE_CANVAS_H"); cv && *cv)
+        h = std::max(64, std::atoi(cv));
+    if (const char* cw = std::getenv("OA_EMOTE_CANVAS_W"); cw && *cw)
+        w = std::max(64, std::atoi(cw));
 
     auto bytes = interpreter_ ? fs_->read(interpreter_->resolve_magic_path(first))
                               : std::nullopt;
@@ -662,6 +702,24 @@ void GameRuntime::RuntimeState::apply_emote_static(const oa::runtime::Event& e) 
             std::fprintf(stderr, "[emote] %s: psb load failed: %s\n", id.c_str(),
                          err.c_str());
         return;
+    }
+    // Expression carry-over (parked_emote_): a scene beat that deletes and
+    // rebuilds the same layer keeps the pose the reference keeps.
+    {
+        auto pit = parked_emote_.find(first);
+        if (std::getenv("OA_EMOTE_DEBUG"))
+            std::fprintf(stderr, "[emote] create id='%s' file='%s' parked=%d\n",
+                         id.c_str(), first.c_str(), int(pit != parked_emote_.end()));
+        if (pit != parked_emote_.end() && pit->second.player) {
+            player->copy_state_from(*pit->second.player);
+            parked_emote_.erase(pit);
+            if (std::getenv("OA_EMOTE_DEBUG"))
+                std::fprintf(stderr, "[emote] %s: expression carried over "
+                                     "(eye=%.1f brow=%.1f mouth=%.1f)\n",
+                             id.c_str(), player->get_variable("face_eye_open"),
+                             player->get_variable("face_eyebrow"),
+                             player->get_variable("face_mouth"));
+        }
     }
     // Same layer id re-created (the game re-runs the scene block when a UI
     // page closes): the script treats it as the same character and issues the
@@ -697,6 +755,18 @@ void GameRuntime::RuntimeState::apply_emote_static(const oa::runtime::Event& e) 
     std::map<std::string, std::string> props;
     props["width"] = std::to_string(w);
     props["height"] = std::to_string(h);
+    // Canvas/box height override: the pose is rasterised into an offscreen
+    // canvas of that size, so anything past it is DISCARDED during the draw —
+    // the transform (centred on req_height_) stays exactly as the script asked.
+    // OA_EMOTE_SURFACE_H is the A/B for "is the view cutting the pose?".
+    if (const char* sv = std::getenv("OA_EMOTE_SURFACE_H"); sv && *sv) {
+        const int sh3 = std::max(64, std::atoi(sv));
+        props["height"] = std::to_string(sh3);
+    }
+    if (const char* swv = std::getenv("OA_EMOTE_SURFACE_W"); swv && *swv) {
+        const int sw3 = std::max(64, std::atoi(swv));
+        props["width"] = std::to_string(sw3);
+    }
     scene_.set_props(id, std::move(props));
     scene_.bind_emote_layer(id);
     if (std::getenv("OA_EMOTE_DEBUG"))

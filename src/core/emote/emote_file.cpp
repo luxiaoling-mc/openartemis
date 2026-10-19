@@ -365,6 +365,10 @@ bool EmoteFile::parse_node(EmoteMotion& m, int nodeIndex, uint32_t off, std::str
     geti("meshCombine", &N.meshCombine);
     geti("meshDivision", &N.meshDivision);
     geti("meshTransform", &N.meshTransform);
+    if (auto v = psb_.object_member(off, "meshSyncChildMask")) {
+        int64_t t = 0;
+        if (psb_.read_int(*v, &t)) N.meshSyncChildMask = uint32_t(t);
+    }
     if (auto v = psb_.object_member(off, "inheritMask")) {
         int64_t t = 0;
         if (psb_.read_int(*v, &t)) N.inheritMask = uint32_t(t);

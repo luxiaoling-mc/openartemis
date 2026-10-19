@@ -944,30 +944,46 @@ bool RenderEngine::emote_render_parts(const oa::render::TextureKey& key,
     };
     std::map<int, StencilBucket> stencil;
     std::vector<const oa::emote::EmoteDrawPart*> plain;
-    for (const auto& part : parts) {
-        if (part.mask_role == 1)
-            stencil[part.mask_group].mask.push_back(&part);
-        else if (part.stencil_group >= 0)
-            stencil[part.stencil_group].content.push_back(&part);
-        else
-            plain.push_back(&part);
-    }
+    // Content parts per group, in draw order: a group is composited AT THE
+    // POSITION OF ITS FIRST CONTENT PART (see the walk below), exactly like
+    // the CPU raster, which paints each entry where it appears in the ordered
+    // list. Compositing every group after all plain parts put the eye/cheek
+    // content on top of the hand and hid its fingers.
+    std::map<int, std::vector<const oa::emote::EmoteDrawPart*>> group_content;
+    for (const auto& part : parts)
+        if (part.mask_role != 1 && part.stencil_group >= 0)
+            group_content[part.stencil_group].push_back(&part);
+    (void)plain;
 
     // one part draw, translated by (ox,oy) scratch-space offset
     auto draw_part = [&](const oa::emote::EmoteDrawPart& part,
                          float ox, float oy) {
-        if (part.source < 0 || part.source >= int(file.sources.size())) return;
+        static const bool drop_log = std::getenv("OA_EMOTE_STENCIL_LOG") != nullptr;
+        if (part.source < 0 || part.source >= int(file.sources.size())) {
+            if (drop_log) std::fprintf(stderr, "[drop] bad source %d\n", part.source);
+            return;
+        }
         const oa::emote::EmoteSource& src = *file.sources[size_t(part.source)];
-        if (part.icon < 0 || part.icon >= int(src.icons.size())) return;
-        if (part.verts.size() < 3) return;
+        if (part.icon < 0 || part.icon >= int(src.icons.size())) {
+            if (drop_log) std::fprintf(stderr, "[drop] bad icon %d src %d\n", part.icon, part.source);
+            return;
+        }
+        if (part.verts.size() < 3) {
+            if (drop_log) std::fprintf(stderr, "[drop] no verts\n");
+            return;
+        }
         const RenderEngine::EmoteAtlasKey akey{key, part.source, file_uid};
         TextureRef atlas = nullptr;
         const auto ai = emote_atlases_.find(akey);
         if (ai != emote_atlases_.end()) atlas = ai->second;
         if (!atlas) {
             std::string err;
-            if (!file.ensure_atlas(const_cast<oa::emote::EmoteSource*>(&src), &err))
+            if (!file.ensure_atlas(const_cast<oa::emote::EmoteSource*>(&src), &err)) {
+                if (drop_log)
+                    std::fprintf(stderr, "[drop] ensure_atlas failed src=%d: %s\n",
+                                 part.source, err.c_str());
                 return;
+            }
             if (src.rgba.empty() || src.textureWidth <= 0 || src.textureHeight <= 0)
                 return;
             atlas = backend_->create_texture(src.textureWidth, src.textureHeight,
@@ -999,17 +1015,34 @@ bool RenderEngine::emote_render_parts(const oa::render::TextureKey& key,
                                 nullptr, 0);
     };
 
-    for (const oa::emote::EmoteDrawPart* part : plain)
-        draw_part(*part, 0.0f, 0.0f);
-
-    // stencil groups: two-offscreen alpha multiply
-    for (auto& [gid, bucket] : stencil) {
-        if (bucket.content.empty()) continue;
-        // group bbox over mask + content vertices (canvas space)
+    if (std::getenv("OA_EMOTE_STENCIL_LOG")) {
+        size_t masks = 0, conts = 0;
+        for (auto& [g, b] : stencil) {
+            masks += b.mask.size();
+            conts += b.content.size();
+        }
+        std::fprintf(stderr,
+                     "[emote] stencil parts=%zu plain=%zu groups=%zu mask=%zu "
+                     "content=%zu\n",
+                     parts.size(), plain.size(), stencil.size(), masks, conts);
+        for (size_t i = 0; i < parts.size(); ++i)
+            if (parts[i].stencil_group >= 0 || parts[i].mask_role == 1)
+                std::fprintf(stderr, "[sg] %2zu sg=%d mr=%d path=%s\n", i,
+                             parts[i].stencil_group, parts[i].mask_role,
+                             parts[i].nodePath.c_str());
+    }
+    // Composite one stencil group: mask shapes -> scratch0, content ->
+    // scratch1, multiply the mask into the content's alpha, blend the result
+    // back onto the canvas at the group's bbox.
+    auto composite_group = [&](int gid) {
+        StencilBucket& bucket = stencil[gid];
+        const auto ci = group_content.find(gid);
+        if (ci == group_content.end() || ci->second.empty()) return;
+        const auto& content = ci->second;
         double x0 = 1e300, y0 = 1e300, x1 = -1e300, y1 = -1e300;
         bool any_v = false;
-        for (const auto* plist : {&bucket.mask, &bucket.content})
-            for (const auto* part : *plist)
+        auto grow = [&](const std::vector<const oa::emote::EmoteDrawPart*>& list) {
+            for (const auto* part : list)
                 for (const auto& v : part->verts) {
                     any_v = true;
                     x0 = std::min(x0, v.x);
@@ -1017,27 +1050,33 @@ bool RenderEngine::emote_render_parts(const oa::render::TextureKey& key,
                     x1 = std::max(x1, v.x);
                     y1 = std::max(y1, v.y);
                 }
-        if (!any_v) continue;
+        };
+        grow(bucket.mask);
+        grow(content);
+        if (!any_v) return;
         int bx0 = std::max(0, int(std::floor(x0)));
         int by0 = std::max(0, int(std::floor(y0)));
         int bx1 = std::min(w - 1, int(std::ceil(x1)));
         int by1 = std::min(h - 1, int(std::ceil(y1)));
-        if (bx0 > bx1 || by0 > by1) continue;
+        if (bx0 > bx1 || by0 > by1) return;
         const int bw = bx1 - bx0 + 1, bh = by1 - by0 + 1;
         if (stencil_scratch_w_ != bw || stencil_scratch_h_ != bh) {
             release_stencil_scratch();
             for (auto& t : stencil_scratch_) {
                 t = backend_->create_texture(bw, bh, TextureAccess::Target);
                 if (!t) break;
+                // Target textures do NOT default to alpha blending: an opaque
+                // copy back onto the canvas would REPLACE every pixel inside
+                // the bbox.
+                backend_->set_texture_blend(t, BlendMode::Blend);
             }
             if (!stencil_scratch_[0] || !stencil_scratch_[1]) {
                 release_stencil_scratch();
-                continue;
+                return;
             }
             stencil_scratch_w_ = bw;
             stencil_scratch_h_ = bh;
         }
-        // pass 1: mask shapes into scratch 0 (straight alpha accumulation)
         backend_->set_target(stencil_scratch_[0]);
         backend_->set_draw_blend(BlendMode::None);
         backend_->set_draw_color(0, 0, 0, 0);
@@ -1045,24 +1084,48 @@ bool RenderEngine::emote_render_parts(const oa::render::TextureKey& key,
         backend_->set_draw_blend(BlendMode::Blend);
         backend_->clear_clip();
         for (const auto* part : bucket.mask) draw_part(*part, -float(bx0), -float(by0));
-        // pass 2: content into scratch 1
         backend_->set_target(stencil_scratch_[1]);
         backend_->set_draw_blend(BlendMode::None);
         backend_->set_draw_color(0, 0, 0, 0);
         backend_->clear();
         backend_->set_draw_blend(BlendMode::Blend);
         backend_->clear_clip();
-        for (const auto* part : bucket.content)
-            draw_part(*part, -float(bx0), -float(by0));
-        // pass 3: mask multiplies the content's alpha (color untouched)
+        for (const auto* part : content) draw_part(*part, -float(bx0), -float(by0));
         backend_->set_texture_blend(stencil_scratch_[0], BlendMode::AlphaMultiply);
         backend_->draw_texture(stencil_scratch_[0], nullptr, nullptr);
-        // pass 4: composited content onto the emote canvas at its bbox
         backend_->set_target(canvas);
         backend_->set_draw_blend(BlendMode::Blend);
         const FRect dst{float(bx0), float(by0), float(bw), float(bh)};
         backend_->draw_texture(stencil_scratch_[1], nullptr, &dst);
         backend_->set_texture_blend(stencil_scratch_[0], BlendMode::Blend);
+    };
+
+    // Ordered walk: everything draws where the PSB tree puts it, and a stencil
+    // group composites at its first content part.
+    std::map<int, char> group_done;
+    for (const auto& p : parts) {
+        if (p.mask_role == 1) {
+            // A mask shape is REAL ARTWORK as well as geometry (CPU parity):
+            // it draws normally and feeds its group's stencil.
+            draw_part(p, 0.0f, 0.0f);
+            stencil[p.mask_group].mask.push_back(&p);
+            continue;
+        }
+        if (p.stencil_group < 0) {
+            draw_part(p, 0.0f, 0.0f);
+            continue;
+        }
+        const int g = p.stencil_group;
+        if (group_done[g]) continue; // already composited at its first part
+        group_done[g] = 1;
+        // A group with no mask shapes cannot clip anything: drawing its
+        // content through an empty mask erases it completely (the PSB moves
+        // the mask art between poses). Draw it plainly instead.
+        if (stencil[g].mask.empty()) {
+            for (const auto* c : group_content[g]) draw_part(*c, 0.0f, 0.0f);
+            continue;
+        }
+        composite_group(g);
     }
     backend_->set_target(prev_target);
     return true;
@@ -1141,9 +1204,22 @@ bool RenderEngine::pump_host_frames(bool* emote_presented) {
         if (gpu) {
             std::vector<oa::emote::EmoteDrawPart> parts;
             std::string err;
+            // Canvas size = the raster target. A pose vertex outside it is
+            // DISCARDED while drawing (the "view cutting the pose" case), so
+            // OA_EMOTE_SURFACE_W/H enlarges the target without touching the
+            // transform (the player still centres on the script's height).
+            static const int surf_w = [] {
+                const char* v = std::getenv("OA_EMOTE_SURFACE_W");
+                return (v && *v) ? std::atoi(v) : 0;
+            }();
+            static const int surf_h = [] {
+                const char* v = std::getenv("OA_EMOTE_SURFACE_H");
+                return (v && *v) ? std::atoi(v) : 0;
+            }();
+            const int cw = surf_w > 0 ? surf_w : st.width;
+            const int ch = surf_h > 0 ? surf_h : st.height;
             if (st.player->collect_pose_parts(&parts, &err) &&
-                emote_render_parts(tkey, st.player->file(), parts, st.width,
-                                   st.height)) {
+                emote_render_parts(tkey, st.player->file(), parts, cw, ch)) {
                 presented = true;
             }
         }

@@ -1317,8 +1317,27 @@ bool GameRuntime::RuntimeState::apply_scene_event(const oa::runtime::Event& e) {
             if (id == e.id || (id.size() > e.id.size() + 1 &&
                                id.compare(0, e.id.size(), e.id) == 0 &&
                                id[e.id.size()] == '.')) {
-                if (it->second.player)
+                if (it->second.player) {
                     emote_view_cache_[id] = it->second.player->view_state();
+                    // Park the player instead of dropping it: the same scene
+                    // beat usually rebuilds the layer right away ([bg] ->
+                    // fgdelall -> [fg]) and the reference keeps the
+                    // expression across that rebuild. Bounded so a long
+                    // session cannot grow it without limit.
+                    if (parked_emote_.size() >= 8) parked_emote_.erase(parked_emote_.begin());
+                    if (std::getenv("OA_EMOTE_DEBUG"))
+                        std::fprintf(stderr, "[emote] park id='%s' file='%s' "
+                                             "eye=%.1f brow=%.1f state=%d\n",
+                                     id.c_str(), it->second.file.c_str(),
+                                     it->second.player ? it->second.player->get_variable("face_eye_open") : -999.0,
+                                     it->second.player ? it->second.player->get_variable("face_eyebrow") : -999.0,
+                                     it->second.player ? int(it->second.player->has_playback_state()) : -1);
+                    // Keyed by the PSB (the character), not the layer id: a
+                    // scene block bumps the scene id (1.0.4 -> 1.0.3) while
+                    // the character file stays the same, and that is exactly
+                    // the rebuild that must keep the expression.
+                    parked_emote_[it->second.file] = std::move(it->second);
+                }
                 it = emote_layers_.erase(it);
             } else {
                 ++it;

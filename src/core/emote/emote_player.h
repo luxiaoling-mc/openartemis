@@ -267,6 +267,22 @@ public:
     /// Idle slot clock in authored frames (-1 when no idle timeline plays).
     double idle_time() const;
 
+    /// Carry the semantic playback state (persistent variable domain, the
+    /// foreground expression list, the idle fade slot and explicit writes)
+    /// from another player driving the SAME psb.
+    ///
+    /// The reference runtime keeps a character's expression when a scene beat
+    /// deletes and immediately rebuilds the layer: image_bg.lua's bg change
+    /// runs fgdelall -> emote.reset, and the following [fg face=..] rebuilds
+    /// the layer, yet the face keeps the previous 照れ pose (verified on
+    /// emotedriver: play 照れ -> Pass, then play 通常 -> Pass leaves
+    /// face_eye_open 36.5 / face_eyebrow 50). Dropping the player here reset
+    /// every variable to the neutral pose, which is the "expression jumped
+    /// back to 通常 after a scene change" report.
+    void copy_state_from(const EmotePlayer& other);
+    /// True when this player carries a non-neutral domain (diagnostics).
+    bool has_playback_state() const;
+
     /// Counters for the two write-surface filters
     /// — how many track writes were skipped as selector option labels and how
     /// many were discarded as unknown labels. Diagnostics/tests only (they
@@ -292,6 +308,12 @@ private:
         double t = 0; // frames (60 fps units)
         bool active = false;
         int flags = 0; // playTimeline flags (PARALLEL bit)
+        /// Domain snapshot taken when the timeline started. Pass() lands only
+        /// the values the timeline actually authored (a non-zero end value);
+        /// everything else is restored from here, which is what makes a
+        /// "play 通常 then Pass" beat leave the running 照れ pose untouched.
+        std::map<std::string, double> base_before;
+        double start_t = 0;
     };
 
     const EmoteTimeline* find_timeline(const std::string& label) const;
@@ -370,6 +392,14 @@ private:
     // variable. Each entry keeps its own clock (the reference's shared
     // currStartTick is a defect and is NOT copied).
     std::vector<Slot> fg_list_;
+    /// pass() ends the entries immediately but lands their stage-end samples on
+    /// the NEXT clock step (the reference's two-phase Pass: isTimelinePlaying
+    /// is already false while the display still shows the old pose).
+    struct PendingPass {
+        std::string label;
+        double t = 0;
+    };
+    std::vector<PendingPass> pending_pass_;
     // every known variable at 0 (defaults incl. motion parameter ids)
     std::map<std::string, double> defaults_;
     // explicit setVariable writes (write the frame and the domain)
@@ -393,6 +423,32 @@ private:
     uint64_t render_interval_ms_ = 125; // throttle; OA_EMOTE_FPS override
     bool dirty_ = true;
     bool external_pose_ = false;
+
+    // --- eyeControl (目パチ) ------------------------------------------------
+    // The PSB's metadata.eyeControl entry authors the automatic blink: over
+    // `blinkFrameCount` frames the eye-open variable is driven from
+    // `beginFrame` to `endFrame` and back, then the controller idles for a
+    // random [blinkIntervalMin .. blinkIntervalMax] frames. Without it the
+    // lid never moves between expressions, so a character whose expression is
+    // 通常 (eye_open = 0) keeps fully open eyes forever — the official runtime
+    // shows the mid-blink lid one icon step down (mabuta icon 0051), and that
+    // is a *per character* difference: a character already at a closed-eye
+    // expression cannot show it.
+    std::string blink_label_;   // eye-open variable ("" = no eyeControl)
+    double blink_begin_ = 0, blink_end_ = 0;
+    double blink_frames_ = 0;   // authored length of one blink
+    double blink_wait_ = 0;     // frames until the next blink starts
+    double blink_t_ = -1;       // frames into the current blink (-1 = idle)
+    double blink_value_ = 0;    // lid amount this frame (0 = open)
+    uint32_t blink_rng_ = 0x9E3779B9u; // xorshift32 state
+    void blink_advance(double frames);
+    double blink_rand01() {
+        blink_rng_ ^= blink_rng_ << 13;
+        blink_rng_ ^= blink_rng_ >> 17;
+        blink_rng_ ^= blink_rng_ << 5;
+        return double(blink_rng_ & 0xFFFFFFu) / double(0x1000000u);
+    }
+    double blink_interval_min_ = 30, blink_interval_max_ = 180;
 
     double view_scale_ = 0.6; // game standard "no"; setScale overrides
     double view_x_ = 0, view_y_ = 0;
