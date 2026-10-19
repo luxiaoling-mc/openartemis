@@ -1105,9 +1105,9 @@ bool RenderEngine::emote_render_parts(const oa::render::TextureKey& key,
     std::map<int, char> group_done;
     for (const auto& p : parts) {
         if (p.mask_role == 1) {
-            // A mask shape is REAL ARTWORK as well as geometry (CPU parity):
-            // it draws normally and feeds its group's stencil.
-            draw_part(p, 0.0f, 0.0f);
+            // A type-12 mask shape only feeds its group's stencil; it is not
+            // artwork of its own (drawing it leaked the eye-white / face
+            // outline onto the canvas and made pupils escape their sockets).
             stencil[p.mask_group].mask.push_back(&p);
             continue;
         }
@@ -1118,13 +1118,6 @@ bool RenderEngine::emote_render_parts(const oa::render::TextureKey& key,
         const int g = p.stencil_group;
         if (group_done[g]) continue; // already composited at its first part
         group_done[g] = 1;
-        // A group with no mask shapes cannot clip anything: drawing its
-        // content through an empty mask erases it completely (the PSB moves
-        // the mask art between poses). Draw it plainly instead.
-        if (stencil[g].mask.empty()) {
-            for (const auto* c : group_content[g]) draw_part(*c, 0.0f, 0.0f);
-            continue;
-        }
         composite_group(g);
     }
     backend_->set_target(prev_target);

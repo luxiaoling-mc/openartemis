@@ -736,10 +736,11 @@ bool warp_is_rigid(const std::string& label, int meshCombine,
         return e ? std::string(e) : std::string("sync1");
     }();
     if (spec == "sync1") {
-        // carrier whose meshSyncChildMask selects exactly one child (0x1 in
-        // this work: the face region): every other child only inherits the
-        // node's frame, i.e. the patch offset is rigid. Verified to the pixel
-        // against emotedriver on tka_0.psb/face_UD.
+        // Measured against emotedriver (docs/TESTING.md §3.1): the field is a
+        // mode selector, not a child bitmask — 0x8 = the patch deforms the
+        // subtree per vertex, 0x1 = the subtree is only offset rigidly, 0x0
+        // is a third, distinct mode. Of the real values in this work
+        // (0x0/0x1/0x8) only 0x1 is proven rigid, so keep the rule narrow.
         return syncMask == 0x1u;
     }
     if (spec == "mask") {
@@ -1650,15 +1651,10 @@ static void paint_entry(const DrawEntry& en, const Mat& fit, int canvasW, int ca
                     if (alpha <= 0.001f) continue;
                     alpha *= float(en.opa);
                     if (mask_out) {
-                        // mask shapes are ALSO visible content (the eye-white is
-                        // both the pupil's stencil and a drawn part; the face
-                        // outline feeds the head stencil). Accumulate the union
-                        // coverage, then fall through to the normal blend —
-                        // bailing out here dropped every mask shape from the
-                        // canvas (a missing face/hair behind the fringe).
                         const uint8_t cov = uint8_t(std::min(255.0f, alpha * 255.0f + 0.5f));
                         uint8_t& slot = mask_out[size_t(py) * canvasW + size_t(px)];
-                        if (cov > slot) slot = cov; // union of the mask shapes
+                        if (cov > slot) slot = cov;
+                        continue;
                     }
                     if (mask_in) alpha *= float(mask_in[size_t(py) * canvasW + size_t(px)]) / 255.0f;
                     if (alpha <= 0.001f) continue;
@@ -1817,10 +1813,10 @@ static void paint_entry(const DrawEntry& en, const Mat& fit, int canvasW, int ca
                     alpha *= float(en.opa);
                     uint8_t* dst = canvas->data() + (size_t(py) * canvasW + size_t(px)) * 4;
                     if (mask_out) {
-                        // see the affine path: mask shapes stay visible
                         const uint8_t cov = uint8_t(std::min(255.0f, alpha * 255.0f + 0.5f));
                         uint8_t& slot = mask_out[size_t(py) * canvasW + size_t(px)];
                         if (cov > slot) slot = cov;
+                        continue;
                     }
                     if (mask_in) alpha *= float(mask_in[size_t(py) * canvasW + size_t(px)]) / 255.0f;
                     if (alpha <= 0.001f) continue;
@@ -2155,16 +2151,6 @@ bool render_static_frame(const EmoteFile& file, const std::map<std::string, doub
     // once (lazily, at the first content entry of the group in draw order)
     // and multiplied into every content entry's coverage.
     const size_t nGroups = stencil_groups.size();
-    // A group with no mask shapes cannot clip anything: drawing its content
-    // through an all-zero mask erases it completely. The host's GPU path
-    // already falls back to drawing such content plainly; the CPU raster must
-    // do the same (the 頬 blush group is exactly this case — the reference
-    // composites the blush unclipped, and clipping it against a wrongly
-    // adopted mask visibly damaged the cheeks).
-    std::vector<char> group_has_mask(nGroups, 0);
-    for (const DrawEntry& e : entries)
-        if (e.mask_for_group >= 0 && e.mask_for_group < int(nGroups))
-            group_has_mask[size_t(e.mask_for_group)] = 1;
     std::vector<char> mask_built(nGroups, 0);
     std::vector<std::vector<uint8_t>> mask_bits(nGroups);
     auto mask_bits_of = [&](int gi) -> uint8_t* {
@@ -2217,15 +2203,12 @@ bool render_static_frame(const EmoteFile& file, const std::map<std::string, doub
                          en.stencil_group, en.mask_for_group, int(en.warped),
                          en.source ? en.source->rgba.size() : size_t(0));
         if (en.mask_for_group >= 0) {
-            // the mask shape draws normally AND feeds its group's stencil
             paint_entry(en, fit, canvasW, canvasH, rgba, nullptr,
                         mask_bits_of(en.mask_for_group));
             continue;
         }
-        const bool clipped = en.stencil_group >= 0 &&
-                             en.stencil_group < int(nGroups) &&
-                             group_has_mask[size_t(en.stencil_group)] != 0;
-        const uint8_t* ma = clipped ? mask_bits_of(en.stencil_group) : nullptr;
+        const uint8_t* ma =
+            en.stencil_group >= 0 ? mask_bits_of(en.stencil_group) : nullptr;
         paint_entry(en, fit, canvasW, canvasH, rgba, ma);
     }
     if (dbg_stencil) {

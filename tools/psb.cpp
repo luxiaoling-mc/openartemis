@@ -59,7 +59,12 @@ void print_usage() {
         "  psb patch-motion <in.psb> <out.psb> <node-label> <old> <new>\n"
         "      Same-size in-place patch: redirect that node's sub-motion\n"
         "      reference (frame content.icon) from <old> to <new>. Builds\n"
-        "      differential fixtures for the official driver.\n");
+        "      differential fixtures for the official driver.\n"
+        "  psb nodetree <file.psb> [motion-substr] [label-substr]\n"
+        "      Node hierarchy with the child INDICES a meshSyncChildMask bit\n"
+        "      indexes, plus meshTransform/meshCombine/meshDivision.\n"
+        "  psb patch-int <in.psb> <out.psb> <label> <member> <value> [nth]\n"
+        "      Rewrite a numeric node member in place (same byte width).\n");
 }
 
 bool read_file(const std::string& path, std::vector<uint8_t>* out) {
@@ -1217,6 +1222,182 @@ int cmd_patch_identity(const std::string& in, const std::string& out,
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// node tree: the CHILD ORDER that a meshSyncChildMask bit is supposed to index
+// ---------------------------------------------------------------------------
+void nodetree_rec(const emote::EmoteMotion& m, int idx, int depth, const std::string& filter,
+                  const std::string& motion, int* shown, int only_idx = -1) {
+    if (idx < 0 || idx >= int(m.nodes.size()) || depth > 64) return;
+    const auto& n = m.nodes[idx];
+    const bool hit = only_idx >= 0 ? (idx == only_idx)
+                                   : (filter.empty() || n.label.find(filter) != std::string::npos);
+    if (!hit) {
+        // filtered: still walk, a matching node can sit below a non-matching one
+        for (int ch : n.children) nodetree_rec(m, ch, depth + 1, filter, motion, shown, only_idx);
+        return;
+    }
+    std::string region;
+    for (const auto& fr : n.frames)
+        if (fr.hasBp || fr.src == "blank") { region = fr.icon; break; }
+    std::string kids;
+    for (size_t i = 0; i < n.children.size() && i < 12; ++i) {
+        kids += (i ? "," : "");
+        kids += std::to_string(n.children[i]);
+    }
+    if (n.children.size() > 12) kids += ",...";
+    std::string reg = region.empty() ? std::string("-") : region;
+    std::printf("%-14s %*s[%d] %-22s type=%d tf=%d mc=%d sync=0x%-4X div=%-2d inh=0x%X "
+                "nch=%zu ch=[%s] reg=%s\n",
+                motion.c_str(), depth * 2, "", idx, n.label.c_str(), n.type, n.meshTransform,
+                n.meshCombine, n.meshSyncChildMask, n.meshDivision, n.inheritMask,
+                n.children.size(), kids.c_str(), reg.c_str());
+    if (++*shown >= 4000) return;
+    for (int ch : n.children) nodetree_rec(m, ch, depth + 1, filter, motion, shown, only_idx);
+}
+
+int cmd_nodetree(const std::string& path, const std::string& motion_filter,
+                 const std::string& label_filter) {
+    std::vector<uint8_t> bytes;
+    if (!read_file(path, &bytes)) { std::fprintf(stderr, "cannot read: %s\n", path.c_str()); return 1; }
+    emote::EmoteFile ef;
+    std::string err;
+    if (!ef.load(bytes, &err)) { std::fprintf(stderr, "load: %s\n", err.c_str()); return 1; }
+    int shown = 0;
+    int only_idx = -1;
+    if (!label_filter.empty() && label_filter[0] == '#') only_idx = std::atoi(label_filter.c_str() + 1);
+    for (const auto& obj : ef.objects) {
+        for (const auto& [mname, midx] : obj.motions) {
+            if (midx < 0 || midx >= int(ef.motions.size())) continue;
+            if (!motion_filter.empty() && mname.find(motion_filter) == std::string::npos) continue;
+            const auto& m = ef.motions[size_t(midx)];
+            if (m.nodes.empty()) continue;
+            std::printf("--- object '%s' motion '%s' nodes=%zu roots=%zu ---\n",
+                        obj.name.c_str(), mname.c_str(), m.nodes.size(), m.layer.size());
+            for (int root : m.layer) nodetree_rec(m, root, 0, label_filter, mname, &shown, only_idx);
+        }
+    }
+    std::fprintf(stderr, "%d node(s) printed\n", shown);
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// patch-int: rewrite a numeric object member in place (same width).
+// The differential fixture for meshSyncChildMask: same PSB, only that value
+// differs, so the official driver's render isolates its effect.
+// ---------------------------------------------------------------------------
+// NumberN0 (0x04) is the sentinel; 0x05..0x0C store 1..8 bytes of little-endian.
+constexpr uint8_t kNumFirst = 0x05, kNumLast = 0x0C;
+inline int num_width(psb::Kind k) { return int(uint8_t(k)) - int(kNumFirst) + 1; }
+
+bool write_number(psb::PsbReader& r, uint32_t off, int64_t value, std::string* err) {
+    const psb::Kind k = r.kind_at(off);
+    if (uint8_t(k) < kNumFirst || uint8_t(k) > kNumLast) {
+        *err = "not a number (kind=0x" + std::to_string(int(uint8_t(k))) + ")";
+        return false;
+    }
+    const int w = num_width(k);
+    const uint64_t uv = uint64_t(value);
+    if (w < 8 && (uv >> (8 * w)) != 0) {
+        *err = "value does not fit the stored width (" + std::to_string(w) + " byte(s))";
+        return false;
+    }
+    auto& b = r.mutable_bytes();
+    for (int i = 0; i < w; ++i) b[size_t(off) + 1 + size_t(i)] = uint8_t((uv >> (8 * i)) & 0xff);
+    return true;
+}
+
+struct IntCtx {
+    std::string label, member;
+    int64_t value = 0;
+    int nth = -1;   // patch only the nth match (0-based); -1 = all
+    int seen = 0;
+    int patched = 0;
+    std::string width_note;
+};
+
+void int_walk(psb::PsbReader& r, uint32_t off, IntCtx* ctx, int depth, std::string* err) {
+    if (depth > 96 || !err->empty()) return;
+    const psb::Kind k = r.kind_at(off);
+    if (k == psb::Kind::Objects) {
+        std::vector<std::string> keys;
+        std::vector<uint32_t> vals;
+        if (!r.object_entries(off, &keys, &vals)) return;
+        std::string label;
+        int64_t label_idx = -1;
+        uint32_t target = 0;
+        bool has = false;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (keys[i] == "label") {
+                if (auto s = r.read_string(vals[i])) label = *s;
+                // raw pool index: lets a non-ASCII label be named as "#427" on
+                // a command line whose code page cannot carry it.
+                const psb::Kind lk = r.kind_at(vals[i]);
+                if (uint8_t(lk) >= 0x15 && uint8_t(lk) <= 0x18) {
+                    const int w = int(uint8_t(lk)) - 0x15 + 1;
+                    int64_t raw = 0;
+                    for (int b = 0; b < w; ++b)
+                        raw |= int64_t(r.mutable_bytes()[size_t(vals[i]) + 1 + size_t(b)]) << (8 * b);
+                    label_idx = raw;
+                }
+            } else if (keys[i] == ctx->member) {
+                target = vals[i];
+                has = true;
+            }
+        }
+        bool label_hit = false;
+        if (ctx->label == "-") label_hit = true;
+        else if (!ctx->label.empty() && ctx->label[0] == '#')
+            label_hit = (label_idx == std::atoll(ctx->label.c_str() + 1));
+        else
+            label_hit = (label == ctx->label);
+        if (has && label_hit) {
+            const int idx = ctx->seen++;
+            if (ctx->nth < 0 || ctx->nth == idx) {
+                const psb::Kind vk = r.kind_at(target);
+                const int w = num_width(vk);
+                if (!write_number(r, target, ctx->value, err)) return;
+                ++ctx->patched;
+                if (ctx->width_note.empty())
+                    ctx->width_note = std::to_string(w) + " byte(s) stored";
+            }
+        }
+        for (size_t i = 0; i < vals.size(); ++i) int_walk(r, vals[i], ctx, depth + 1, err);
+    } else if (k == psb::Kind::List) {
+        std::vector<uint32_t> items;
+        if (r.list_items(off, &items))
+            for (uint32_t v : items) int_walk(r, v, ctx, depth + 1, err);
+    }
+}
+
+int cmd_patch_int(const std::string& in, const std::string& out, const std::string& label,
+                  const std::string& member, int64_t value, int nth) {
+    std::vector<uint8_t> data;
+    if (!read_file(in, &data)) { std::fprintf(stderr, "cannot read %s\n", in.c_str()); return 1; }
+    psb::PsbReader r;
+    std::string err;
+    if (!r.load(data, &err)) { std::fprintf(stderr, "load: %s\n", err.c_str()); return 1; }
+    IntCtx ctx;
+    ctx.label = label;
+    ctx.member = member;
+    ctx.value = value;
+    ctx.nth = nth;
+    int_walk(r, r.root_offset(), &ctx, 0, &err);
+    if (!err.empty()) { std::fprintf(stderr, "patch failed: %s\n", err.c_str()); return 1; }
+    if (ctx.patched == 0) {
+        std::fprintf(stderr, "no object matched (label='%s', member='%s', candidates=%d)\n",
+                     label.c_str(), member.c_str(), ctx.seen);
+        return 1;
+    }
+    if (!write_file(out, r.mutable_bytes())) {
+        std::fprintf(stderr, "cannot write %s\n", out.c_str());
+        return 1;
+    }
+    std::printf("patched %d/%d '%s'.%s = %lld (%s) => %s\n", ctx.patched, ctx.seen,
+                label.c_str(), member.c_str(), (long long)value, ctx.width_note.c_str(),
+                out.c_str());
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1254,6 +1435,17 @@ int main(int argc, char** argv) {
             return cmd_patch_motion(path, argv[3], argv[4], argv[5], argv[6]);
         }
         if (cmd == "strings") return cmd_strings(path);
+        if (cmd == "nodetree")
+            return cmd_nodetree(path, argc > 3 ? argv[3] : "", argc > 4 ? argv[4] : "");
+        if (cmd == "patch-int") {
+            if (argc < 7) {
+                std::fprintf(stderr,
+                    "usage: psb patch-int <in.psb> <out.psb> <label> <member> <value> [nth]\n");
+                return 2;
+            }
+            return cmd_patch_int(path, argv[3], argv[4], argv[5], std::atoll(argv[6]),
+                                 argc > 7 ? std::atoi(argv[7]) : -1);
+        }
         if (cmd == "patch-identity") {
             if (argc < 4) {
                 std::fprintf(stderr, "usage: psb patch-identity <in.psb> <out.psb> [keep-label|#index]\n");

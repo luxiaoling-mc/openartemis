@@ -81,9 +81,18 @@ struct EmoteNode {
     int parameterIndex = -1; // index into motion.parameter
     uint32_t inheritMask = 0x20007FC;
     int meshCombine = 0, meshDivision = 0, meshTransform = 0;
-    /// Bitmask of which CHILDREN receive this node's mesh deformation. A node
-    /// whose mask is 0 does not warp its subtree per vertex — the driver only
-    /// moves the node's own frame (the "rigid offset" class).
+    /// Mesh-sync selector. Measured against emotedriver with single-byte
+    /// patches on one node (see docs/TESTING.md "meshSyncChildMask"): only
+    /// bits 0 and 3 change the output; bits 1..2 are inert on their own and
+    /// bits 4..7 are ignored. In this work only 0x0 / 0x1 / 0x8 occur:
+    ///   0x8  -> the node's patch deforms its subtree PER VERTEX (mesh sync)
+    ///   0x1  -> the subtree is NOT mesh-warped; the patch acts as one rigid
+    ///           offset read at the region centre (face_UD/face_LR)
+    ///   0x0  -> a third, distinct behaviour (verified different from both),
+    ///           only on ■腕RC here; its patch is identity in every pose we
+    ///           could drive, so the engine currently treats it as 0x8.
+    /// Combinations (0x3/0x5/0x9/0x9..0xF) each render differently, so the
+    /// field is NOT a plain child bitmask despite its name.
     uint32_t meshSyncChildMask = 0;
     bool removed = false;
     bool isMaskNode = false; // type 12 (stencil composite)
