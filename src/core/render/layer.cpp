@@ -485,6 +485,13 @@ void Compositor::create(const std::string& id,
     Layer* l = find_mut(id);
     // 脚本显式创建（[lyc]/[lyc2] 事件;消息绑定 ensure_path 物化不走这里）。
     l->script_created = true;
+    // A new image on the layer replaces a running [anime] playback (one
+    // still being defined, init/add before end, is kept). Otherwise the
+    // playback overwrites the new file with its frames.
+    if (const auto it = anim_->anime_states_.find(id);
+        it != anim_->anime_states_.end() && it->second.total_duration_ms > 0 &&
+        props.count("file"))
+        anim_->anime_states_.erase(it);
     // Scene::create: bind the file (non-empty
     // clears solid mode) — like the lyc Create event that precedes the
     // SetProperties pass.
@@ -546,6 +553,11 @@ void Compositor::remove(const std::string& id) {
     // tweenset cascade on layer deletion: dropping tweens
     // of the removed subtree also clears same-group members elsewhere.
     clear_tweens_of_subtree(subtree_ids);
+    // [anime] playbacks die with their layers. A surviving one kept writing
+    // its frames into the next layer created at the same id: a looping smoke
+    // animation replaced a character's body image every frame until a load
+    // (which drops all playbacks) rebuilt the scene.
+    for (const std::string& sid : subtree_ids) anim_->anime_states_.erase(sid);
     // message-layer registry cleanup
     cleanup_message_layers_of_subtree(subtree_ids, &message_layer_bindings_,
                                       &default_message_layer_,
