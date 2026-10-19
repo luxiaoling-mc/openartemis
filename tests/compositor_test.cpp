@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "core/render/layer.h"
+#include "core/render/render_internal.h" // TweenDone returned by advance_tweens
 
 namespace {
 int failures = 0;
@@ -268,6 +269,52 @@ int main() {
         check(sc.bind_video_layer("500.z.mv") && sc.unbind_video_layer("500.z.mv") &&
                   sc.find("500.z.mv")->file.empty(),
               "bind -> unbind returns the carrier to the empty state");
+    }
+
+    // Running frame animations belong to the layer they were created on.
+    {
+        auto start_anime = [](oa::render::Compositor& sc, const char* id) {
+            sc.apply_anime({{"id", id}, {"mode", "init"},
+                            {"file", "smoke"}, {"time", "0"}}, 0);
+            sc.apply_anime({{"id", id}, {"mode", "end"}, {"time", "100"}}, 0);
+        };
+        for (int mode = 0; mode < 3; ++mode) {
+            oa::render::Compositor sc;
+            start_anime(sc, "1.0");
+            start_anime(sc, "2");
+            if (mode == 0) sc.remove("1.0");
+            if (mode == 1) sc.remove("1");
+            if (mode != 2)
+                check(!sc.layer_anime_active("1.0"),
+                      "deleting a layer or its parent clears its anime immediately");
+            sc.create("1.0", {{"file", "character"}});
+            sc.advance_tweens(50);
+            check(sc.find("1.0")->file == "character" &&
+                      !sc.layer_anime_active("1.0"),
+                  mode == 0 ? "deleted layer's anime cannot overwrite a reused id" :
+                  mode == 1 ? "deleted subtree's anime cannot overwrite a reused id" :
+                              "replacing a file stops its running anime");
+            check(sc.layer_anime_active("2") && sc.find("2")->file == "smoke",
+                  "unrelated layer's anime keeps playing");
+        }
+        oa::render::Compositor sc;
+        start_anime(sc, "1");
+        sc.create("1", {{"left", "42"}});
+        sc.advance_tweens(50);
+        check(sc.layer_anime_active("1") && sc.find("1")->file == "smoke" &&
+                  sc.find("1")->left == 42,
+              "create without a file preserves a running anime");
+
+        // init/add before end is a definition, not an active playback.
+        sc.apply_anime({{"id", "3"}, {"mode", "init"}, {"file", "frame0"}}, 0);
+        sc.create("3", {{"file", "placeholder"}});
+        check(sc.layer_anime_active("3"), "file replacement preserves unfinished anime");
+        sc.apply_anime({{"id", "3"}, {"mode", "add"},
+                        {"file", "frame1"}, {"time", "50"}}, 0);
+        sc.apply_anime({{"id", "3"}, {"mode", "end"}, {"time", "100"}}, 0);
+        sc.advance_tweens(75);
+        check(sc.find("3")->file == "frame1",
+              "preserved anime definition can finish and play");
     }
 
     if (failures) {
