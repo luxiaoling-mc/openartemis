@@ -64,7 +64,19 @@ struct RgbaF {
 /// 引擎实际使用的混合语义子集（layermode: add/additive、screen≈blend、
 /// multiply→mod；其余一律 blend；NONE 仅离屏清屏用）。
 enum class BlendMode { None, Blend, Add, Mod,
-                       AlphaMultiply }; // dstA *= srcA, dstRGB kept (stencil mask)
+                       // RGBA *= srcA (stencil mask step). A target filled by
+                       // src-over blending holds PREMULTIPLIED rgb, so the
+                       // mask has to scale rgb as well as alpha; scaling only
+                       // alpha leaves the rgb at full strength and the whole
+                       // sprite comes back too bright.
+                       AlphaMultiply,
+                       // src + dst*(1-srcA): "over" for a PREMULTIPLIED source.
+                       // Required whenever a target texture is composited onto
+                       // another target/the canvas — plain Blend would multiply
+                       // the already-premultiplied rgb by alpha a second time
+                       // (soft content such as the 頬 blush came out nearly
+                       // black that way).
+                       BlendPremult };
 
 /// 纹理创建方式（与引擎三种用法一一对应：静态贴图/流式逐帧刷新/离屏
 /// target）。

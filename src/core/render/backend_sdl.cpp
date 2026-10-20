@@ -20,13 +20,21 @@ SDL_BlendMode to_sdl_blend(BlendMode m) {
         case BlendMode::Add: return SDL_BLENDMODE_ADD;
         case BlendMode::Mod: return SDL_BLENDMODE_MOD;
         case BlendMode::AlphaMultiply:
-            // dstRGB kept, dstA *= srcA: the stencil mask multiplies the
-            // content's alpha channel (color ops pass destination through)
+            // stencil mask step: RGBA *= srcA. The content target holds
+            // premultiplied rgb (it was filled by src-over blending over a
+            // cleared target), so rgb must shrink with the mask too.
             return SDL_ComposeCustomBlendMode(
-                SDL_BLENDFACTOR_ZERO, SDL_BLENDFACTOR_ONE,
-                SDL_BLENDOPERATION_ADD,           // color: dst kept
-                SDL_BLENDFACTOR_DST_ALPHA, SDL_BLENDFACTOR_ZERO,
+                SDL_BLENDFACTOR_ZERO, SDL_BLENDFACTOR_SRC_ALPHA,
+                SDL_BLENDOPERATION_ADD,           // color: dst *= srcA
+                SDL_BLENDFACTOR_ZERO, SDL_BLENDFACTOR_SRC_ALPHA,
                 SDL_BLENDOPERATION_ADD);          // alpha: dstA *= srcA
+        case BlendMode::BlendPremult:
+            // "over" for a premultiplied source (target -> target/canvas)
+            return SDL_ComposeCustomBlendMode(
+                SDL_BLENDFACTOR_ONE, SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+                SDL_BLENDOPERATION_ADD,
+                SDL_BLENDFACTOR_ONE, SDL_BLENDFACTOR_ONE_MINUS_SRC_ALPHA,
+                SDL_BLENDOPERATION_ADD);
         case BlendMode::Blend: break; // fallthrough to default
     }
     return SDL_BLENDMODE_BLEND;

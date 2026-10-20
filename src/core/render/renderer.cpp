@@ -1162,12 +1162,22 @@ bool RenderEngine::emote_render_parts(const oa::render::TextureKey& key,
         backend_->set_draw_blend(BlendMode::Blend);
         backend_->clear_clip();
         for (const auto* part : content) draw_part(*part, -float(bx0), -float(by0));
+        // mask step: RGBA *= mask coverage (both channels — the content target
+        // holds premultiplied rgb, see the BlendPremult note below)
         backend_->set_texture_blend(stencil_scratch_[0], BlendMode::AlphaMultiply);
         backend_->draw_texture(stencil_scratch_[0], nullptr, nullptr);
         backend_->set_target(canvas);
         backend_->set_draw_blend(BlendMode::Blend);
         const FRect dst{float(bx0), float(by0), float(bw), float(bh)};
+        // The content target was cleared to transparent and filled by src-over
+        // blending, so its rgb is PREMULTIPLIED: compositing it with plain
+        // Blend multiplies by alpha a second time and soft-alpha content turns
+        // into a dark smudge (the 頬 blush — the only soft content that goes
+        // through a stencil group — came out almost black). Use the
+        // premultiplied "over" instead.
+        backend_->set_texture_blend(stencil_scratch_[1], BlendMode::BlendPremult);
         backend_->draw_texture(stencil_scratch_[1], nullptr, &dst);
+        backend_->set_texture_blend(stencil_scratch_[1], BlendMode::Blend);
         backend_->set_texture_blend(stencil_scratch_[0], BlendMode::Blend);
     };
 
