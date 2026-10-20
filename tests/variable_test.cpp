@@ -101,9 +101,33 @@ void test_compare_logic() {
     check(e.run("1 < 2 && 2 <= 2") == Value::make_bool(true), "rel + and");
     check(e.run("3 > 4 || 4 >= 4") == Value::make_bool(true), "or");
     check(e.run("'1' == 1") == Value::make_bool(true), "numeric string eq via f64");
-    check(e.run("'abc' == 'xyz'") == Value::make_bool(true),
-          "non-numeric strings compare as 0==0 (Artemis semantics)");
-    check(e.run("'abc' == 0") == Value::make_bool(true), "string vs 0 via f64 fallback");
+    // String equality is TEXT equality. The official SDK's own scripts dispatch
+    // on string tags with an if/elseif chain of `==` comparisons
+    // (Sample/backlog.iet: "$backlog.tag.0 == 'print'" / "'scein'" / "'sceout'"
+    // / "'link'" …, Docs/spec/macro.txt: "$pos == 'left'"/'center'/'right').
+    // A chain only works if distinct strings compare UNEQUAL — the old
+    // "every non-numeric string folds to 0" rule made every branch true and
+    // the first one always win.
+    check(e.run("'abc' == 'abc'") == Value::make_bool(true),
+          "identical non-numeric strings are equal");
+    check(e.run("'abc' == 'xyz'") == Value::make_bool(false),
+          "distinct non-numeric strings compare by text (not 0==0)");
+    check(e.run("'print' == 'scein'") == Value::make_bool(false),
+          "backlog-style tag dispatch: different tag names are unequal");
+    // Mixed string/number: no numeric fallback for non-numeric text. This is
+    // the guard rail the iMel language screen needs (`0 == 'ja'` must be 0,
+    // otherwise every language button renders as "already selected").
+    check(e.run("'abc' == 0") == Value::make_bool(false),
+          "non-numeric string vs number: no numeric fallback");
+    check(e.run("0 == 'ja'") == Value::make_bool(false), "0 == 'ja' is false");
+    check(e.run("'' == 0") == Value::make_bool(false), "empty string is not numeric 0");
+    // ... while NUMERIC text still compares numerically (leading zeros too),
+    // and a missing variable is Int(0) — the evaluator turns absence into 0,
+    // so `$unset == 0` keeps working.
+    check(e.run("'0' == 0") == Value::make_bool(true), "numeric text '0' == 0");
+    check(e.run("'01' == 1") == Value::make_bool(true), "leading-zero numeric text == number");
+    check(e.run("nosuchvar == 0") == Value::make_bool(true),
+          "missing variable is Int(0), so $unset == 0 still holds");
     check(e.run("2.5 < 3") == Value::make_bool(true), "float rel");
 }
 

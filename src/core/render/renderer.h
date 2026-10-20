@@ -327,6 +327,14 @@ private:
     // ------------------------------------------------------------------
     std::optional<std::pair<double, double>> decoded_size(const oa::render::TextureKey& key) const override;
     std::optional<std::pair<double, double>> uploaded_size(const oa::render::TextureKey& key) const override;
+    /// Natural size of an asset from its FILE HEADER (PNG IHDR / JPEG SOF),
+    /// cached by asset name. Headless runs have no backend, so no texture (and
+    /// no decoded pixels) exist — hit testing would otherwise see every image
+    /// layer as size-less and no click could ever land (offscreen click probes,
+    /// e.g. the iMel macro buttons). Windowed runs never reach this: hit_size
+    /// resolves from `decoded` first.
+    std::optional<std::pair<double, double>> probe_asset_size(const std::string& name);
+    std::map<std::string, std::pair<double, double>> probed_sizes_;
     // ------------------------------------------------------------------
     // draw-node split + intermediate-group local compositing
     // (implemented in renderer.cpp). draw_node is a thin dispatcher:

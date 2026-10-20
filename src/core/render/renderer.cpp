@@ -786,7 +786,19 @@ const oa::media::Image* RenderEngine::resolve_image(const std::string& name)
     // ev/fg/cg/rule/title stay .png; exact filenames (raw `resolved`) always
     // win first, then .png, then .jpg (png-first keeps legacy archives —
     // fpm/NekoMiko, sole-.png bgs — byte-identical behavior).
-    for (const std::string& cand : { resolved, resolved + ".png", resolved + ".jpg" }) {
+    // The iMel frameworks address config/title art both as
+    // "_data/image/..." (os_name_path prefix) and as bare "image/..."
+    // (t.imgpath style). The archive root IS _data, so a bare path must
+    // retry behind the data-root prefix — without it every [lyc2
+    // file="$t.imgpath + 'bg_config'"] silently decoded to nothing and the
+    // config page came up as a text-only skeleton.
+    std::vector<std::string> candidates{resolved, resolved + ".png", resolved + ".jpg"};
+    if (!resolved.empty() && resolved[0] != ':' && resolved.rfind("_data/", 0) != 0) {
+        candidates.push_back("_data/" + resolved);
+        candidates.push_back("_data/" + resolved + ".png");
+        candidates.push_back("_data/" + resolved + ".jpg");
+    }
+    for (const std::string& cand : candidates) {
         if (auto b = overlay_read(cand)) {
             bytes = b;
             break;
@@ -794,6 +806,53 @@ const oa::media::Image* RenderEngine::resolve_image(const std::string& name)
         if (auto b = fs_->read(cand)) {
             bytes = b;
             break;
+        }
+    }
+    // iMel ".lnq" indirection: <name>.lnq is a one-line text pointer at the
+    // real image ("os_name_path/image/gui/game/mw/adv/_common/mw.png"). The
+    // message-window plates (mw / mw_flame / mw_name / mw_name_flame) and a
+    // lot of the newer GUI are addressed this way; resolving nothing left the
+    // story page with bare text and no window frame.
+    if (!bytes) {
+        std::optional<std::vector<uint8_t>> lnq;
+        std::vector<std::string> lnq_candidates{resolved + ".lnq"};
+        if (!resolved.empty() && resolved[0] != ':' && resolved.rfind("_data/", 0) != 0)
+            lnq_candidates.push_back("_data/" + resolved + ".lnq");
+        for (const std::string& cand : lnq_candidates) {
+            if (auto b = overlay_read(cand)) {
+                lnq = b;
+                break;
+            }
+            if (auto b = fs_->read(cand)) {
+                lnq = b;
+                break;
+            }
+        }
+        if (lnq) {
+            std::string target(reinterpret_cast<const char*>(lnq->data()), lnq->size());
+            if (const size_t nl = target.find_first_of("\r\n"); nl != std::string::npos)
+                target.resize(nl);
+            while (!target.empty() && (target.back() == ' ' || target.back() == '\t'))
+                target.pop_back();
+            // The pointer is written in the game's own path vocabulary: the
+            // leading `os_name_path/` is the project's data root (the archive
+            // root itself for this family, published by first.iet).
+            const std::string os_prefix = "os_name_path/";
+            if (target.rfind(os_prefix, 0) == 0) {
+                std::string data_root = "_data/";
+                if (auto v = rt_->interpreter().variables().get("os_name_path")) {
+                    const std::string s = v->to_string();
+                    if (!s.empty()) data_root = s.back() == '/' ? s : s + "/";
+                }
+                target = data_root + target.substr(os_prefix.size());
+            }
+            if (!target.empty()) {
+                if (auto b = overlay_read(target)) bytes = b;
+                else if (auto b = fs_->read(target)) bytes = b;
+                if (std::getenv("OA_TEXDBG"))
+                    std::fprintf(stderr, "[tex] lnq %s -> %s (%zu bytes)\n", resolved.c_str(),
+                                 target.c_str(), bytes ? bytes->size() : size_t(0));
+            }
         }
     }
     if (!bytes) return nullptr;
@@ -1545,7 +1604,91 @@ std::optional<std::pair<double, double>> RenderEngine::hit_size(void* userdata, 
     // —— 现状语义:盒/clip 优先由 Compositor hit_test_all 骨架承担)。
     const oa::render::ContentRole& role = oa::render::content_role_of(l);
     if (!role.textured_content(l)) return std::nullopt;
-    return ptr->decoded_size(role.texture_key(l));
+    const oa::render::TextureKey key = role.texture_key(l);
+    if (auto size = ptr->decoded_size(key)) return size;
+    // Headless: no decoded pixels and no backend textures. Reading the file
+    // header keeps hit testing (click/rollover) working offscreen — the
+    // iMel framework's buttons store only left/top and rely on the image's
+    // natural size for their hit quad.
+    if (!ptr->backend_ && !key.empty() && key.is_asset()) {
+        return ptr->probe_asset_size(key.name);
+    }
+    return std::nullopt;
+}
+
+namespace {
+
+/// PNG/JPEG natural size from the first bytes (no pixel decode).
+bool image_header_size(const std::vector<uint8_t>& b, int* w, int* h) {
+    static const unsigned char kPng[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    if (b.size() >= 24 && std::memcmp(b.data(), kPng, 8) == 0) {
+        *w = (int)((uint32_t(b[16]) << 24) | (uint32_t(b[17]) << 16) |
+                   (uint32_t(b[18]) << 8) | uint32_t(b[19]));
+        *h = (int)((uint32_t(b[20]) << 24) | (uint32_t(b[21]) << 16) |
+                   (uint32_t(b[22]) << 8) | uint32_t(b[23]));
+        return *w > 0 && *h > 0;
+    }
+    if (b.size() >= 4 && b[0] == 0xFF && b[1] == 0xD8) {
+        size_t i = 2;
+        while (i + 9 < b.size()) {
+            if (b[i] != 0xFF) {
+                ++i;
+                continue;
+            }
+            const uint8_t marker = b[i + 1];
+            if (marker == 0xD8 || marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7)) {
+                i += 2;
+                continue;
+            }
+            const size_t len = (size_t(b[i + 2]) << 8) | b[i + 3];
+            const bool sof = marker >= 0xC0 && marker <= 0xCF && marker != 0xC4 &&
+                             marker != 0xC8 && marker != 0xCC;
+            if (sof && i + 9 < b.size()) {
+                *h = (int)((uint32_t(b[i + 5]) << 8) | b[i + 6]);
+                *w = (int)((uint32_t(b[i + 7]) << 8) | b[i + 8]);
+                return *w > 0 && *h > 0;
+            }
+            if (len < 2) break;
+            i += 2 + len;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+std::optional<std::pair<double, double>> RenderEngine::probe_asset_size(const std::string& name) {
+    const auto cached = probed_sizes_.find(name);
+    if (cached != probed_sizes_.end()) {
+        return cached->second.first > 0 ? std::optional<std::pair<double, double>>(cached->second)
+                                        : std::nullopt;
+    }
+    std::string resolved = rt_->interpreter().resolve_magic_path(name);
+    std::optional<std::vector<uint8_t>> bytes;
+    for (const std::string& cand : {resolved, resolved + ".png", resolved + ".jpg"}) {
+        if (auto b = overlay_read(cand)) {
+            bytes = b;
+            break;
+        }
+        if (auto b = fs_->read(cand)) {
+            bytes = b;
+            break;
+        }
+    }
+    if (!bytes && resolved.size() >= 4 &&
+        resolved.compare(resolved.size() - 4, 4, ".lnq") == 0) {
+        // .lnq is a text pointer at the real image; the caller passes the
+        // extension-less name, so probe that variant too.
+        if (auto b = fs_->read(resolved)) bytes = b;
+    }
+    int w = 0, h = 0;
+    if (!bytes || !image_header_size(*bytes, &w, &h)) {
+        probed_sizes_.emplace(name, std::make_pair(0.0, 0.0));
+        return std::nullopt;
+    }
+    const std::pair<double, double> size{double(w), double(h)};
+    probed_sizes_.emplace(name, size);
+    return size;
 }
 
 std::optional<uint8_t> RenderEngine::alpha_sampler(void* userdata, const oa::render::Layer& l, int tx, int ty)

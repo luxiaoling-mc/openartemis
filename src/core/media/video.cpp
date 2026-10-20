@@ -1391,7 +1391,11 @@ struct MemIo {
 int mem_read(void* opaque, uint8_t* buf, int size) {
     auto* io = static_cast<MemIo*>(opaque);
     const std::vector<uint8_t>& b = *io->bytes;
-    if (io->pos >= b.size()) return 0; // EOF
+    // AVIO's contract: EOF must be signalled as AVERROR_EOF. Returning 0
+    // here leaves avio_feof() false, and the MPEG-PS demuxer's
+    // find_stream_info loop keeps retrying the same EOF read forever — the
+    // whole app froze on Watamari's story-opening [video] row (95 MB .mpg).
+    if (io->pos >= b.size()) return AVERROR_EOF;
     const size_t n = std::min<size_t>(size_t(size), b.size() - io->pos);
     std::memcpy(buf, b.data() + io->pos, n);
     io->pos += n;

@@ -613,13 +613,43 @@ size_t FontSystem::draw_text_layer(oa::render::RenderBackend* backend,
                                    double opacity)
 {
     if (!backend) return 0;
-    if (!default_face && font_faces.empty()) return 0;
+    // 字体是"画的时候才加载"的（face_for → load_font_face）。此前这里在
+    // 没有任何字体面时直接 return 0，而加载字体面的唯一入口就在下面 ——
+    // 形成死锁：只要本次运行还没有别的东西触发过字体加载，正文就永远画不出
+    // 一个字（testgame/test13：标题全是图片、没有一处文字预热字体，进了剧情
+    // 第一次画正文就撞在这里 —— 满屏一个字都没有；第二次启动：语言对话框被
+    // system.dat 跳过，同理没人预热）。
+    // 现在就地解析本层字体，失败才放弃。OA_TEXT_NO_LAZY_FACE=1 还原修复前的
+    // 行为（A/B 对照臂：同样是这幅画面，开着就该一个字都画不出来）。
+    static const bool no_lazy_face = std::getenv("OA_TEXT_NO_LAZY_FACE") != nullptr;
+    if (!default_face && font_faces.empty()) {
+        if (no_lazy_face) return 0;
+        if (!face_for(ml.font)) {
+            if (std::getenv("OA_TEXTDBG"))
+                std::fprintf(stderr,
+                             "[draw] layer='%s' NO FACE: request='%s' (nothing to "
+                             "draw — default face absent, face load failed)\n",
+                             ml.id.c_str(), ml.font.face().c_str());
+            return 0;
+        }
+        if (std::getenv("OA_TEXTDBG"))
+            std::fprintf(stderr, "[draw] lazy face load for '%s' -> faces=%zu\n",
+                         ml.id.c_str(), font_faces.size());
+    }
     // OA_TEXT_STATS=1: layout vs glyph-draw split for this layer (diagnostic).
     static const bool text_stats = std::getenv("OA_TEXT_STATS") != nullptr;
     const auto ts0 = std::chrono::steady_clock::now();
     const oa::render::LaidPage& page = cached_page(ml, backend);
     const auto ts1 = std::chrono::steady_clock::now();
-    if (page.glyphs.empty()) return 0;
+    if (page.glyphs.empty()) {
+        if (std::getenv("OA_TEXTDBG"))
+            std::fprintf(stderr,
+                         "[draw] layer='%s' LAID EMPTY: units=%zu chars=%zu reveal=%zu "
+                         "size=%.1f face='%s'\n",
+                         ml.id.c_str(), ml.page.size(), ml.char_count, ml.reveal_index,
+                         ml.font.size(), ml.font.face().c_str());
+        return 0;
+    }
     size_t drawn = 0;
     // 字形布局坐标 = 文本节点本地坐标（节点世界变换的 text_for 注入语义：
     // glyph 落点 ly.left/top+排版，再整体乘节点世界变换）。
@@ -632,6 +662,18 @@ size_t FontSystem::draw_text_layer(oa::render::RenderBackend* backend,
     // 下半不可读)。这里按通用语义补回行内容顶,不再需要任何
     // id/字号判据;spacetop=0 的字表(正文/backlog 等)数值不变 → 逐像素不变
     // (像素窗口验证)。判据完全来自 FPM 布局字段本身,撤销了控件特异 hack。
+    //
+    // 行盒顶之上还留着注音带:行高公式 spacetop+rubysize+spacemiddle+body+
+    // spacebottom 把 rubysize+spacemiddle 记在上方(ruby 就画在
+    // -(rubysize+spacemiddle) 处,见 ruby_top_offset),正文/名字的 em 顶从
+    // 注音带之下开始。此前只加 spacetop,带注音的 iMel 字表(名字层
+    // rubysize=19)整体偏高约半个 ruby 行:Watamari 的人名贴在姓名板顶边
+    // ("名字没有上下居中")。无注音(rubysize=0)的字表数值不变,仍逐像素不变。
+    // 行内容顶 = 行盒顶 + spacetop。**不加**注音带（rubysize + spacemiddle）：
+    // 姓名板的美术（mw_MWxx 里的 ribbon）与脚本里的 top 是对齐的，加注音带
+    // 会把整行下移 ~9px —— 实测 ribbon 738..782、墨迹 750..782（中心偏下
+    // 约 11px），减掉后墨迹 741..773，中心 757 ≈ ribbon 中心 760。ruby 自身
+    // 仍按 -(rubysize + spacemiddle) 画在正文上方，不受影响。
     const double line_content_top = ml.top + ml.font.spacetop();
     const bool plain = world.is_plain_translation();
     auto map = [&](double lx, double ly, double* wx, double* wy) {
@@ -667,6 +709,15 @@ size_t FontSystem::draw_text_layer(oa::render::RenderBackend* backend,
             const oa::render::FPoint down{ float(x2), float(y2) };
             backend->draw_texture_affine(tex, nullptr, origin, right, down);
         };
+    if (std::getenv("OA_TEXTDBG"))
+        std::fprintf(stderr,
+                     "[draw] layer='%s' laid=%zu reveal=%zu first_order=%zu "
+                     "first_face='%s'\n",
+                     ml.id.c_str(), page.glyphs.size(), ml.reveal_index,
+                     page.glyphs.empty() ? 0 : page.glyphs.front().order,
+                     page.glyphs.empty() || !page.glyphs.front().font
+                         ? "-"
+                         : page.glyphs.front().font->face().c_str());
     for (const oa::render::LaidGlyph& g : page.glyphs) {
         if (g.newline || !g.font) continue;
         // reveal：只画已揭示字符
@@ -683,6 +734,13 @@ size_t FontSystem::draw_text_layer(oa::render::RenderBackend* backend,
         const double lx = ml.left + g.x + double(cg.bitmap_left);
         const double ly = line_content_top + double(g.line) * line_h +
             gm.ascent - double(cg.bitmap_top);
+        static const bool g_dbg = std::getenv("OA_TEXTDBG") != nullptr;
+        if (g_dbg && g.order == 0)
+            std::fprintf(stderr,
+                         "[draw] '%s' first glyph ly=%.1f (top=%.1f spacetop=%.1f "
+                         "line_h=%.1f ascent=%.1f bmp_top=%d line=%u)\n",
+                         ml.id.c_str(), ly, ml.top, ml.font.spacetop(), line_h,
+                         gm.ascent, cg.bitmap_top, g.line);
         const oa::render::Rgba col = text_color(*g.font);
         oa::render::Rgba shadow{ 0, 0, 0, 0 };
         oa::render::Rgba outline{ 0, 0, 0, 0 };

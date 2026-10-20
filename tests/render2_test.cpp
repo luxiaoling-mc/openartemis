@@ -180,6 +180,59 @@ void test_runtime_typed_property_tweens() {
           "R12 anchor settled");
 }
 
+// ------------------------------------------------- s.current_message_layer
+void test_current_message_layer_published() {
+    // Artemis publishes the active message layer as `s.current_message_layer`.
+    // Framework block macros guard their close tag with it — Watamari's
+    // */chgmsg_name runs `[/chgmsg]` only when that variable still reads
+    // 'name'; leaving it unset kept the name window open, so the story body
+    // printed into the name slot from the next scene on.
+    MemFs fs;
+    auto rt = make_runtime(fs,
+                           "*main\n"
+                           "[chgmsg id=\"adv\"]\n"
+                           "[chgmsg id=\"name\"]\n"
+                           "[print data=\"八田\"]\n"
+                           "[/chgmsg]\n");
+    oa::runtime::FrameInput idle;
+    rt->tick(16, idle);
+    (void)rt->drain_events();
+    const auto v = rt->interpreter().variables().get("s.current_message_layer");
+    check(v.has_value(), "MLP: s.current_message_layer is published");
+    check(v && v->to_string() == "adv",
+          "MLP: [/chgmsg] republishes the restored layer (adv)");
+    const auto* ml = rt->text().layer("name");
+    check(ml != nullptr, "MLP: the name layer exists");
+    check(ml && ml->char_count == 2, "MLP: the printed row landed in the name layer");
+}
+
+// ------------------------------------------------------------- lyc2 image csv
+void test_lyc2_reads_image_csv() {
+    // [lyc2 file=F] places the layer from F.csv ("left,top" — the message
+    // window plate ships 168,747). Without it the plate was created at 0,0 and
+    // the story page drew its text on the bare background.
+    MemFs fs;
+    fs.files["image/gui/game/mw/mw.csv"] = "168,747\r\n";
+    auto rt = make_runtime(fs, "*main\n[lyc2 id=\"80.0.0\" file=\"image/gui/game/mw/mw\"]\n");
+    oa::runtime::FrameInput idle;
+    rt->tick(16, idle);
+    (void)rt->drain_events();
+    const Layer* l = rt->scene().find("80.0.0");
+    check(l != nullptr, "lyc2: the plate layer exists");
+    check(l && approx(l->left, 168.0) && approx(l->top, 747.0),
+          "lyc2: the image csv places the layer");
+    // An explicit geometry on the tag still wins over the csv.
+    MemFs fs2;
+    fs2.files["image/gui/game/mw/mw.csv"] = "168,747\r\n";
+    auto rt2 = make_runtime(
+        fs2, "*main\n[lyc2 id=\"80.0.0\" file=\"image/gui/game/mw/mw\" left=\"10\" top=\"20\"]\n");
+    rt2->tick(16, idle);
+    (void)rt2->drain_events();
+    const Layer* l2 = rt2->scene().find("80.0.0");
+    check(l2 && approx(l2->left, 10.0) && approx(l2->top, 20.0),
+          "lyc2: an inline position overrides the csv");
+}
+
 } // namespace
 
 int main() {
@@ -187,6 +240,8 @@ int main() {
     test_lytween_sync_wait();
     test_tween_handler_via_tag_queue();
     test_runtime_typed_property_tweens();
+    test_current_message_layer_published();
+    test_lyc2_reads_image_csv();
     if (failures) {
         std::fprintf(stderr, "render2_test: %d failure(s)\n", failures);
         return 1;

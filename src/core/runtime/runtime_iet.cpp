@@ -409,11 +409,11 @@ private:
             if (tok_eq(peek(), Tok::Eq)) {
                 next();
                 const Value right = parse_comparison();
-                left = compare(left, right, [](double a, double b) { return a == b; });
+                left = Value::make_bool(values_equal(left, right));
             } else if (tok_eq(peek(), Tok::Neq)) {
                 next();
                 const Value right = parse_comparison();
-                left = compare(left, right, [](double a, double b) { return a != b; });
+                left = Value::make_bool(!values_equal(left, right));
             } else {
                 break;
             }
@@ -555,6 +555,36 @@ private:
         const double y = b.as_float().value_or(0.0);
         return Value::make_bool(fn(x, y));
     }
+    /// Numeric view for ==/!= only: numeric kinds and numeric-looking strings.
+    static std::optional<double> number_view(const Value& v) {
+        switch (v.kind) {
+            case ValueKind::Int: return double(v.int_val);
+            case ValueKind::Float: return v.float_val;
+            case ValueKind::Bool: return v.bool_val ? 1.0 : 0.0;
+            case ValueKind::String: {
+                if (v.str_val.empty()) return std::nullopt;
+                char* end = nullptr;
+                errno = 0;
+                const double d = std::strtod(v.str_val.c_str(), &end);
+                if (errno == 0 && end == v.str_val.c_str() + v.str_val.size()) return d;
+                return std::nullopt;
+            }
+            case ValueKind::Null: return std::nullopt;
+        }
+        return std::nullopt;
+    }
+    /// Equality is type-aware: `0 == 'ja'` must be FALSE (the iMel framework
+    /// writes `ng="$g.language == g.language_all.(t.i)"` and reads the result
+    /// as a string, so the old numeric fallback — every non-numeric string
+    /// collapsing to 0.0 — disabled *every* language button: test10 booted to
+    /// a LANGUAGE dialog with three greyed-out buttons).
+    static bool values_equal(const Value& a, const Value& b) {
+        const auto na = number_view(a);
+        const auto nb = number_view(b);
+        if (na && nb) return *na == *nb;
+        if (!na && !nb) return a.to_display() == b.to_display();
+        return false;
+    }
     static Value add(const Value& a, const Value& b) {
         if (a.kind == ValueKind::String) {
             return Value::make_string(a.str_val + b.to_display());
@@ -641,12 +671,97 @@ private:
 
 } // namespace
 
+Value ExpressionEvaluator::resolve_indirect(std::string_view name_expr) const {
+    std::string name;
+    try {
+        name = evaluate(name_expr).to_string();
+    } catch (const std::exception&) {
+        return Value::make_int(0);
+    }
+    if (const auto v = vars_->get(name)) return *v;
+    return Value::make_int(0);
+}
+
+std::string ExpressionEvaluator::expand_indirect(std::string_view expr) const {
+    std::string out;
+    size_t i = 0;
+    const size_t n = expr.size();
+    auto balanced_end = [&](size_t open) -> size_t {
+        int depth = 0;
+        bool in_str = false;
+        for (size_t k = open; k < n; ++k) {
+            const char c = expr[k];
+            if (in_str) {
+                if (c == '\'') in_str = false;
+                continue;
+            }
+            if (c == '\'') in_str = true;
+            else if (c == '(') ++depth;
+            else if (c == ')' && --depth == 0) return k + 1;
+        }
+        return n;
+    };
+    while (i < n) {
+        const char c = expr[i];
+        if (c == '\'') {
+            out.push_back(c);
+            ++i;
+            while (i < n) {
+                const char cc = expr[i++];
+                out.push_back(cc);
+                if (cc == '\'') break;
+            }
+            continue;
+        }
+        if (c == '$' && i + 1 < n && expr[i + 1] == '$') {
+            const size_t start = i + 2;
+            size_t end = start;
+            if (start < n && expr[start] == '(') {
+                end = balanced_end(start);
+            } else {
+                while (end < n &&
+                       (std::isalnum(uint8_t(expr[end])) || expr[end] == '_' ||
+                        expr[end] == '.')) {
+                    ++end;
+                }
+                while (end + 1 < n && expr[end] == '.' && expr[end + 1] == '(') {
+                    end = balanced_end(end + 1);
+                }
+            }
+            const std::string operand(expr.substr(start, end - start));
+            const Value v = resolve_indirect(operand);
+            if (v.kind == ValueKind::String) {
+                out.push_back('\'');
+                out += v.str_val;
+                out.push_back('\'');
+            } else {
+                out += v.to_display();
+            }
+            i = end;
+            continue;
+        }
+        out.push_back(c);
+        ++i;
+    }
+    return out;
+}
+
 Value ExpressionEvaluator::evaluate(std::string_view expr) const {
-    Parser parser(tokenize(expr), *vars_);
-    return parser.parse();
+    try {
+        const std::string expanded = expand_indirect(expr);
+        Parser parser(tokenize(expanded), *vars_);
+        return parser.parse();
+    } catch (const ExpressionError& e) {
+        // Carry the offending text: the bare tokenizer message ("unexpected
+        // character in expression") gives no clue which tag parameter broke.
+        throw ExpressionError(std::string(e.what()) + " [expr: " + std::string(expr) + "]");
+    }
 }
 
 Value ExpressionEvaluator::resolve_param(const std::string& value) const {
+    if (value.size() >= 2 && value[0] == '$' && value[1] == '$') {
+        return resolve_indirect(std::string_view(value).substr(2));
+    }
     if (value.starts_with('$')) {
         return evaluate(normalize_expr(std::string_view(value).substr(1)));
     }
@@ -669,6 +784,11 @@ Value ExpressionEvaluator::resolve_param(const std::string& value) const {
 }
 
 std::string ExpressionEvaluator::resolve_param_str(const std::string& value) const {
+    if (value.size() >= 2 && value[0] == '$' && value[1] == '$') {
+        const Value v = resolve_indirect(std::string_view(value).substr(2));
+        if (v.kind == ValueKind::Null) return {};
+        return v.to_string();
+    }
     if (value.starts_with('$')) {
         return evaluate(normalize_expr(std::string_view(value).substr(1))).to_string();
     }
@@ -877,6 +997,56 @@ std::vector<Segment> split_line_segments(std::string_view line) {
     return segments;
 }
 
+// True when the line ends inside an unclosed "[...]" tag (quotes protect
+// brackets). The framework spreads long tags over several lines:
+//   [execcsv exec = "font" csv = "..."
+//        height = "$g.screen_height"   // comment
+//        align  = "$t.fontalign"]
+// and the line-based parser used to turn such a tag into story text (the
+// whole block was printed as narration and its effect silently skipped).
+bool has_unclosed_tag(std::string_view line) {
+    bool in_tag = false;
+    bool in_quote = false;
+    bool escaped = false;
+    for (size_t i = 0; i < line.size(); ++i) {
+        const char c = line[i];
+        if (in_tag && in_quote && escaped) {
+            escaped = false;
+            continue;
+        }
+        if (in_tag && in_quote && c == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (c == '"' && in_tag) {
+            in_quote = !in_quote;
+        } else if (!in_tag && c == '[') {
+            in_tag = true;
+        } else if (in_tag && !in_quote && c == ']') {
+            in_tag = false;
+        }
+    }
+    return in_tag;
+}
+
+// Continuation line of a multi-line tag: drop "//" comments that sit outside
+// quotes (the framework annotates CSV parameter lines that way), then trim.
+std::string strip_tag_continuation(std::string_view raw) {
+    std::string out;
+    bool in_quote = false;
+    for (size_t i = 0; i < raw.size(); ++i) {
+        const char c = raw[i];
+        if (c == '"') {
+            in_quote = !in_quote;
+            out.push_back(c);
+            continue;
+        }
+        if (!in_quote && c == '/' && i + 1 < raw.size() && raw[i + 1] == '/') break;
+        out.push_back(c);
+    }
+    return trim(out);
+}
+
 std::vector<std::string_view> split_lines(std::string_view content) {
     std::vector<std::string_view> lines;
     size_t pos = 0;
@@ -893,6 +1063,104 @@ std::vector<std::string_view> split_lines(std::string_view content) {
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// §4b Script-input preprocessor ([&scpsupport] / [&autoinsert] / [&linetag])
+//
+// Artemis resolves these LOAD-TIME directives into text substitutions before
+// a line is parsed (Docs/tag/preprocessor/*). iMel titles depend on them:
+// every scenario writes
+//     [&autoinsert target="linehead"  command="[onlinehead]"]
+//     [&autoinsert target="lineend"   command="[onlineend]"]
+//     [&autoinsert target="blankline" command="[onblankline]"]
+// at the top and then one plain sentence per line. `*onlineend` (macro.iet)
+// is where the page break lives:
+//     [wait scenario = "1" input = "1" skip = "1"]   <- click releases it
+// so without the preprocessor NO wait is ever armed for a story line and the
+// scenario runs to its end by itself (Watamari/test10: "story skips on its
+// own"). Lines without directives are untouched: the rules start out empty.
+// ---------------------------------------------------------------------------
+struct PreprocRules {
+    std::string linehead;
+    std::string lineend;
+    std::string blankline;
+    // [&linetag]: lines that are COMMANDS, not prose ("#立ち絵表示 a,b,c").
+    bool linetag = false;
+    std::string linetag_prefix;
+    struct CharRule {
+        std::string ch;      // empty = the line break itself (scenario text)
+        std::string command;
+    };
+    std::vector<CharRule> chars;
+    bool empty() const {
+        return linehead.empty() && lineend.empty() && blankline.empty() && chars.empty();
+    }
+};
+
+// Turn a directive's `command="[a][b x=y]"` payload into real instructions.
+void append_preproc_commands(Script& out, const std::string& command, size_t line_num) {
+    if (command.empty()) return;
+    for (const Segment& seg : split_line_segments(command)) {
+        if (!seg.is_tag) continue;
+        const std::string inner = trim(seg.text);
+        size_t sp = 0;
+        while (sp < inner.size() && !is_space(inner[sp])) ++sp;
+        const std::string tag = inner.substr(0, sp);
+        if (tag.empty()) continue;
+        Instruction ins;
+        ins.tag = tag;
+        ins.params = parse_params(trim(std::string_view(inner).substr(sp)), line_num);
+        ins.line = line_num;
+        out.instructions.push_back(std::move(ins));
+    }
+}
+
+// Apply one source line made only of "&" directives. Returns true when the
+// line was consumed by the preprocessor (it then emits no instruction).
+bool apply_preproc_line(const std::string& line, PreprocRules& pre, size_t line_num) {
+    const auto segs = split_line_segments(line);
+    if (segs.empty()) return false;
+    bool any = false;
+    for (const Segment& seg : segs) {
+        if (!seg.is_tag) {
+            if (!trim(seg.text).empty()) return false; // prose on the line
+            continue;
+        }
+        const std::string inner = trim(seg.text);
+        if (inner.empty() || inner[0] != '&') return false;
+        size_t sp = 0;
+        while (sp < inner.size() && !is_space(inner[sp])) ++sp;
+        const std::string tag = inner.substr(0, sp);
+        const auto p = parse_params(trim(std::string_view(inner).substr(sp)), line_num);
+        const auto get = [&p](const char* key) {
+            const auto it = p.find(key);
+            return it == p.end() ? std::string() : it->second;
+        };
+        if (tag == "&autoinsert") {
+            const std::string target = get("target");
+            const std::string command = get("command");
+            if (target == "linehead") pre.linehead = command;
+            else if (target == "lineend") pre.lineend = command;
+            else if (target == "blankline") pre.blankline = command;
+        } else if (tag == "&linetag") {
+            const std::string allow = get("allow");
+            pre.linetag = (allow.empty() || allow != "0");
+            pre.linetag_prefix = get("prefix");
+        } else if (tag == "&scpsupport") {
+            const std::string mode = get("mode");
+            if (mode == "init") {
+                pre.chars.clear();
+            } else if (mode == "add" || mode == "addsp") {
+                PreprocRules::CharRule rule;
+                rule.ch = get("char");
+                rule.command = get("command");
+                if (!rule.command.empty()) pre.chars.push_back(std::move(rule));
+            }
+        }
+        any = true;
+    }
+    return any;
+}
+
 Script Script::parse(const std::string& name, std::string_view content) {
     Script out;
     out.name = name;
@@ -906,6 +1174,35 @@ Script Script::parse(const std::string& name, std::string_view content) {
     bool in_block = false;
     size_t block_line = 0;
 
+    // Load-time input-support rules for THIS script (see §4b). Empty until the
+    // script itself registers one, so every other title parses unchanged.
+    PreprocRules pre;
+    size_t current_line_num = 0;
+    // Append the line's tail decorators: [&scpsupport] char rules first, then
+    // the unconditional [&autoinsert target="lineend"] payload.
+    auto decorate_tail = [&](const std::string& source_line) {
+        if (pre.chars.empty() && pre.lineend.empty()) return;
+        // Where the rules fire: a `char` rule matches the trailing scenario
+        // text; a rule without `char` matches the line break of a text line.
+        bool tail_is_text = false;
+        std::string tail_text;
+        const auto segs = split_line_segments(source_line);
+        if (!segs.empty() && !segs.back().is_tag) {
+            tail_text = std::string(trim(segs.back().text));
+            tail_is_text = !tail_text.empty();
+        }
+        for (const auto& rule : pre.chars) {
+            const bool fire = rule.ch.empty()
+                                  ? tail_is_text
+                                  : (tail_is_text && tail_text.size() >= rule.ch.size() &&
+                                     tail_text.compare(tail_text.size() - rule.ch.size(),
+                                                       rule.ch.size(), rule.ch) == 0);
+            if (fire) append_preproc_commands(out, rule.command, current_line_num);
+        }
+        if (!pre.lineend.empty())
+            append_preproc_commands(out, pre.lineend, current_line_num);
+    };
+
     while (line_idx < n) {
         // Pull the next effective line: blank, ";"-prefixed and comment
         // content (including whole "/* ... */" blocks) is consumed here, so
@@ -914,9 +1211,20 @@ Script Script::parse(const std::string& name, std::string_view content) {
         std::string line;
         while (true) {
             if (line_idx >= n) break;
-            line = trim(strip_line_comments(lines[line_idx], line_idx + 1, in_block,
+            const std::string_view raw = lines[line_idx];
+            line = trim(strip_line_comments(raw, line_idx + 1, in_block,
                                             block_line));
             if (line.empty()) {
+                // A genuinely empty source line is the scenario's paragraph
+                // break, which [&autoinsert target="blankline"] decorates.
+                // Comment-only lines and block-comment interiors are not.
+                // The empty element produced by a trailing newline is not a
+                // paragraph break.
+                if (trim(raw).empty() && !pre.blankline.empty() && !in_block &&
+                    line_idx + 1 < n) {
+                    current_line_num = line_idx + 1;
+                    append_preproc_commands(out, pre.blankline, current_line_num);
+                }
                 ++line_idx;
                 continue;
             }
@@ -924,6 +1232,7 @@ Script Script::parse(const std::string& name, std::string_view content) {
         }
         if (line.empty()) break; // content exhausted (unterminated block throws below)
         const size_t line_num = line_idx + 1;
+        current_line_num = line_num;
 
         if (line.starts_with(';')) { // ";" full-line comment
             ++line_idx;
@@ -934,6 +1243,66 @@ Script Script::parse(const std::string& name, std::string_view content) {
             if (!label.empty()) out.labels[label] = out.instructions.size();
             ++line_idx;
             continue;
+        }
+
+        // "&" directives configure the decorators and never reach the
+        // instruction stream.
+        if (apply_preproc_line(line, pre, line_num)) {
+            ++line_idx;
+            continue;
+        }
+        if (!pre.linehead.empty())
+            append_preproc_commands(out, pre.linehead, line_num);
+
+        // [&linetag] command row: "<prefix>tag p0,p1,...". The command name
+        // ends at the first blank, the rest is a CSV of positional arguments
+        // whose names come from tag.ini (expanded at execution time).
+        if (pre.linetag) {
+            const bool prefixed = !pre.linetag_prefix.empty() &&
+                                  std::string_view(line).starts_with(pre.linetag_prefix);
+            const bool bare = pre.linetag_prefix.empty() && !line.empty() &&
+                              ((line[0] >= '0' && line[0] <= '9') ||
+                               (line[0] >= 'A' && line[0] <= 'Z') ||
+                               (line[0] >= 'a' && line[0] <= 'z'));
+            if (prefixed || bare) {
+                Instruction ins;
+                ins.kind = Instruction::Kind::LineTag;
+                ins.params["text"] = line.substr(prefixed ? pre.linetag_prefix.size() : 0);
+                ins.line = line_num;
+                out.instructions.push_back(std::move(ins));
+                ++line_idx;
+                decorate_tail(line);
+                continue;
+            }
+        }
+
+        // Multi-line tag: keep pulling raw lines until the bracket closes.
+        // Consumed count is tracked so the outer loop does not skip or
+        // re-read them; an unterminated tail falls back to the old
+        // "unclosed [ is story text" behaviour for the first line only.
+        bool consumed_extra_lines = false;
+        if (has_unclosed_tag(line)) {
+            const size_t first_line_idx = line_idx;
+            std::string joined = line;
+            size_t look = line_idx + 1;
+            bool closed = false;
+            while (look < n && look < first_line_idx + 64) {
+                const std::string cont = strip_tag_continuation(lines[look]);
+                if (!cont.empty()) {
+                    joined.push_back(' ');
+                    joined += cont;
+                }
+                ++look;
+                if (!has_unclosed_tag(joined)) {
+                    closed = true;
+                    break;
+                }
+            }
+            if (closed) {
+                line = trim(joined);
+                line_idx = look; // already points past the closing line
+                consumed_extra_lines = true;
+            }
         }
 
         if (line.find('[') != std::string::npos) {
@@ -988,7 +1357,8 @@ Script Script::parse(const std::string& name, std::string_view content) {
                 ins.line = line_num;
                 out.instructions.push_back(std::move(ins));
             }
-            if (!lua_consumed) ++line_idx;
+            if (!lua_consumed && !consumed_extra_lines) ++line_idx;
+            decorate_tail(line);
             continue;
         }
 
@@ -997,6 +1367,7 @@ Script Script::parse(const std::string& name, std::string_view content) {
         ins.params["text"] = line;
         ins.line = line_num;
         out.instructions.push_back(std::move(ins));
+        decorate_tail(line);
         ++line_idx;
     }
     if (in_block) {
@@ -1191,7 +1562,8 @@ bool is_builtin_tag(const std::string& tag) {
         "jump",  "goto",   "call",   "return", "stop",   "wt",    "wt0",     "wait",
         "exkey",
         "@",     "var",    "if",     "elseif", "else",  "/if",     "loop",  "/loop",
-        "lua",   "reset", "exit",   "gotitle", "yesno", "dialog", "calllua", "macroadd",
+        "lua",   "reset", "exit",   "gotitle", "yesno", "dialog", "calllua",
+        "forcedcalllua", "macroadd", "execcsv",
         "macrodel", "tag",
     };
     for (const char* b : kBuiltins) {
@@ -1227,7 +1599,17 @@ void Interpreter::load_file(const std::string& name, const std::vector<uint8_t>&
     if (bytes.size() >= 4 && bytes[0] == 'A' && bytes[1] == 'S' && bytes[2] == 'B' &&
         bytes[3] == 0) {
         // ASB -> text -> regular parser
-        load_script(name, decode_asb(bytes));
+        const std::string decoded = decode_asb(bytes);
+        if (const char* dump = std::getenv("OA_SCRIPT_DUMP"); dump && name == dump) {
+            if (FILE* f = std::fopen("oa_script_dump.txt", "wb"))
+            {
+                std::fwrite(decoded.data(), 1, decoded.size(), f);
+                std::fclose(f);
+                std::fprintf(stderr, "[script] dumped %s (%zu bytes)\n", name.c_str(),
+                             decoded.size());
+            }
+        }
+        load_script(name, decoded);
         return;
     }
     const std::string text = util::decode_to_utf8(
@@ -1237,6 +1619,8 @@ void Interpreter::load_file(const std::string& name, const std::vector<uint8_t>&
 }
 
 void Interpreter::load_external_script(const std::string& file) {
+    if (std::getenv("OA_SCRIPT_DUMP"))
+        std::fprintf(stderr, "[script] load %s\n", file.c_str());
     if (scripts_.count(file)) return;
     if (!hooks_.file_loader) {
         throw ScriptError("script-not-found", "no file loader wired; cannot load " + file);
@@ -1275,6 +1659,52 @@ bool Interpreter::try_load_script(const std::string& file, std::string* error) {
     }
 }
 
+const std::vector<std::string>& Interpreter::line_tag_params(const std::string& tag) {
+    static const std::vector<std::string> kEmpty;
+    if (!line_tags_loaded_) {
+        line_tags_loaded_ = true;
+        const auto& loader = hooks_.file_loader;
+        std::optional<std::vector<uint8_t>> bytes;
+        if (loader) {
+            bytes = loader("tag.ini");
+            if (!bytes) bytes = loader("system/tag.ini");
+        }
+        if (bytes && !bytes->empty()) {
+            const std::string text(bytes->begin(), bytes->end());
+            std::string section;
+            for (const std::string_view raw : split_lines(text)) {
+                const std::string line = trim(raw);
+                if (line.empty() || line.front() == ';') continue;
+                if (line.front() == '[') {
+                    const size_t close = line.find(']');
+                    section = trim(std::string_view(line).substr(
+                        1, close == std::string::npos ? std::string::npos : close - 1));
+                    auto& cols = line_tags_[section];
+                    cols.clear();
+                    continue;
+                }
+                // "index=name" — the column order for that command.
+                const size_t eq = line.find('=');
+                if (section.empty() || eq == std::string::npos) continue;
+                const std::string index_text = trim(std::string_view(line).substr(0, eq));
+                const std::string name = trim(std::string_view(line).substr(eq + 1));
+                if (name.empty()) continue;
+                auto& cols = line_tags_[section];
+                size_t index = 0;
+                try {
+                    index = size_t(std::stoul(index_text));
+                } catch (const std::exception&) {
+                    continue;
+                }
+                if (cols.size() <= index) cols.resize(index + 1);
+                cols[index] = name;
+            }
+        }
+    }
+    const auto it = line_tags_.find(tag);
+    return it == line_tags_.end() ? kEmpty : it->second;
+}
+
 void Interpreter::restore_position(const std::string& script, size_t line,
                                    const std::vector<CallFrame> stack) {
     if (!script.empty() && !scripts_.count(script)) {
@@ -1289,6 +1719,8 @@ void Interpreter::restore_position(const std::string& script, size_t line,
     call_stack_ = stack;
     arrived_by_jump_ = false;
     last_wait_from_queue_ = false;
+    queue_hold_depth_ = 0;
+    macro_param_saves_.clear();
 }
 
 void Interpreter::start(const std::string& script, std::string_view label) {
@@ -1304,6 +1736,8 @@ void Interpreter::start(const std::string& script, std::string_view label) {
     current_line_ = *line;
     call_stack_.clear();
     arrived_by_jump_ = false;
+    queue_hold_depth_ = 0;
+    macro_param_saves_.clear();
 }
 
 void Interpreter::boot(const std::string& script) {
@@ -1323,6 +1757,91 @@ void Interpreter::boot(const std::string& script) {
     current_line_ = line.value_or(0);
     call_stack_.clear();
     arrived_by_jump_ = false;
+    queue_hold_depth_ = 0;
+    macro_param_saves_.clear();
+}
+
+bool Interpreter::local_var_declared(const std::string& name) const {
+    // A macro frame is the only authority while one is active: parameters it
+    // supplied plus variables it declared with writelocal=1. Falling back to
+    // the flat local map here used to leak a returned frame's `file`
+    // (…/system/config.iet) into the next selectbtn, whose option rows then
+    // stored the wrong jump file.
+    if (!macro_param_saves_.empty()) {
+        const auto& top = macro_param_saves_.back();
+        return top.provided.count(name) > 0 || top.written.count(name) > 0;
+    }
+    return variables_.local.count(name) > 0;
+}
+
+void Interpreter::note_local_write(const std::string& name) {
+    if (!macro_param_saves_.empty()) macro_param_saves_.back().written.insert(name);
+}
+
+void Interpreter::restore_macro_params(size_t depth) {
+    if (macro_param_saves_.empty()) return;
+    if (macro_param_saves_.back().depth != depth) return;
+    for (const auto& [name, value] : macro_param_saves_.back().saved) {
+        if (value) {
+            variables_.set(name, *value);
+        } else {
+            variables_.remove(name);
+        }
+    }
+    macro_param_saves_.pop_back();
+}
+
+std::optional<std::pair<std::string, std::map<std::string, std::string>>>
+Interpreter::script_block(const std::string& file, size_t index) const {
+    // iMel's tag filters (macro.iet: tagFilters.waitstop / .return) take a
+    // frame out of e:getScriptStack() and feed it straight back here. They
+    // index the RESULT without a nil check (`local command = currentTag.command`),
+    // so a miss is a Lua crash → the filter verdict degrades to "not handled"
+    // → [waitstop] produces no wait at all → the story advances by itself.
+    // Two robustness rules therefore matter on this face:
+    //   1) resolve the script name across the '\' / '/' spellings the stack
+    //      can carry (the frames keep whatever spelling loaded them);
+    //   2) clamp an out-of-range index to the last row instead of failing —
+    //      the caller's index arithmetic is `index - 1` on our own line
+    //      numbers, and a one-off must not drop the whole wait.
+    const Script* script = nullptr;
+    if (const auto it = scripts_.find(file); it != scripts_.end()) {
+        script = &it->second;
+    } else {
+        const bool has_bs = file.find('\\') != std::string::npos;
+        std::string alt = file;
+        for (char& c : alt) c = has_bs ? (c == '\\' ? '/' : c) : (c == '/' ? '\\' : c);
+        if (const auto it2 = scripts_.find(alt); it2 != scripts_.end()) {
+            script = &it2->second;
+        } else {
+            const size_t cut = alt.find_last_of("/\\");
+            const std::string base = cut == std::string::npos ? alt : alt.substr(cut + 1);
+            for (const auto& [name, s] : scripts_) {
+                const size_t b = name.find_last_of("/\\");
+                if ((b == std::string::npos ? name : name.substr(b + 1)) == base) {
+                    script = &s;
+                    break;
+                }
+            }
+        }
+    }
+    if (!script) {
+        if (std::getenv("OA_STORYDBG"))
+            std::fprintf(stderr, "[script] getScriptBlock miss: no script '%s'\n",
+                         file.c_str());
+        return std::nullopt;
+    }
+    const auto& rows = script->instructions;
+    if (rows.empty()) return std::nullopt;
+    if (index >= rows.size()) {
+        if (std::getenv("OA_STORYDBG"))
+            std::fprintf(stderr,
+                         "[script] getScriptBlock '%s' index=%zu out of range (rows=%zu) "
+                         "-> clamped\n",
+                         file.c_str(), index, rows.size());
+        index = rows.size() - 1;
+    }
+    return std::make_pair(rows[index].tag, rows[index].params);
 }
 
 const std::string* Interpreter::current_script() const {
@@ -1344,6 +1863,7 @@ void Interpreter::enqueue_tag(std::string tag, std::map<std::string, std::string
     ins.tag = std::move(tag);
     ins.params = std::move(params);
     ins.line = 0;
+    if (current_script_name_) ins.origin_script = *current_script_name_;
     tag_queue_.push_back(std::move(ins));
 }
 
@@ -1397,7 +1917,58 @@ bool tag_bool(std::string_view v, bool fallback) {
 
 /// Entry point for one instruction.
 static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool apply_filter) {
+    // [&linetag] row: "command p0,p1,..." — tag.ini names the columns
+    // (tag/preprocessor/linetag.txt: "パラメータ名を省略する代わりに、
+    // tag.ini ファイルによってパラメータ順序を定義する"). Expand, then run the
+    // command through the normal dispatch (it is a macro of macro.iet).
+    if (ins.kind == Instruction::Kind::LineTag) {
+        const std::string text = ins.get_or("text", "");
+        size_t sp = 0;
+        while (sp < text.size() && !is_space(text[sp])) ++sp;
+        Instruction expanded;
+        expanded.kind = Instruction::Kind::Tag;
+        expanded.tag = text.substr(0, sp);
+        expanded.line = ins.line;
+        const std::string rest = trim(std::string_view(text).substr(sp));
+        if (!expanded.tag.empty() && !rest.empty()) {
+            const auto& names = it.line_tag_params(expanded.tag);
+            size_t index = 0;
+            size_t pos = 0;
+            while (pos <= rest.size()) {
+                const size_t comma = rest.find(',', pos);
+                std::string arg = trim(std::string_view(rest).substr(
+                    pos, comma == std::string::npos ? std::string::npos : comma - pos));
+                if (!arg.empty()) {
+                    if (arg.size() >= 2 && arg.front() == '"' && arg.back() == '"')
+                        arg = arg.substr(1, arg.size() - 2);
+                    // Unnamed columns keep the parser's 0-based positional
+                    // key convention (parse_params).
+                    const std::string key =
+                        index < names.size() ? names[index] : std::to_string(index);
+                    expanded.params.emplace(key, arg);
+                }
+                if (comma == std::string::npos) break;
+                pos = comma + 1;
+                ++index;
+            }
+        }
+        if (expanded.tag.empty()) return TagOutcome{};
+        return execute_tag(it, expanded, apply_filter);
+    }
+
     const std::string& tag = ins.tag;
+    if (std::getenv("OA_TAGTRACE")) {
+        std::string pv;
+        for (const auto& [k, v] : ins.params) {
+            if (k == "id" || k == "file" || k == "name" || k == "data" ||
+                k == "estimate" || k == "system" || k == "label") {
+                pv += k + "=" + v + " ";
+            }
+        }
+        std::fprintf(stderr, "[tag] %-12s %s @%s:%zu\n", tag.c_str(), pv.c_str(),
+                     it.current_script() ? it.current_script()->c_str() : "?",
+                     it.current_line());
+    }
     VariableStore& vars = it.variables();
     const ExpressionEvaluator eval(vars);
     TagOutcome out;
@@ -1424,11 +1995,39 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
     // … 仍由过滤器拦截)。
     if (apply_filter && tag != "return") {
         const bool is_engine_native = it.engine_tags().count(tag) > 0;
-        const bool has_builtin = is_builtin_tag(tag) || is_engine_native;
+        // A [macroadd]-registered tag has a native handler too (the macro call
+        // below). Without this a framework filter that returns 0 ("not
+        // handled, run it yourself" — iMel's 背景/イベントCG filters do exactly
+        // that for every st=/add= row) counted as a consume and the macro never
+        // ran: the background layer stayed empty and the story page was drawn
+        // without its background.
+        const bool is_macro = it.macros().count(tag) > 0;
+        const bool has_builtin = is_builtin_tag(tag) || is_engine_native || is_macro;
         if (!is_engine_native) {
+            // Tag filters receive EVALUATED parameter strings — the framework's
+            // tags.<tag> handlers treat p.file / p.data as final values (e.g.
+            // macro.iet's lyc filter runs gFileExists(e, param.file) directly
+            // and then re-issues e:tag{"lyc", file=param.file}). Handing them
+            // the raw `$...` text made every [lyc file="$os_name_path + ..."]
+            // fail its existence check, the filter consumed the tag, and boot
+            // parked on a black screen (Watamari, test10 config/language page).
+            // Values without the `$` marker are passed through untouched.
+            std::map<std::string, std::string> filter_params;
+            for (const auto& [k, v] : ins.params) {
+                if (!v.empty() && v.front() == '$') {
+                    try {
+                        filter_params[k] = eval.resolve_param_str(v);
+                        continue;
+                    } catch (const std::exception&) {
+                        // Broken expression: keep the literal text so the
+                        // script's own handler decides what to do with it.
+                    }
+                }
+                filter_params[k] = v;
+            }
             oa::runtime::FilterDecision d = oa::runtime::FilterDecision::Missing;
             try {
-                d = it.lua_bridge().run_tag_filter(tag, ins.params);
+                d = it.lua_bridge().run_tag_filter(tag, filter_params);
             } catch (const oa::runtime::LuaError& e) {
                 // research/130: a broken tags.<tag> handler no longer kills the
                 // app; the filter verdict degrades to "not handled by the
@@ -1444,10 +2043,15 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
         }
     }
 
-    if (tag == "calllua") {
+    // `forcedcalllua` is the framework's "run it even mid-transition" flavour
+    // of calllua (iMel lycaution ends its notice with a tween handler of that
+    // name to pop the message layer back). Unknown names were dropped as
+    // CustomEvents, so the notice layer stayed active and every later story
+    // line printed into the bottom notice strip instead of the window.
+    if (tag == "calllua" || tag == "forcedcalllua") {
         const std::string raw = resolve_or_empty("function");
         if (raw.empty()) {
-            throw ScriptError("runtime", "calllua missing function parameter", ins.line);
+            throw ScriptError("runtime", tag + " missing function parameter", ins.line);
         }
         const std::string function = eval.resolve_param_str(raw);
         if (function.empty()) return out; // optional callback -> silent
@@ -1457,7 +2061,7 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
         }
         const auto& hook = it.hooks().call_lua_function;
         if (!hook) {
-            throw ScriptError("lua", "calllua: lua engine not wired", ins.line);
+            throw ScriptError("lua", tag + ": lua engine not wired", ins.line);
         }
         // Non-empty name that resolves to nothing is a silent no-op in the
         // (optional callbacks are pervasive in game Lua).
@@ -1474,8 +2078,28 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
         return out;
     }
     if (tag == "macroadd" || tag == "macrodel") {
-        // Macro registry arrives with the Lua layer; loading bookkeeping
-        // only. File read errors are debug-level.
+        // Macro registry: every label in the file becomes a callable tag
+        // (iMel framework: macroadd button.iet -> [btn]/[btn_on]/...,
+        // macroadd msg.iet -> [chgmsg]/[print] helpers). Invocation happens in
+        // the unknown-tag fallback below.
+        const std::string file = eval.resolve_param_str(resolve_or_empty("file"));
+        if (file.empty()) return out;
+        if (tag == "macrodel") {
+            it.remove_macros_of_file(file);
+            return out;
+        }
+        std::string load_error;
+        if (!it.try_load_script(file, &load_error)) {
+            std::fprintf(stderr, "[macroadd] cannot load %s: %s\n", file.c_str(),
+                         load_error.c_str());
+            return out;
+        }
+        if (const Script* ms = it.get_script(file)) {
+            for (const auto& [label, line] : ms->labels) {
+                (void)line;
+                it.add_macro(label, file);
+            }
+        }
         return out;
     }
 
@@ -1506,7 +2130,10 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
             out.line = size_t(n);
             return out;
         }
-        const std::string label = resolve_or_empty("label");
+        // label may be a $ expression ("$'registration_functionkeys_' + mode"):
+        // the framework builds label names dynamically.
+        const std::string raw_label = resolve_or_empty("label");
+        const std::string label = eval.resolve_param_str(raw_label);
         if (const std::string* cond = ins.get("cond")) {
             const Value v = eval.resolve_param("$" + *cond);
             if (!v.to_bool()) return out;
@@ -1526,7 +2153,7 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
     if (tag == "call") {
         out.kind = TagOutcomeKind::Call;
         out.file = eval.resolve_param_str(resolve_or_empty("file"));
-        out.label = resolve_or_empty("label");
+        out.label = eval.resolve_param_str(resolve_or_empty("label"));
         out.return_line = it.current_line() + 1;
         out.return_script = *it.current_script();
         return out;
@@ -1545,12 +2172,28 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
     }
     if (tag == "wt") {
         WaitReason r;
-        r.kind = WaitReason::Kind::Timed;
-        r.milliseconds =
-            uint64_t(eval.resolve_param(resolve_or_empty("time")).as_int().value_or(0));
-        r.input = eval.resolve_param(resolve_or_empty("input")).as_int().value_or(1);
+        // A BARE [wt] (no time=, no input=) is the plain CLICK wait. It used
+        // to be Timed(0), which resolves on the next tick, so every splash
+        // screen that reads
+        //   [calllua brand_logo][wt]
+        // skipped itself (test2's opening logo / caution page). With any
+        // explicit parameter the timed form stays — and the authored input=
+        // is honoured (0 = not clickable, 2 = skip-mode only), which the
+        // click-wait branch above must not swallow.
+        const std::string wt_time = resolve_or_empty("time");
+        const std::string wt_input = resolve_or_empty("input");
+        if (wt_time.empty() && wt_input.empty()) {
+            r.kind = WaitReason::Kind::Generic;
+            r.id = "wt"; // physical click only (see resolve_wait Generic)
+        } else {
+            r.kind = WaitReason::Kind::Timed;
+            r.milliseconds =
+                uint64_t(eval.resolve_param(wt_time).as_int().value_or(0));
+            r.input = eval.resolve_param(wt_input).as_int().value_or(1);
+        }
         out.kind = TagOutcomeKind::WaitEvent;
         out.event = Event::wait(std::move(r));
+        out.event.tag = tag;
         return out;
     }
     if (tag == "wt0") {
@@ -1605,6 +2248,7 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
         r.kind = WaitReason::Kind::Generic;
         out.kind = TagOutcomeKind::WaitEvent;
         out.event = Event::wait(std::move(r));
+        out.event.tag = tag;
         return out;
     }
     if (tag == "var") {
@@ -1613,8 +2257,29 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
     }
     if (tag == "if" || tag == "elseif") {
         const std::string est = resolve_or_empty("estimate");
-        const Value v = eval.resolve_param(est.empty() ? "1" : est);
-        if (v.to_bool()) return out; // Continue into body
+        // Malformed expressions are data bugs the original runtime logs and
+        // treats as false (Watamari button_s.iet ships
+        // "$(selectdata.(selectdata.pushed).notrans == 0" with no closing
+        // paren). Aborting the tick killed the whole app mid-story.
+        //
+        // A MISSING estimate is false too: the original evaluates nil, and the
+        // scripts rely on it — Watamari's sysbtn.iet writes
+        // `[if estiamte = "$t.sceneskip"]` (seven rows, parameter name typo);
+        // treating the empty condition as TRUE ran the `[return]` inside and
+        // killed sysbtn_set/hide, so the skip/menu buttons at the bottom-right
+        // of the story page never appeared.
+        bool cond = false;
+        if (est.empty()) {
+            std::fprintf(stderr, "[expr] %s without estimate -> false\n", tag.c_str());
+        } else {
+            try {
+                cond = eval.resolve_param(est).to_bool();
+            } catch (const ExpressionError& e) {
+                std::fprintf(stderr, "[expr] %s estimate -> false: %s\n", tag.c_str(),
+                             e.what());
+            }
+        }
+        if (cond) return out; // Continue into body
         // ASB 编译形态(mkmh 等新作):if/elseif 带 index=N —— 条件为假时
         // 直接跳到本脚本第 N 条指令(decode 后 N == 指令序号),无需结构扫描。
         if (const std::string* ip = ins.get("index")) {
@@ -1646,8 +2311,13 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
     }
     if (tag == "loop") {
         const std::string est = resolve_or_empty("estimate");
-        const Value v = eval.resolve_param(est.empty() ? "1" : est);
-        if (v.to_bool()) return out;
+        bool cond = false;
+        try {
+            cond = eval.resolve_param(est.empty() ? "1" : est).to_bool();
+        } catch (const ExpressionError& e) {
+            std::fprintf(stderr, "[expr] loop estimate -> false: %s\n", e.what());
+        }
+        if (cond) return out;
         if (const std::string* ip = ins.get("index")) {
             char* end = nullptr;
             const long long n = std::strtoll(ip->c_str(), &end, 10);
@@ -1697,18 +2367,45 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
     }
     // ---- M5b: native tag events (string-preserving passthrough) ----
     {
+        // Scene/UI tags are expression-capable in EVERY parameter, not just
+        // id: the framework writes [lyc2 file="$t.imgpath + 'bg_config'"],
+        // [lyprop top="$t.lydialog.fontheight / 2 * (-1)"],
+        // [lytween time="$t.lydialog.fadeintime"] and
+        // [chgmsg id="$t.lydialog.id + '.50'"]. Passing the raw "$..."
+        // strings through left config-page images unresolved (missing rows),
+        // the dialog message layer bound to a literal "$t.lydialog.id + '.50'"
+        // node (no geometry -> no text inside the box), and tweens timed on
+        // unparsable values. Resolve once here; values without the `$` marker
+        // are passed through untouched, and a broken expression keeps its
+        // literal text (the engine's original dispatch logs and continues).
+        auto resolve_params = [&](const std::map<std::string, std::string>& raw) {
+            std::map<std::string, std::string> resolved;
+            for (const auto& [k, v] : raw) {
+                if (!v.empty() && v.front() == '$') {
+                    try {
+                        resolved[k] = eval.resolve_param_str(v);
+                        continue;
+                    } catch (const std::exception&) {
+                        // keep the literal text
+                    }
+                }
+                resolved[k] = v;
+            }
+            return resolved;
+        };
         auto set_event = [&](Event::Kind k) {
             out.kind = TagOutcomeKind::WaitEvent;
             out.event.kind = k;
             out.event.tag = tag;
-            out.event.params = ins.params;
-            out.event.id = ins.get_or("id", "");
+            out.event.params = resolve_params(ins.params);
+            const auto idit = out.event.params.find("id");
+            out.event.id = idit == out.event.params.end() ? std::string() : idit->second;
         };
         auto set_line = [&](Event::Kind k, const std::string& content) {
             out.kind = TagOutcomeKind::WaitEvent;
             out.event.kind = k;
             out.event.tag = tag;
-            out.event.params = ins.params;
+            out.event.params = resolve_params(ins.params);
             out.event.content = content;
         };
         if (tag == "lyc" || tag == "lyc2") {
@@ -1741,7 +2438,16 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
             return out;
         }
         if (tag == "print") {
-            set_line(Event::Kind::ScenarioLine, resolve_or_empty("data"));
+            const std::string raw = resolve_or_empty("data");
+            std::string text = raw;
+            if (!raw.empty() && raw.front() == '$') {
+                try {
+                    text = eval.resolve_param_str(raw);
+                } catch (const std::exception&) {
+                    text = raw;
+                }
+            }
+            set_line(Event::Kind::ScenarioLine, text);
             return out;
         }
         if (tag == "rt") {
@@ -1758,6 +2464,63 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
         }
         if (tag == "/chgmsg" || tag == "chgmsg_close") {
             set_event(Event::Kind::MessageLayerPop);
+            return out;
+        }
+        // [execcsv exec="font" csv=".../<font sheet>"] — the framework's way
+        // to apply a whole font row from a csv (per-character name geometry
+        // lives there: tag_font_name_<char>.csv). Unknown tags were dropped, so
+        // every character's name kept the base row's box — the name then sits
+        // wherever THAT box is while the window art (and its name banner)
+        // follows the character, i.e. "换个角色名字就偏".
+        if (tag == "execcsv") {
+            const std::string exec = resolve_or_empty("exec");
+            const std::string csv_raw = resolve_or_empty("csv");
+            const std::string csv =
+                csv_raw.empty() ? std::string() : eval.resolve_param_str(csv_raw);
+            if (exec != "font" || csv.empty()) return out;
+            std::map<std::string, std::string> sheet;
+            if (it.hooks().resource_read) {
+                std::optional<std::vector<uint8_t>> bytes =
+                    it.hooks().resource_read(it.resolve_magic_path(csv));
+                if (!bytes && csv[0] != ':' && csv.rfind("_data/", 0) != 0)
+                    bytes = it.hooks().resource_read("_data/" + csv);
+                if (bytes) {
+                    const std::string text(reinterpret_cast<const char*>(bytes->data()),
+                                           bytes->size());
+                    size_t pos = 0;
+                    while (pos <= text.size()) {
+                        size_t nl = text.find_first_of("\r\n", pos);
+                        if (nl == std::string::npos) nl = text.size();
+                        std::string line = text.substr(pos, nl - pos);
+                        pos = nl + 1;
+                        if (const size_t cm = line.find("//"); cm != std::string::npos)
+                            line.resize(cm);
+                        const size_t eq = line.find('=');
+                        if (eq == std::string::npos) continue;
+                        auto trim = [](std::string v) {
+                            while (!v.empty() && (v.front() == ' ' || v.front() == '\t'))
+                                v.erase(0, 1);
+                            while (!v.empty() && (v.back() == ' ' || v.back() == '\t'))
+                                v.pop_back();
+                            return v;
+                        };
+                        std::string key = trim(line.substr(0, eq));
+                        std::string val = trim(line.substr(eq + 1));
+                        if (!key.empty() && !val.empty()) sheet[key] = val;
+                    }
+                }
+            }
+            // Tag-level parameters (height/align overrides written as $expr)
+            // win over the sheet, exactly like the framework's own merge.
+            for (const auto& [k, v] : ins.params) {
+                if (k == "exec" || k == "csv") continue;
+                sheet[k] = eval.resolve_param(v).to_string();
+            }
+            if (sheet.empty()) return out;
+            if (!sheet.count("stack")) sheet["stack"] = "0";
+            set_event(Event::Kind::TextConfig);
+            out.event.tag = "font";
+            out.event.params = std::move(sheet);
             return out;
         }
         if (tag == "font" || tag == "font_close" || tag == "/font" ||
@@ -1843,15 +2606,110 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
         return out;
     }
 
+    // Macro invocation: an unhandled tag registered by [macroadd file=...] is
+    // a [call file=F label=tag]. The tag's parameters become plain variables
+    // for the duration of the macro (the framework body reads $file / $id /
+    // e:var("top")), and the previous values are restored on [return].
+    if (const auto mi = it.macros().find(tag); mi != it.macros().end()) {
+        const Script* macro_script = it.get_script(mi->second);
+        const auto macro_line =
+            macro_script ? macro_script->get_label_line(tag) : std::nullopt;
+        if (macro_script && macro_line) {
+            Interpreter::MacroParamSave save;
+            save.depth = it.call_stack().size() + 1;
+            for (const auto& [k, v] : ins.params) {
+                if (k == "1") continue;
+                save.provided.insert(k);
+                std::string value = v;
+                try {
+                    value = eval.resolve_param_str(v);
+                } catch (const std::exception&) {
+                    // keep the literal text
+                }
+                save.saved.emplace(k, vars.get(k));
+                vars.set(k, Value::make_string(value));
+            }
+            it.push_macro_param_save(std::move(save));
+            out.kind = TagOutcomeKind::Call;
+            out.file = mi->second;
+            out.label = tag;
+            out.return_line = it.current_line() + (apply_filter ? 1 : 0);
+            out.return_script = *it.current_script();
+            return out;
+        }
+    }
+
     // Unknown tag -> Event::Custom (fallback).
     out.kind = TagOutcomeKind::CustomEvent;
     out.event = Event::custom(tag, ins.params);
     return out;
 }
 
+bool Interpreter::run_tag_now(const std::string& tag,
+                              std::map<std::string, std::string> params) {
+    // Presentation-only whitelist. `e:tag` in Artemis runs the tag immediately;
+    // `e:enqueueTag` defers. Both used to push onto the same FIFO, so a macro's
+    // freshly built layers were applied AFTER tags the caller had queued
+    // earlier (slider_h's rebuild ran after the CSV [lyprop id="100.101"
+    // left=...] and reset the slider to the origin).
+    static const std::set<std::string> kNow = {
+        "lyc", "lyc2", "lydel", "lyprop", "lycolor", "lyevent",
+        "lytween", "lytweendel", "tweenset", "/tweenset",
+        "font", "fontinit", "fontdefault", "font_close", "/font",
+        "ruby", "/ruby", "print", "rt", "rp",
+        "chgmsg", "/chgmsg", "chgmsg_close",
+        "flip", "lyshader", "tximg",
+    };
+    if (!hooks_.immediate_tags) return false;
+    if (!kNow.count(tag)) return false;
+    if (immediate_tag_depth_ >= 8) return false; // re-entrancy guard
+    Instruction ins;
+    ins.tag = tag;
+    ins.params = std::move(params);
+    ins.line = current_line_;
+    if (current_script_name_) ins.origin_script = *current_script_name_;
+    ++immediate_tag_depth_;
+    TagOutcome outcome;
+    try {
+        outcome = execute_tag(*this, ins, false);
+    } catch (const std::exception& e) {
+        --immediate_tag_depth_;
+        std::fprintf(stderr, "[tag-now] %s failed: %s\n", tag.c_str(), e.what());
+        return true; // consumed (error logged), keep the Lua flow alive
+    }
+    --immediate_tag_depth_;
+    switch (outcome.kind) {
+        case TagOutcomeKind::Continue:
+            return true;
+        case TagOutcomeKind::WaitEvent:
+        case TagOutcomeKind::CustomEvent:
+            if (callback_) (void)callback_(outcome.event);
+            return true;
+        default:
+            // Redirecting outcomes (jump/call/return/wait) must be owned by
+            // the main loop; let the caller queue the tag.
+            return false;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Run loop (interpreter main step loop)
 // ---------------------------------------------------------------------------
+
+bool Interpreter::dispatch_text_row_to_print_filter(const std::string& text) {
+    if (!lua_bridge_->has_tag_filters()) return false;
+    std::map<std::string, std::string> params{{"data", text}};
+    oa::runtime::FilterDecision d = oa::runtime::FilterDecision::Missing;
+    try {
+        d = lua_bridge().run_tag_filter("print", params);
+    } catch (const oa::runtime::LuaError& e) {
+        // A broken tags.print handler must not kill the row: log and fall back
+        // to the engine's own text path (research/130 policy).
+        lua_bridge().report_dispatch_error("tag filter", "print", e.what());
+        return false;
+    }
+    return d == oa::runtime::FilterDecision::Consume;
+}
 
 ExecutionResult Interpreter::run() {
     for (;;) {
@@ -1883,13 +2741,31 @@ ExecutionResult Interpreter::run() {
         // Scenario story text.
         if (ins.kind == Instruction::Kind::Text) {
             const std::string text = ins.get_or("text", "");
+            // A scenario text row is `[print data="<row>"]` as far as the
+            // SCRIPT side is concerned: Artemis hands it to the registered
+            // tagFilters.print, which is where the iMel multi-language layer
+            // lives. Watamari wraps every line in [lang ja|cn|en]…[/lang]; the
+            // lang filter only records printlang.target and the print filter
+            // picks the text of the active language and re-issues
+            // e:tag{"print", data=…} (which runs natively and emits the
+            // ScenarioLine). Emitting an engine-private ScenarioText event
+            // here instead bypassed that filter entirely — the text never
+            // reached the message layer and the story opened with a blank
+            // message window.
+            if (dispatch_text_row_to_print_filter(text)) {
+                ++current_line_;
+                continue;
+            }
             const Event event = Event::scenario_text(text);
             const CallbackResult cr = callback_(event);
             if (cr == CallbackResult::Continue) {
                 ++current_line_;
                 continue;
             }
-            if (cr == CallbackResult::Pause) return ExecutionResult::Wait;
+            if (cr == CallbackResult::Pause) {
+                parked_ = true;
+                return ExecutionResult::Wait;
+            }
             throw ScriptError("aborted", "callback aborted", ins.line);
         }
 
@@ -1983,14 +2859,25 @@ ExecutionResult Interpreter::run() {
                 continue;
             }
             case TagOutcomeKind::Return: {
+                if (return_floor_ != 0 && call_stack_.size() <= return_floor_) {
+                    // A macro's return burst must not unwind the real caller
+                    // chain (see set_return_floor): drop the extra [return]s.
+                    continue;
+                }
                 if (!call_stack_.empty()) {
                     const std::string origin_script =
                         current_script_name_ ? *current_script_name_ : "";
                     const size_t origin_line = current_line_;
                     const CallFrame frame = call_stack_.back();
                     call_stack_.pop_back();
+                    restore_macro_params(call_stack_.size() + 1);
                     current_script_name_ = frame.script;
                     current_line_ = frame.return_line;
+                    if (std::getenv("OA_TAGTRACE")) {
+                        std::fprintf(stderr, "[ret] -> %s:%zu (depth %zu)\n",
+                                     frame.script.c_str(), frame.return_line,
+                                     call_stack_.size());
+                    }
                     // resurrection probe: a [return]
                     // landing on the game's select-[stop] area
                     // (system/script.asb line <= 1) re-parks a consumed
@@ -2017,6 +2904,13 @@ ExecutionResult Interpreter::run() {
                     }
                     continue;
                 }
+                // [return] with an empty stack ENDS the script (the pre-fix
+                // semantics). Treating it as "skip this row and continue"
+                // fell through into the NEXT label block — FPM's title
+                // ui.asb keeps `*exskip` (adv_exskipstart -> e:debugSkip) right
+                // after `*title`'s [return], so a single title click started
+                // the engine fast-forward and the story jumped 共通-05 ->
+                // 09 -> 12 in three frames without ever showing a page.
                 return ExecutionResult::Completed;
             }
             case TagOutcomeKind::WaitEvent:
@@ -2032,6 +2926,7 @@ ExecutionResult Interpreter::run() {
                     // wait machine reads last_wait_event_ to classify the
                     // pause (Wait_ vs Trans vs media).
                     last_wait_event_ = outcome.event;
+                    parked_ = true;
                     return ExecutionResult::Wait;
                 }
                 throw ScriptError("aborted", "callback aborted", ins.line);
@@ -2180,6 +3075,13 @@ oa::runtime::LuaHost Interpreter::build_lua_host() {
         if (!hooks_.file_loader) return false;
         return hooks_.file_loader(resolved).has_value();
     };
+    host.save_root = [this]() -> std::string {
+        return hooks_.save_root ? hooks_.save_root() : std::string();
+    };
+    host.run_tag_now = [this](const std::string& tag,
+                              std::map<std::string, std::string> params) {
+        return run_tag_now(tag, std::move(params));
+    };
     host.get_var = [this](const std::string& name) { return lookup_var_ptr(name); };
     host.set_var = [this](const std::string& name, oa::runtime::Value v) {
         variables_.set(name, std::move(v));
@@ -2199,6 +3101,7 @@ oa::runtime::LuaHost Interpreter::build_lua_host() {
         ins.tag = std::move(tag);
         ins.params = std::move(params);
         ins.line = 0;
+        if (current_script_name_) ins.origin_script = *current_script_name_;
         tag_queue_.push_back(std::move(ins));
     };
     // Lua-originated e:tag{"calllua",...} runs synchronously,
@@ -2261,6 +3164,18 @@ oa::runtime::LuaHost Interpreter::build_lua_host() {
         // No runtime behind (unit tests): project the interpreter clock.
         const uint64_t fps = config_.fps > 0 ? uint64_t(config_.fps) : 60;
         return now_ms() * fps / 1000;
+    };
+    host.script_block = [this](const std::string& file, size_t index) {
+        return script_block(file, index);
+    };
+    host.script_stack = [this] {
+        std::vector<std::pair<std::string, size_t>> out;
+        out.reserve(call_stack_.size() + 1);
+        for (const auto& frame : call_stack_) {
+            out.emplace_back(frame.script, frame.return_line);
+        }
+        if (current_script_name_) out.emplace_back(*current_script_name_, current_line_);
+        return out;
     };
     host.get_wait_reason = [this] { return wait_reason_info_; };
     host.now_ms = [this] { return now_ms(); };
@@ -2374,15 +3289,39 @@ bool Interpreter::apply_var(const std::map<std::string, std::string>& params) {
         return it == params.end() ? "" : it->second;
     };
     const ExpressionEvaluator eval(variables_);
+    // [var name="$expr" ...] builds the target variable name dynamically
+    // (framework: [var name="$t.lydialog.varname" data="1"] answers a dialog by
+    // writing t.yesno). An unresolved name wrote a literal "$..." variable and
+    // the caller's `[if estimate="$t.yesno"]` never saw the answer.
+    auto resolved_name = [&](const std::string& raw) -> std::string {
+        if (!raw.empty() && raw.front() == '$') {
+            try {
+                return eval.resolve_param_str(raw);
+            } catch (const std::exception&) {
+                return raw;
+            }
+        }
+        return raw;
+    };
+
+    if (get("writelocal") == "1") {
+        const std::string written = resolved_name(get("name"));
+        if (!written.empty()) note_local_write(written);
+    }
 
     const auto sys = params.find("system");
     if (sys == params.end()) {
         // simple form: [var name=".." data=".."]
-        variables_.set(get("name"), eval.resolve_param(get("data")));
+        try {
+            variables_.set(resolved_name(get("name")), eval.resolve_param(get("data")));
+        } catch (const ExpressionError& e) {
+            std::fprintf(stderr, "[expr] var data -> empty: %s\n", e.what());
+            variables_.set(resolved_name(get("name")), Value::make_string(""));
+        }
         return true;
     }
     const std::string& system = sys->second;
-    const std::string name = get("name");
+    const std::string name = resolved_name(get("name"));
     if (system == "os") {
         const std::string os =
             variables_.platform.empty() ? "unknown" : variables_.platform;
@@ -2421,7 +3360,7 @@ bool Interpreter::apply_var(const std::map<std::string, std::string>& params) {
         const std::string target = get("target");
         bool exists = false;
         if (get("local") == "1") {
-            exists = variables_.local.count(target) > 0;
+            exists = local_var_declared(target);
         } else {
             exists = variables_.get(target).has_value();
         }
@@ -2455,6 +3394,45 @@ bool Interpreter::apply_var(const std::map<std::string, std::string>& params) {
             variables_.set(name, Value::make_int((long long)count));
         } else {
             variables_.set(name, Value::make_int((long long)src.size()));
+        }
+        return true;
+    }
+    if (system == "explode") {
+        // [var name=N system=explode source=S delimiter=D] ->
+        //   N.size = count, N.0..N.n-1 = pieces.
+        // delimiter is a literal string (default ","); string_char_delimiter
+        // is a numeric char code used by the framework's packed tag strings
+        // (28/29 = FS/GS). `writelocal` needs no special handling: the store
+        // routes by name prefix ("t." -> temp etc.), which is what the
+        // framework's localNames rely on.
+        const std::string src = eval.resolve_param_str(get("source"));
+        std::string delim = get("delimiter");
+        if (delim.empty()) {
+            const std::string code = get("string_char_delimiter");
+            if (!code.empty()) {
+                char* end = nullptr;
+                const long c = std::strtol(code.c_str(), &end, 10);
+                if (end != code.c_str() && c > 0 && c < 256) {
+                    delim.assign(1, static_cast<char>(c));
+                }
+            }
+        }
+        if (delim.empty()) delim = ",";
+        std::vector<std::string> parts;
+        size_t pos = 0;
+        for (;;) {
+            const size_t hit = src.find(delim, pos);
+            if (hit == std::string::npos) {
+                parts.push_back(src.substr(pos));
+                break;
+            }
+            parts.push_back(src.substr(pos, hit - pos));
+            pos = hit + delim.size();
+        }
+        variables_.set(name + ".size", Value::make_int((long long)parts.size()));
+        for (size_t i = 0; i < parts.size(); ++i) {
+            variables_.set(name + "." + std::to_string(i),
+                           Value::make_string(parts[i]));
         }
         return true;
     }
@@ -2675,6 +3653,24 @@ bool Interpreter::apply_var(const std::map<std::string, std::string>& params) {
 // ---------------------------------------------------------------------------
 
 std::optional<ExecutionResult> Interpreter::flush_tag_queue() {
+    // A queued [call] suspended the drain: the callee must run (and return)
+    // before the caller's remaining queued tags may execute — those tags were
+    // enqueued in the caller's context and their labels resolve there.
+    if (queue_hold_depth_ != 0) {
+        // The hold protects a queued [call]: the tags behind it belong to the
+        // caller and must wait until the callee RETURNS. A callee that parks
+        // ([stop] on the title screen, [wait]) has yielded to the host, so the
+        // queue is no longer "the callee's continuation" — it is the next
+        // interaction batch (title click -> sestop/jump). Keeping the hold
+        // there stranded every later click in the queue: test13's title
+        // buttons deleted the UI and then did nothing, forever.
+        if (parked_ || call_stack_.size() < queue_hold_depth_) {
+            queue_hold_depth_ = 0;
+        } else {
+            return std::nullopt;
+        }
+    }
+    parked_ = false;
     while (!tag_queue_.empty()) {
         Instruction ins = std::move(tag_queue_.front());
         tag_queue_.erase(tag_queue_.begin());
@@ -2690,6 +3686,19 @@ std::optional<ExecutionResult> Interpreter::flush_tag_queue() {
                          lf ? lf->c_str() : "-", ff ? ff->c_str() : "-",
                          current_script_name_->c_str(), current_line_,
                          tag_queue_.size());
+        }
+        // A queued jump/call carrying only a label belongs to the script that
+        // issued it (origin_script), not to wherever the drain has moved after
+        // the surrounding [return] burst — macro.iet's returnjump queues
+        // [jump label=lydialog_exec] from inside lyldialog.iet, and resolving
+        // it against the caller (config.iet) aborted with "label not found".
+        if ((ins.tag == "jump" || ins.tag == "goto" || ins.tag == "call") &&
+            !ins.get("file") && !ins.get("index") && !ins.origin_script.empty() &&
+            ins.get("label")) {
+            const Script* origin = get_script(ins.origin_script);
+            if (origin && origin->get_label_line(*ins.get("label"))) {
+                ins.params["file"] = ins.origin_script;
+            }
         }
         const TagOutcome outcome = execute_tag(*this, ins, false);
         switch (outcome.kind) {
@@ -2753,17 +3762,36 @@ std::optional<ExecutionResult> Interpreter::flush_tag_queue() {
                 current_script_name_ = target;
                 current_line_ = *line;
                 arrived_by_jump_ = true;
+                // Hold the rest of the queue until this callee returns (see
+                // queue_hold_depth_): queued tags behind a queued [call] were
+                // enqueued by the caller and must resolve in the caller's
+                // script, not in the callee we just entered.
+                if (hooks_.queue_call_hold) {
+                    queue_hold_depth_ = call_stack_.size();
+                    return std::nullopt;
+                }
                 continue;
             }
             case TagOutcomeKind::Return: {
+                if (return_floor_ != 0 && call_stack_.size() <= return_floor_) {
+                    // A macro's return burst must not unwind the real caller
+                    // chain (see set_return_floor): drop the extra [return]s.
+                    continue;
+                }
                 if (!call_stack_.empty()) {
                     const std::string origin_script =
                         current_script_name_ ? *current_script_name_ : "";
                     const size_t origin_line = current_line_;
                     const CallFrame frame = call_stack_.back();
                     call_stack_.pop_back();
+                    restore_macro_params(call_stack_.size() + 1);
                     current_script_name_ = frame.script;
                     current_line_ = frame.return_line;
+                    if (std::getenv("OA_TAGTRACE")) {
+                        std::fprintf(stderr, "[ret] -> %s:%zu (depth %zu)\n",
+                                     frame.script.c_str(), frame.return_line,
+                                     call_stack_.size());
+                    }
                     // resurrection probe: a [return]
                     // landing on the game's select-[stop] area
                     // (system/script.asb line <= 1) re-parks a consumed
@@ -2786,6 +3814,13 @@ std::optional<ExecutionResult> Interpreter::flush_tag_queue() {
                     }
                     continue;
                 }
+                // A queued [return] with an empty stack ENDS the script.
+                // Skipping it and draining on made the interpreter walk past
+                // the label block into whatever follows: FPM's title ui.asb
+                // lays `*title`(-> [return]) directly above `*exskip`, so the
+                // fall-through reached adv_exskipstart and the story
+                // fast-forwarded through whole chapters (test2's
+                // "P3-0b story body reached" / 05->09->12 in three frames).
                 return ExecutionResult::Completed;
             }
             case TagOutcomeKind::WaitEvent:
@@ -2796,12 +3831,16 @@ std::optional<ExecutionResult> Interpreter::flush_tag_queue() {
                     last_wait_from_queue_ = true;
                     note_wait_reason(outcome.event);
                     last_wait_event_ = outcome.event;
+                    parked_ = true;
                     return ExecutionResult::Wait;
                 }
                 throw ScriptError("aborted", "callback aborted", 0);
             }
         }
     }
+    // The click's queued tags (handler nav + the macro's return burst) are
+    // fully drained: release the caller-chain guard.
+    return_floor_ = 0;
     return std::nullopt;
 }
 
@@ -2819,7 +3858,7 @@ namespace {
 bool is_var_barrier_stop_tag(const std::string& tag) {
     static const char* kStop[] = {
         "wait",    "call",    "jump",    "return",  "calllua",
-        "exlabel", "label",
+        "forcedcalllua", "exlabel", "label",
         "macroadd","exkey",   "estag",   "/if",     "loop",
         "/loop",   "exit",    "gotitle", "yesno",
     };
@@ -2875,11 +3914,15 @@ void Interpreter::flush_pending_text_tags() {
             case TagOutcomeKind::Call:
             case TagOutcomeKind::Return:
                 // Stream redirected: the var behind it would not have been
-                // reached — leave the rest to the normal drain.
+                // reached. Put the row BACK and stop here — the normal drain
+                // owns jumps/calls (a queued macro call must push its frame
+                // and run its body; executing it here and walking away
+                // silently dropped slider_h for every slider but the first).
                 if (std::getenv("OA_DEBUG_VAR"))
                     std::fprintf(stderr,
                                  "[var] barrier redirect at '%s' remains=%zu\n",
                                  ins.tag.c_str(), tag_queue_.size() - i);
+                tag_queue_.insert(tag_queue_.begin(), std::move(ins));
                 i = tag_queue_.size();
                 break;
             case TagOutcomeKind::WaitEvent:

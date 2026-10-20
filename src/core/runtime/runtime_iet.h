@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <set>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -155,6 +156,14 @@ public:
     /// resolve_param_str: same but never coerces numeric-looking strings to
     /// numbers (keeps "1.80" as "1.80").
     std::string resolve_param_str(const std::string& value) const;
+    /// `$$<expr>` indirect reference: evaluate <expr> to a variable NAME, then
+    /// read that variable. The framework builds names dynamically
+    /// ($$'g.movie_read_' + file, $$('pos_' + pos)) and also embeds the form
+    /// inside larger expressions ([if estimate="$$flag != 0"]).
+    Value resolve_indirect(std::string_view name_expr) const;
+    /// Rewrite every embedded `$$<operand>` in an expression into the value it
+    /// references (string values are quoted so they stay one token).
+    std::string expand_indirect(std::string_view expr) const;
 
 private:
     const VariableStore* vars_;
@@ -180,12 +189,24 @@ struct Instruction {
         Tag,      // a "[tag ...]" row; `tag` holds its script tag name
         Text,     // parser-synthesized story text (params["text"])
         LuaBlock, // parser-synthesized "[lua] ... [/lua]" block (params["code"])
+        /// A [&linetag] row: `params["text"]` holds "tag p0,p1,...". The
+        /// parameter COLUMN order lives in the project's tag.ini, which the
+        /// parser cannot see, so the row is expanded at execution time
+        /// (Interpreter::line_tag_params).
+        LineTag,
     };
 
     Kind kind = Kind::Tag;
     std::string tag; // valid when kind == Kind::Tag; empty otherwise
     std::map<std::string, std::string> params; // insertion-independent (last wins)
     size_t line = 0;
+    /// Script that was executing when this row was ENQUEUED from Lua
+    /// (e:tag / e:enqueueTag). The framework queues `[jump label=...]` rows
+    /// from inside a macro/filter and expects them to resolve in the script
+    /// that issued them, not in whatever script the queue drain has moved to
+    /// after the surrounding [return] burst (macro.iet's returnjump /
+    /// button.iet's target dispatch). Empty for rows read from a script.
+    std::string origin_script;
 
     const std::string* get(std::string_view key) const {
         const auto it = params.find(std::string(key));
@@ -365,6 +386,32 @@ struct CallFrame {
 
 // Host-side capability hooks (filled by the engine runtime and its Lua layer).
 struct InterpreterHooks {
+    /// Framework flavour switch for e:tag ordering: when true (default) the
+    /// presentation tags listed in run_tag_now's whitelist execute in place;
+    /// when false they are appended to the tag queue in program order.
+    /// The FPM family (system/script.asb + estag) needs the queued order: its
+    /// [trans] captures the CURRENT frame as the fade source, so applying the
+    /// next step's [lyc] in place paints over the image the transition is
+    /// about to fade from (test2's splash went blank).
+    bool immediate_tags = true;
+    /// Queued-[call] hold (see Interpreter::queue_hold_depth_). When true, a
+    /// queued [call] suspends the drain until that callee returns, so the
+    /// tags the caller queued BEHIND it resolve in the caller's script
+    /// (Eustia/August boot: e:enqueueTag{"call", file="system/msg.iet"} then
+    /// e:enqueueTag{"jump", label="game_start"} — draining the jump inside
+    /// msg.iet aborted with "label not found: game_start").
+    ///
+    /// The FPM family (system/script.asb + estag drivers) needs the opposite.
+    /// Its `[call file=system/script.asb label=estagNN]` targets are
+    /// FALL-THROUGH label chains: each estag_call enqueues one real UI tag
+    /// (lyc / lyprop / print / chmsg …), so holding them stacks the whole
+    /// entrance and releases it as one burst — the title never settles
+    /// ("title parked and stationary" fails) and the 次の選択肢 fast-forward
+    /// loses its ordering (nsel_jump: opts=0, chapter unchanged). FPM keeps
+    /// draining through the callee (HEAD behaviour) and relies on
+    /// Instruction::origin_script to resolve a queued bare-label jump in the
+    /// script that issued it.
+    bool queue_call_hold = true;
     /// Execute a [lua] block (called at script load; fallback when stepped over).
     std::function<void(const std::string& code, const std::string& script_name, size_t line)>
         run_lua_block;
@@ -416,6 +463,13 @@ struct InterpreterHooks {
         resource_read;
     /// Save-area existence (e:var file_exists save=1). Absent => false.
     std::function<bool(const std::string& file)> save_file_exists;
+    /// Absolute save-area root. Backs the Lua `io.open` redirect: the iMel
+    /// framework persists its own system/global data with relative paths
+    /// ("savedata/system.dat"), and on the original engine those resolve into
+    /// the save directory. Stock Lua io.open would hit the process CWD
+    /// instead, so syssave() failed with a nil file handle and every boot
+    /// re-ran config_default (and the language screen). Empty = no redirect.
+    std::function<std::string()> save_root;
     /// Save-area modification time (e:var file_update_time).
     /// Absent => noexist default.
     std::function<std::optional<std::array<int64_t, 6>>(const std::string& file)>
@@ -467,12 +521,19 @@ public:
     /// 只把原因写进 `error`（不抛）。语义上等价于 restore_position 的第一步，
     /// 使"读档失败"能在任何清场之前判定（原子失败）。
     bool try_load_script(const std::string& file, std::string* error);
+    /// tag.ini column names for one [&linetag] command (loaded lazily from
+    /// the project's tag.ini). Empty when the file or the section is absent,
+    /// in which case the row's columns stay positional ("1", "2", ...).
+    const std::vector<std::string>& line_tag_params(const std::string& tag);
     /// Rewrite ONLY the call stack, leaving the current position and the
     /// queue-wait/arrival flags untouched (inline-event settle uses this
     /// to drop the synthetic marker frame — restore_position would clear
     /// last_wait_from_queue_, making a later next_line skip the parked
     /// wait's [return] row).
     void set_call_stack(std::vector<CallFrame> stack) {
+        if (queue_hold_depth_ != 0 && stack.size() < queue_hold_depth_) {
+            queue_hold_depth_ = 0; // held callee frame removed outside the run loop
+        }
         call_stack_ = std::move(stack);
     }
     /// Temporarily detach / re-queue pending engine tags (used by the save
@@ -489,6 +550,45 @@ public:
     void enqueue_tag(std::string tag, std::map<std::string, std::string> params);
     /// Whether the tag queue holds pending tags.
     bool has_queued_tags() const { return !tag_queue_.empty(); }
+    /// Macro registry: [macroadd file=F] registers every label of F as a
+    /// callable tag (`[btn ...]` -> `[call file=F label=btn]`), the iMel
+    /// framework's whole UI layer (button.iet/msg.iet/chara_*.iet).
+    const std::map<std::string, std::string>& macros() const { return macros_; }
+    void add_macro(const std::string& label, const std::string& file) {
+        macros_[label] = file;
+    }
+    void remove_macros_of_file(const std::string& file) {
+        for (auto it = macros_.begin(); it != macros_.end();) {
+            if (it->second == file) it = macros_.erase(it);
+            else ++it;
+        }
+    }
+    /// Macro parameter scope snapshot (see macro_param_saves_).
+    struct MacroParamSave {
+        size_t depth = 0;
+        std::map<std::string, std::optional<Value>> saved;
+        /// Parameter names THIS call supplied. Artemis gives every macro call
+        /// its own local frame: an outer call's parameter must not look like a
+        /// local variable inside a nested macro that did not pass it
+        /// ([set_functionkeys] with no mode used to see an enclosing
+        /// selectbtn's mode=1 and jump to registration_functionkeys_1).
+        std::set<std::string> provided;
+        /// Names written with writelocal=1 while this frame was active
+        /// (frame-local temporaries the script itself declares).
+        std::set<std::string> written;
+    };
+    void push_macro_param_save(MacroParamSave save) {
+        macro_param_saves_.push_back(std::move(save));
+    }
+    /// Undo the parameter variables of the macro frame that just returned
+    /// (depth = call stack depth BEFORE the pop).
+    void restore_macro_params(size_t depth);
+    /// `[var system=var_exist local=1]`: is `name` local to the CURRENT macro
+    /// frame (parameter or writelocal declaration)? Outer frames' parameters
+    /// and stale leftovers of returned frames do not count.
+    bool local_var_declared(const std::string& name) const;
+    /// Remember a writelocal=1 write in the innermost macro frame.
+    void note_local_write(const std::string& name);
     /// First `n` queued tags in FIFO order (diagnostics only).
     std::vector<Instruction> peek_tag_queue(size_t n) const {
         std::vector<Instruction> out;
@@ -507,6 +607,16 @@ public:
     /// that kind; consumed by the runtime's inline-event-frame settle after
     /// each drain round.
     bool queued_saw_call() const { return queued_saw_call_; }
+    /// Click-handler return floor: while the queued tags of one pointer click
+    /// drain, [return]s may not pop below this depth. The iMel button macro
+    /// emits an explicit return burst computed from e:getScriptStack() (its
+    /// block-stack view); this engine's real frames are the click origin and
+    /// below, so an unguarded burst unwound first.iet/config.iet and left the
+    /// handler running at depth 0 (test10 language change -> system/0.iet).
+    /// 0 = no guard. Cleared once the click's queued tags are drained.
+    void set_return_floor(size_t depth) { return_floor_ = depth; }
+    size_t return_floor() const { return return_floor_; }
+    void clear_return_floor() { return_floor_ = 0; }
     bool queued_saw_jump() const { return queued_saw_jump_; }
 
     // -- state ---------------------------------------------------------------
@@ -525,6 +635,25 @@ public:
     bool apply_var(const std::map<std::string, std::string>& params);
     /// Fire a registered event handler (e.g. onEnterFrame -> Lua vsync).
     bool fire_event(const std::string& event_name);
+    /// `e:tag{...}` from Lua executes the tag NOW (Artemis semantics), unlike
+    /// `e:enqueueTag` which defers. Only presentation tags are accepted here;
+    /// control-flow outcomes return false so the caller can queue the tag and
+    /// let the main loop own the redirect. Re-entrant (an [lyc] filter
+    /// re-issuing [lyc]) up to a bounded depth, then falls back to the queue.
+    bool run_tag_now(const std::string& tag, std::map<std::string, std::string> params);
+
+    /// A scenario text row is `[print data="<row>"]` to the framework side:
+    /// hand it to the registered tagFilters.print (the iMel multi-language
+    /// layer lives there — it picks the text of the active [lang xx] block and
+    /// re-issues e:tag{"print", data=…}). Returns true when the filter took
+    /// ownership (the row must not be emitted as an engine text event).
+    bool dispatch_text_row_to_print_filter(const std::string& text);
+
+    /// e:getScriptBlock backing: tag row at script : instruction index
+    /// (command = tag name, parameter = raw params). nullopt when the script
+    /// is unknown or the index is out of range.
+    std::optional<std::pair<std::string, std::map<std::string, std::string>>>
+    script_block(const std::string& file, size_t index) const;
     /// Resolve a logical file name through the magic-path table
     /// (e:setMagicPath, ":bg/" prefixes etc).
     std::string resolve_magic_path(const std::string& name) const;
@@ -554,6 +683,9 @@ public:
 private:
     Config config_;
     std::map<std::string, Script> scripts_;
+    /// tag.ini: command -> ordered parameter names ([&linetag] columns).
+    std::map<std::string, std::vector<std::string>> line_tags_;
+    bool line_tags_loaded_ = false;
     std::optional<std::string> current_script_name_;
     size_t current_line_ = 0;
     std::vector<CallFrame> call_stack_;
@@ -561,6 +693,26 @@ private:
     bool last_wait_from_queue_ = false;
     bool queued_saw_call_ = false;
     bool queued_saw_jump_ = false;
+    /// While non-zero, the queued-tag drain is held: a queued [call] handed
+    /// control to a callee and the rest of the queue belongs to the caller
+    /// (resolved against the caller's script/labels), so it must wait for
+    /// that frame to return. Value = call_stack depth right after the push;
+    /// 0 = no hold. Eustia/August boot is the canonical case:
+    ///   e:enqueueTag{"call", file="system/msg.iet"}
+    ///   e:enqueueTag{"jump", label="game_start"}
+    /// — draining the jump inside msg.iet used to abort with
+    /// "jump: label not found: game_start".
+    size_t queue_hold_depth_ = 0;
+    size_t return_floor_ = 0;
+    int immediate_tag_depth_ = 0;
+    /// True when the last run() ended by yielding a wait/stop to the host.
+    /// queue_hold_depth_ is released on that edge (see flush_tag_queue).
+    bool parked_ = false;
+    // Macro tag -> defining file ([macroadd]); see macros().
+    std::map<std::string, std::string> macros_;
+    // Macro parameter scope: tag params become plain variables for the
+    // duration of the macro call; previous values are restored on [return].
+    std::vector<MacroParamSave> macro_param_saves_;
     VariableStore variables_;
     InterpreterHooks hooks_;
     std::function<CallbackResult(const Event&)> callback_ =

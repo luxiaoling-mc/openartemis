@@ -29,6 +29,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
+#include <system_error>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -277,6 +279,7 @@ LuaBridge::LuaBridge(LuaHost host) : host_(std::move(host)) {
     if (!L_) throw LuaError("luaL_newstate failed");
     luaL_openlibs(L_);
     apply_stdlib_block_list(L_);
+    install_save_open_redirect(L_);
 
     install_engine_api();
 }
@@ -289,6 +292,49 @@ LuaBridge::~LuaBridge() {
         if (event_filter_ref_ != LUA_NOREF) luaL_unref(L_, LUA_REGISTRYINDEX, event_filter_ref_);
     }
     if (L_) lua_close(L_);
+}
+
+// io.open redirect: relative paths resolve into the save area so the
+// framework's own persistence (syssave/system.dat, saveg.dat) works like the
+// original engine. The stock opener is kept in the registry.
+int l_io_open_save(lua_State* L) {
+    LuaBridge* bridge = static_cast<LuaBridge*>(lua_touserdata(L, lua_upvalueindex(1)));
+    const char* path = luaL_checkstring(L, 1);
+    const char* mode = luaL_optstring(L, 2, "r");
+    std::string resolved(path);
+    if (bridge && bridge->host().save_root) {
+        const std::string root = bridge->host().save_root();
+        const bool absolute = !resolved.empty() &&
+                              (resolved[0] == '/' || resolved[0] == '\\' ||
+                               (resolved.size() > 1 && resolved[1] == ':'));
+        if (!root.empty() && !absolute) {
+            resolved = root + "/" + resolved;
+            if (mode[0] == 'w' || mode[0] == 'a' || std::strchr(mode, '+')) {
+                std::error_code ec;
+                const auto parent = std::filesystem::path(resolved).parent_path();
+                if (!parent.empty()) std::filesystem::create_directories(parent, ec);
+            }
+        }
+    }
+    lua_getfield(L, LUA_REGISTRYINDEX, "oa.io.open");
+    lua_pushstring(L, resolved.c_str());
+    lua_pushstring(L, mode);
+    lua_call(L, 2, 1);
+    return 1;
+}
+
+void LuaBridge::install_save_open_redirect(lua_State* L) {
+    lua_getglobal(L, "io");
+    if (!lua_istable(L, -1)) {
+        lua_pop(L, 1);
+        return;
+    }
+    lua_getfield(L, -1, "open");
+    lua_setfield(L, LUA_REGISTRYINDEX, "oa.io.open");
+    lua_pushlightuserdata(L, this);
+    lua_pushcclosure(L, l_io_open_save, 1);
+    lua_setfield(L, -2, "open");
+    lua_pop(L, 1);
 }
 
 void LuaBridge::install_engine_api() {
@@ -671,7 +717,8 @@ int l_tag(lua_State* L) {
     // boundary (the outer engine call unwinds cleanly). A missing/empty
     // "function" keeps the historical queue path so its drain-time error
     // surfaces unchanged.
-    if (tag == "calllua" && bridge->host().run_calllua_sync) {
+    if ((tag == "calllua" || tag == "forcedcalllua") &&
+        bridge->host().run_calllua_sync) {
         auto fnit = params.find("function");
         const std::string fn = fnit == params.end() ? std::string() : fnit->second;
         if (!fn.empty()) {
@@ -685,6 +732,13 @@ int l_tag(lua_State* L) {
                 return lua_error(L);
             }
         }
+    }
+    // Artemis e:tag = execute now (the framework relies on the ordering:
+    // slider_h's [lyc]/[lyprop] must land before the caller's CSV position
+    // row, otherwise the rebuild resets the slider to the origin).
+    if (bridge->host().run_tag_now &&
+        bridge->host().run_tag_now(tag, params)) {
+        return 0;
     }
     if (!bridge->host().enqueue_tag) {
         lua_pushliteral(L, "tag queue not wired");
@@ -990,14 +1044,75 @@ int l_noop(lua_State* L) {
     return 0;
 }
 
-// getScriptBlock/getScriptStack default stubs (host fills them later).
+// e:getScriptBlock(frame) -> { command = <tag>, parameter = { ... } }
+// frame is one of e:getScriptStack()'s entries (file + index). Returns nil
+// when the host has no such row.
 int l_get_script_block(lua_State* L) {
-    lua_pushnil(L);
+    const LuaBridge* bridge = bridge_from_state(L);
+    // Method call: `e:getScriptBlock(frame)` -> stack = [engine, frame], so the
+    // frame table lives at index 2 (index 1 is the handle).
+    if (!lua_istable(L, 2) || !bridge->host().script_block) {
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_getfield(L, 2, "file");
+    const char* file = lua_tostring(L, -1);
+    lua_getfield(L, 2, "index");
+    const size_t index = size_t(lua_tonumber(L, -1));
+    lua_pop(L, 2);
+    if (!file) {
+        lua_pushnil(L);
+        return 1;
+    }
+    const auto block = bridge->host().script_block(file, index);
+    if (!block) {
+        // Never hand back nil: iMel's tagFilters index the result
+        // unconditionally (`local command = currentTag.command`), so a nil
+        // turned every [waitstop] into a Lua error → filter "not handled" →
+        // no wait armed → the story ran by itself. An empty block keeps the
+        // filter alive (its command compares as "" = unknown row).
+        if (std::getenv("OA_STORYDBG"))
+            std::fprintf(stderr, "[script] getScriptBlock('%s', %zu) -> empty block\n",
+                         file, index);
+        lua_createtable(L, 0, 2);
+        lua_pushliteral(L, "");
+        lua_setfield(L, -2, "command");
+        lua_createtable(L, 0, 0);
+        lua_setfield(L, -2, "parameter");
+        return 1;
+    }
+    lua_createtable(L, 0, 2);
+    lua_pushlstring(L, block->first.data(), block->first.size());
+    lua_setfield(L, -2, "command");
+    lua_createtable(L, 0, (int)block->second.size());
+    for (const auto& [k, v] : block->second) {
+        lua_pushlstring(L, v.data(), v.size());
+        lua_setfield(L, -2, k.c_str());
+    }
+    lua_setfield(L, -2, "parameter");
     return 1;
 }
 
 int l_get_script_stack(lua_State* L) {
+    const LuaBridge* bridge = bridge_from_state(L);
     lua_createtable(L, 0, 0);
+    if (!bridge->host().script_stack) return 1;
+    int index = 1;
+    for (const auto& [file, line] : bridge->host().script_stack()) {
+        lua_createtable(L, 0, 4);
+        lua_pushlstring(L, file.data(), file.size());
+        lua_setfield(L, -2, "file");
+        lua_pushnumber(L, (lua_Number)line);
+        lua_setfield(L, -2, "index");
+        lua_pushnumber(L, (lua_Number)line);
+        lua_setfield(L, -2, "line");
+        // Framework bodies iterate stack[i].reservedCommands (queued-tag
+        // bookkeeping) — an empty table keeps "#reservedCommands" == 0, the
+        // "nothing pending on this frame" answer.
+        lua_createtable(L, 0, 0);
+        lua_setfield(L, -2, "reservedCommands");
+        lua_rawseti(L, -2, index++);
+    }
     return 1;
 }
 
@@ -1478,6 +1593,8 @@ void LuaBridge::store_log_filter(lua_State* L, int idx) {
     // 0 = raw output (default), 1 = suppressed; non-number clears.
     log_filter_value_ = lua_isnumber(L, idx) ? (int)lua_tonumber(L, idx) : 0;
 }
+
+bool LuaBridge::has_tag_filters() const { return tag_filter_ref_ != LUA_NOREF; }
 
 FilterDecision LuaBridge::run_tag_filter(const std::string& tag,
                                          const std::map<std::string, std::string>& params) {

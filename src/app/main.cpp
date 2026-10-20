@@ -260,9 +260,25 @@ int parse_args(int argc, char** argv, Options& o) {
 // Shared status heartbeat: frames / current wait / layer count
 // ("what step is the game parked on").
 static void print_status(AppState* state) {
-    std::printf("[app] status frames=%llu wait=%s layers=%zu\n",
-        (unsigned long long)state->frames, wait_desc(state->rt->current_wait()).c_str(),
-        state->rt->scene().size());
+    // The active message layer and its page size are the two numbers that tell
+    // "nothing was printed" apart from "printed but not drawn" — the heartbeat
+    // is what a player can hand back from a stuck session.
+    const auto& text = state->rt->text();
+    const std::string active = text.active_layer_id();
+    const auto* ml = text.layer(active);
+    const size_t glyphs = state->s_last_text_glyphs;
+    const std::string bound = state->rt->scene().bound_scene_id(active);
+    std::printf("[app] status frames=%llu wait=%s layers=%zu text='%s':%zu "
+                "reveal=%zu pend=%d visible=%d drawable=%d node='%s' exists=%d glyphs=%zu\n",
+                (unsigned long long)state->frames,
+                wait_desc(state->rt->current_wait()).c_str(), state->rt->scene().size(),
+                active.c_str(), ml ? ml->char_count : 0, ml ? ml->reveal_index : 0,
+                ml && ml->reveal_pending ? 1 : 0,
+                state->rt->scene().is_message_layer_visible(active) ? 1 : 0,
+                state->rt->scene().is_message_layer_drawable(active, ml && ml->positioned)
+                    ? 1
+                    : 0,
+                bound.c_str(), state->rt->scene().find(bound) ? 1 : 0, glyphs);
 };
 
 // ---------------------------------------------------------------------------
@@ -493,6 +509,56 @@ static void frame_stats_report() {
     }
 }
 
+#if OA_TEST_BUILD
+// ---------------------------------------------------------------------------
+// OA_AUTOPLAY=1 — advance by pressing ONLY where the runtime actually parks a
+// click wait, exactly how the tests drive the runtime (`tick` + FrameInput).
+//
+// Timed synthetic input (click/key/hover at fixed frame numbers) was removed
+// on purpose: it had to be re-tuned per scene, only ran at real-time pace and
+// silently missed beats whenever pacing drifted. Script progress is a property
+// of the runtime state, not of a frame number — do not add it back.
+// Points rotate through the few that matter (message area, title 開始, language
+// OK, language 中文) so boot menus and the story advance in one pass.
+void autoplay_input(oa::runtime::GameRuntime& rt, uint64_t frame,
+                    oa::runtime::FrameInput& in) {
+    static const bool on = std::getenv("OA_AUTOPLAY") != nullptr;
+    if (!on) return;
+    const auto* w = rt.current_wait();
+    const bool at_wait = w && (w->kind == oa::runtime::WaitReason::Kind::Generic ||
+                               w->kind == oa::runtime::WaitReason::Kind::Stop);
+    static uint64_t last = 0;
+    static bool pressed = false;
+    // Where to press is decided by what is actually on screen, so a menu page
+    // never gets a blind click in the wrong corner (that used to walk into
+    // 終了 and quit the run): title 開始 button, else the language 中文 row,
+    // else the story text area.
+    int px = 960, py = 900;
+    const auto* start_btn = rt.scene().find("100.1.1");
+    const auto* lang_cn = rt.scene().find("200.10.2.1");
+    if (start_btn && start_btn->visible) {
+        px = 1683;
+        py = 648;
+    } else if (lang_cn && lang_cn->visible) {
+        px = 893;
+        py = 587;
+    }
+    if (at_wait && !pressed && frame >= last + 10) {
+        in.mouse_x = px;
+        in.mouse_y = py;
+        in.left_down = true;
+        in.left_click_edge = true;
+        pressed = true;
+        last = frame;
+    } else {
+        // always release: leaving left_down set when the wait disappears would
+        // pin the button down for the rest of the run.
+        in.left_down = false;
+        pressed = false;
+    }
+}
+#endif
+
 SDL_AppResult SDL_AppInit(void** appstate, int argc, char* argv[])
 {
     // the SDL3 main-callback driver runs event-gated when the
@@ -706,7 +772,10 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char* argv[])
             if (state->frames >= 200 && !state->video_demo_file.empty())
                 video_demo_start(state);
 #endif
-            const oa::runtime::FrameInput hinput;
+            oa::runtime::FrameInput hinput;
+#if OA_TEST_BUILD
+            autoplay_input(*state->rt, state->frames, hinput);
+#endif
             try {
                 state->rt->tick(16, hinput);
             }
@@ -740,6 +809,21 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char* argv[])
                 print_status(state);
             }
             if (state->opt.frames_target > 0 && state->frames >= state->opt.frames_target) {
+                // OA_SCENEDUMP=<id prefix>: dump the live scene nodes (file /
+                // geometry / visibility) for offline diagnosis of "layer is
+                // missing from the screen" reports. Prefix "" dumps all.
+                if (const char* dump = std::getenv("OA_SCENEDUMP")) {
+                    const std::string prefix(dump);
+                    for (const oa::render::Layer* l : state->rt->scene().draw_order()) {
+                        if (!prefix.empty() && l->id.rfind(prefix, 0) != 0) continue;
+                        std::printf("[scene] %-16s left=%.0f top=%.0f w=%.0f h=%.0f "
+                                    "vis=%.0f alpha=%.3f eff=%d file=%s\n",
+                                    l->id.c_str(), l->left, l->top, l->width, l->height,
+                                    l->visible ? 1.0 : 0.0, l->alpha,
+                                    state->rt->scene().is_effectively_visible(l->id) ? 1 : 0,
+                                    l->file.c_str());
+                    }
+                }
                 // headless end-of-run stats (no pixels, so no luma snapshot)
                 size_t handler_layers = 0;
                 for (const oa::render::Layer* l : state->rt->scene().draw_order())
@@ -756,6 +840,53 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char* argv[])
                     (int)state->rt->audio().is_bgm_playing(),
                     state->rt->audio().state().se_channels.size(),
                     state->rt->audio().state().voice_channels.size());
+#if OA_TEST_BUILD
+                // OA_TXTDUMP=1: every message layer with its page/reveal state.
+                // Offscreen probe for "the story text does not show up".
+                if (std::getenv("OA_TXTDUMP")) {
+                    for (const auto& [id, ml] : state->rt->text().layers()) {
+                        std::string raw;
+                        for (const auto& u : ml.page)
+                            raw += u.kind == oa::render::PageUnit::Kind::Newline ? std::string("\\n")
+                                                                                : u.data;
+                        const oa::render::Layer* node = state->rt->scene().find(id);
+                        std::fprintf(stderr,
+                                     "[txt] %-24s chars=%zu reveal=%zu pend=%d hidden=%d "
+                                     "positioned=%d page=%zu alpha=%.2f vis=%d eff=%d "
+                                     "box=(%.0f,%.0f %.0fx%.0f) size=%.0f align=%s "
+                                     "sample='%.40s'\n",
+                                     id.c_str(), ml.char_count, ml.reveal_index,
+                                     ml.reveal_pending ? 1 : 0, ml.text_hidden ? 1 : 0,
+                                     ml.positioned ? 1 : 0, ml.page.size(),
+                                     node ? node->alpha : -1.0,
+                                     node ? (node->visible ? 1 : 0) : -1,
+                                     node ? (state->rt->scene().is_effectively_visible(id) ? 1 : 0)
+                                          : -1,
+                                     ml.left, ml.top, ml.width, ml.height, ml.font.size(),
+                                     ml.font.get_or("align", "-").c_str(),
+                                     raw.c_str());
+                    }
+                }
+                // OA_VARDUMP=<prefix>: print the engine variable store at the
+                // end of a headless run (prefix "" = everything). Offscreen
+                // probe for framework state (t.button / status / g.language ...).
+                if (const char* vd = std::getenv("OA_VARDUMP"); vd) {
+                    const std::string prefix(vd);
+                    const auto& vars = state->rt->interpreter().variables();
+                    auto dump = [&](const char* domain, const auto& map) {
+                        for (const auto& [k, v] : map) {
+                            if (!prefix.empty() && k.rfind(prefix, 0) != 0) continue;
+                            std::fprintf(stderr, "[var] %-28s = %s\n", k.c_str(),
+                                         v.to_string().c_str());
+                        }
+                        (void)domain;
+                    };
+                    dump("local", vars.local);
+                    dump("temp", vars.temp);
+                    dump("global", vars.global);
+                    dump("system", vars.system);
+                }
+#endif
                 hquit = true;
             }
         }
@@ -1270,6 +1401,7 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* ev)
     return SDL_APP_CONTINUE;
 }
 
+
 SDL_AppResult SDL_AppIterate(void* appstate)
 {
     AppState* state = static_cast<AppState*>(appstate);
@@ -1321,6 +1453,10 @@ SDL_AppResult SDL_AppIterate(void* appstate)
             (unsigned long long)state->frames, state->probe_id.c_str());
     }
 #endif
+#if OA_TEST_BUILD
+    // Windowed driver: same wait-driven autoplay as headless (no timed input).
+    autoplay_input(*state->rt, state->frames, state->input);
+#endif
     state->input.left_click_edge = state->input.left_down && !state->mouse_left_prev;
     state->mouse_left_prev = state->input.left_down;
 #if OA_TEST_BUILD
@@ -1329,8 +1465,6 @@ SDL_AppResult SDL_AppIterate(void* appstate)
     // orchestration below only watches the runtime hover set to decide
     // when the title button is reached.
     const bool hovered = state->rt->is_hovered(state->probe_id);
-    // text smoke (OA_TXT_SMOKE=1)：尽力走剧情文本（见下方块）
-    const bool txt_smoke = std::getenv("OA_TXT_SMOKE") != nullptr;
     {
         // once the title button is actually hovered (probe reached), give
         // the run a settled tail so the end-of-run metric lands on the
@@ -1341,25 +1475,10 @@ SDL_AppResult SDL_AppIterate(void* appstate)
             std::printf("[app] P1b hover settled at frame %llu (id=%s)\n",
                 (unsigned long long)state->frames, state->probe_id.c_str());
         }
-        // text smoke (OA_TXT_SMOKE=1): 尽力走 "はじめから" 到达剧情
-        // 文本帧。标题停驻后点 bt_start 推进游戏（Stop 停驻排水已在队列第
-        // 6 项转正为常开，点击的 estag/jump 链照常执行）；不结束 run（用
-        // CLI --frames 决定时长），周期打印文本引擎内容与字形绘制状态。
-        // 能到哪算哪（依赖菜单 conf 域）。
-        if (txt_smoke && state->hover_end_armed && !state->end_committed_ &&
-            state->frames >= state->settle_frame_ + 120 && !state->rt->transition().is_in_progress(
-                state->rt->now_ms()) &&
-            hovered) {
-            state->end_committed_ = true;
-            state->probe_click_at_ = state->frames + 2;
-            std::printf("[app] TXT smoke: click bt_start at frame %llu\n",
-                (unsigned long long)state->frames);
-        }
         // after the entrance settles wait for a plateau (no transition in
         // flight, pointer still on the button) and end there; fall back to
         // settle+900 so the run always terminates.
-        if (state->hover_end_armed && !state->end_committed_ && state->opt.frames_target > 0 &&
-            !txt_smoke) {
+        if (state->hover_end_armed && !state->end_committed_ && state->opt.frames_target > 0) {
             if (state->frames >= state->settle_frame_ + 900) {
                 state->end_committed_ = true;
                 state->opt.frames_target = state->frames + 60;
@@ -1419,40 +1538,6 @@ SDL_AppResult SDL_AppIterate(void* appstate)
     }
 #endif // OA_TEST_BUILD
 
-#if OA_TEST_BUILD
-    if (txt_smoke && state->hover_end_armed && state->end_committed_ && state->frames % 120 == 0) {
-        const auto layers = state->rt->text().visible_content_layers();
-        std::string sample;
-        bool body = false;
-        const std::string act = state->rt->text().active_layer_id();
-        if (!layers.empty()) {
-            if (const oa::render::MessageLayer* ml0 = state->rt->text().layer(layers[0])) {
-                for (const auto& u : ml0->page) {
-                    if (u.data.empty()) continue;
-                    sample = u.data.substr(0, 24);
-                    break;
-                }
-            }
-            for (const auto& id : layers) {
-                if (state->rt->text().page_has_visible_text(id)) {
-                    body = true;
-                    break;
-                }
-            }
-        }
-        static bool body_verdict_printed = false;
-        if (body && !body_verdict_printed) {
-            body_verdict_printed = true;
-            std::printf("[txt] BODY-TEXT-REACHED f=%llu layer=%s sample='%s'\n",
-                (unsigned long long)state->frames, act.c_str(), sample.c_str());
-        }
-        std::printf("[txt] f=%llu wait=%s text_layers=%zu glyphs=%zu active=%s "
-            "body=%d sample='%s'\n",
-            (unsigned long long)state->frames, wait_desc(state->rt->current_wait()).c_str(),
-            layers.size(), state->s_last_text_glyphs, act.c_str(), (int)body,
-            sample.c_str());
-    }
-#endif // OA_TEST_BUILD
     // decide injection (overrideKey 124) intentionally omitted: it drives
     // [stop]-released flows into save/menu contexts that need M8 domains
 
@@ -2062,6 +2147,30 @@ SDL_AppResult SDL_AppIterate(void* appstate)
             const size_t total_chars = state->rt->text().visible_content_layers().size();
             std::printf("[app] text layers=%zu glyphs_last_frame=%zu\n", total_chars,
                 state->s_last_text_glyphs);
+#if OA_TEST_BUILD
+            // Windowed runs need the same message-layer dump as headless ones:
+            // "no text on screen" has to be told apart from "text was never
+            // printed" without a headless replay.
+            if (std::getenv("OA_TXTDUMP")) {
+                const auto ids = state->rt->text().layers();
+                for (const auto& [id, ml] : ids) {
+                    std::string raw;
+                    for (const auto& u : ml.page) {
+                        if (u.kind == oa::render::PageUnit::Kind::Newline) raw += '\n';
+                        else raw += u.data;
+                    }
+                    std::printf("[txt] %-24s chars=%zu reveal=%zu pend=%d hidden=%d "
+                                "positioned=%d page=%zu visible=%d box=(%.0f,%.0f %.0fx%.0f) "
+                                "size=%.0f align=%s sample='%.40s'\n",
+                                id.c_str(), ml.char_count, ml.reveal_index,
+                                ml.reveal_pending ? 1 : 0, ml.text_hidden ? 1 : 0,
+                                ml.positioned ? 1 : 0, ml.page.size(),
+                                state->rt->scene().is_message_layer_visible(id) ? 1 : 0,
+                                ml.left, ml.top, ml.width, ml.height, ml.font.size(),
+                                ml.font.get_or("align", "-").c_str(), raw.c_str());
+                }
+            }
+#endif
             if (state->opt.dump_on_end) write_ppm(state->opt.dump, frame);
             state->quit = true;
         }

@@ -383,18 +383,61 @@ void TextEngine::pop_layer() {
 
 void TextEngine::apply_font(const std::map<std::string, std::string>& p) {
     MessageLayer& l = active_mut();
-    const auto sit = p.find("stack");
-    const bool stacked = sit == p.end() || sit->second == "1" || sit->second == "true";
+    // entirexscale / entireyscale: the framework's font rows are authored in an
+    // ENLARGED glyph space and ask the engine to fold that factor into the
+    // GLYPH metrics — iMel's mw font rows carry `entirexscale = 66 /
+    // entireyscale = 66` ("font resolution is 1.5x"), so `size` and the line
+    // spacings in that same row are 1.5x values. The placement keys
+    // (left/top/width/height) stay in stage units: they line the text up with
+    // the message-window plate, whose own position comes from the image csv
+    // (mw.csv 168,747). Scaling the box as well floated the body text above the
+    // window and pushed the name out of its plate.
+    std::map<std::string, std::string> scaled = p;
+    double sx = 100.0;
+    double sy = 100.0;
+    if (const auto it = p.find("entirexscale"); it != p.end()) parse_dbl(it->second, &sx);
+    if (const auto it = p.find("entireyscale"); it != p.end()) parse_dbl(it->second, &sy);
+    if (sx <= 0.0) sx = 100.0;
+    if (sy <= 0.0) sy = 100.0;
+    if (sx != 100.0 || sy != 100.0) {
+        auto scale_key = [&](const char* key, double factor) {
+            const auto it = scaled.find(key);
+            if (it == scaled.end()) return;
+            double v = 0.0;
+            if (!parse_dbl(it->second, &v)) return;
+            it->second = std::to_string(v * factor / 100.0);
+        };
+        scale_key("size", sy);
+        scale_key("kerning", sx);
+        // width/height describe the TEXT BOX in the enlarged font space (the
+        // body row asks for 1600 wide at entire=66 -> 1056 on a 1920 stage;
+        // the name row 525 -> 346, which is exactly the width of its plate).
+        // left/top, on the other hand, are screen coordinates: scaling them
+        // floated the body text above the window and pushed the name to the
+        // right edge of its plate.
+        scale_key("width", sx);
+        scale_key("height", sy);
+        scale_key("spacetop", sy);
+        scale_key("spacemiddle", sy);
+        scale_key("spacebottom", sy);
+        scale_key("outline", sy);
+        scale_key("rubysize", sy);
+        scaled["entirexscale"] = "100";
+        scaled["entireyscale"] = "100";
+    }
+    const std::map<std::string, std::string>& p_use = scaled;
+    const auto sit = p_use.find("stack");
+    const bool stacked = sit == p_use.end() || sit->second == "1" || sit->second == "true";
     if (stacked) l.font_stack.push_back(l.font);
-    l.font.merge_raw(p);
+    l.font.merge_raw(p_use);
     if (font_debug_enabled()) {
         std::string dbg;
-        for (const auto& [k, v] : p) { dbg += k + "=" + v + " "; }
+        for (const auto& [k, v] : p_use) { dbg += k + "=" + v + " "; }
         std::printf("[text] apply_font: %s\n", dbg.c_str());
     }
-    auto set_d = [&p](const char* key, double* dst) {
-        const auto it = p.find(key);
-        if (it == p.end()) return;
+    auto set_d = [&p_use](const char* key, double* dst) {
+        const auto it = p_use.find(key);
+        if (it == p_use.end()) return;
         (void)parse_dbl(it->second, dst);
     };
     set_d("left", &l.left);
@@ -403,13 +446,13 @@ void TextEngine::apply_font(const std::map<std::string, std::string>& p) {
     set_d("height", &l.height);
     // 排版键 → 本层获得绘制盒（无盒层只能经脚本显式节点绘制,孤儿打印
     // 不绘制;继承/默认字体不置位,见 MessageLayer::positioned）。
-    if (p.count("left") || p.count("top") || p.count("width") ||
-        p.count("height"))
+    if (p_use.count("left") || p_use.count("top") || p_use.count("width") ||
+        p_use.count("height"))
         l.positioned = true;
     // 再现记录：font 参数原样入本页标签序列（get_message_tags/backlog）
     BacklogTag t;
     t.kind = BacklogTag::Kind::Font;
-    t.font = p;
+    t.font = p_use;
     l.page_tags.push_back(std::move(t));
     bump_revision();
 }

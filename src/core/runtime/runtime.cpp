@@ -13,6 +13,9 @@ namespace oa::runtime {
 namespace {
 // virtual key codes used by Artemis scripts
 constexpr int kKeyMouseLeft = 1;
+/// Shared budget for the OA_STORYDBG lines (arm + release, first N).
+int g_storydbg = 0;
+int g_storydbg_arm = 0;
 constexpr int kKeyMouseRight = 2;
 constexpr int kKeyEnter = 13;
 constexpr int kKeySpace = 32;
@@ -404,6 +407,25 @@ void GameRuntime::RuntimeState::open_project(std::string_view platform) {
     interpreter_->hooks().resource_exists = [read_resolved](const std::string& resolved) {
         return read_resolved(resolved).has_value();
     };
+    // Framework family probe: FPM titles ship system/script.asb next to
+    // first.iet/ui.asb/save.asb. Their scriptMainloop/estag drivers depend on
+    // e:tag appending to the queue (the next step must not be applied before
+    // the [trans] capture) and on clock-driven parks being left alone.
+    //fpm_family_ = interpreter_->hooks().resource_exists
+    //                  ? interpreter_->hooks().resource_exists("system/script.asb")
+    //                  : false;
+    fpm_family_ = true;
+    interpreter_->hooks().immediate_tags = !fpm_family_;
+    // FPM's estag calls are fall-through label chains that enqueue the whole
+    // UI state; holding the queue behind them collapses the entrance into one
+    // burst (see InterpreterHooks::queue_call_hold). Non-FPM keeps the hold.
+    interpreter_->hooks().queue_call_hold = !fpm_family_;
+    interpreter_->hooks().save_root = [this]() -> std::string {
+        if (auto dir = std::dynamic_pointer_cast<oa::runtime::DirSaveStore>(save_store_)) {
+            return dir->root();
+        }
+        return std::string();
+    };
     interpreter_->hooks().save_file_exists = [this](const std::string& file) -> bool {
         const std::string rel = qualify_save_file(file);
         if (rel.empty() || !save_store_) return false;
@@ -490,6 +512,15 @@ void GameRuntime::RuntimeState::open_project(std::string_view platform) {
         }
         pending_events_.push_back(e);
         if (e.kind == oa::runtime::Event::Kind::Wait_) {
+            return oa::runtime::CallbackResult::Pause;
+        }
+        // [reset] hands the engine back to its boot script: the current
+        // script must STOP here. Continuing ran the rows after [reset] against
+        // the cleared variable store (Watamari's go-title macro: reset is
+        // followed by [return]; the caller then called
+        // "$scenario_path + 'special.txt'" with scenario_path cleared ->
+        // "0special.txt" and the app aborted).
+        if (e.kind == oa::runtime::Event::Kind::Reset) {
             return oa::runtime::CallbackResult::Pause;
         }
         if (e.kind == oa::runtime::Event::Kind::Trans) {
@@ -802,6 +833,9 @@ void GameRuntime::RuntimeState::tick(uint64_t delta_ms, const FrameInput& in) {
         clicked = down_edges_.count(kKeyEnter) > 0 || down_edges_.count(kKeySpace) > 0;
     }
     clicked = clicked || pc.role_advance;
+    // NB: only fresh PRESSES count — the host injects a mouse-left up-edge on
+    // every frame the button is not held, which would disable the guard always.
+    input_this_tick_ = clicked || decide_edge_ || !down_edges_.empty();
 
     // script status 4 = forced stop (no user input): park the story line but
     // keep onEnterFrame ticking (already fired) and scene tweens advancing.
@@ -953,7 +987,20 @@ void GameRuntime::RuntimeState::run_until_wait() {
         // when no wait reason was parked at dispatch time).
         pending_sync_tween_layer_.reset();
         if (ev && ev->kind == oa::runtime::Event::Kind::Wait_) {
+            if (std::getenv("OA_STORYDBG") && g_storydbg_arm < 40) {
+                ++g_storydbg_arm;
+                std::fprintf(stderr,
+                             "[story] arm tag='%s' kind=%d ms=%llu input=%d at %s:%zu\n",
+                             ev->tag.c_str(), (int)ev->reason.kind,
+                             (unsigned long long)ev->reason.milliseconds,
+                             ev->reason.input,
+                             interpreter_->current_script()
+                                 ? interpreter_->current_script()->c_str()
+                                 : "?",
+                             interpreter_->current_line());
+            }
             wait_ = ev->reason;
+            wait_armed_this_tick_ = true;
             wait_remaining_ms_ = 0;
             switch (ev->reason.kind) {
                 case oa::runtime::WaitReason::Kind::Timed:
@@ -991,6 +1038,53 @@ void GameRuntime::RuntimeState::run_until_wait() {
 
 void GameRuntime::RuntimeState::drain_parked_queue() {
     if (!interpreter_) return;
+    // A park that is TOLD BY THE CLOCK — a [wait time=N] (Timed) or one of the
+    // engine-timed stops ([trans] / fullscreen [video] / [alldelete]) — must
+    // not be drained over: the framework (FPM's scriptMainloop / estag) has
+    // already pre-enqueued the next scenario rows, and any queued tag that
+    // parks the stream replaces the running park outright — its remaining
+    // time is lost, the [trans] is abandoned after one frame and the whole
+    // splash / story fast-forwards (test2: the 2500 ms brand-logo wait was
+    // killed 16 ms after it armed by the queued [call estag03] -> [trans],
+    // so the caution screen never got its 2.5 s).
+    // The batch stays in the queue and runs once the park releases.
+    // Interactive parks ([@] / [stop] / [exkey]) keep draining: that is how
+    // a title-screen hover/click reaches the queue.
+    bool hold_drain = false;
+    if (fpm_family_ && wait_) {
+        // A fullscreen [video] park OWNS the click: the click IS the movie's
+        // skip input (resolve_wait Stop{id:"video"} -> queue_finish ->
+        // stop_overlay). Letting the queue drain on that tick executed the
+        // click's Lua e:tags first, and any queued [wait]/[trans] replaced the
+        // park outright — the script walked on while the overlay kept playing
+        // over the scene (test5: clicking the brand logo neither skipped the
+        // movie nor stopped it). So this park holds regardless of fresh input;
+        // its release path is the skip/EOF finish, not the queue.
+        const bool video_park =
+            wait_->kind == oa::runtime::WaitReason::Kind::Stop && wait_->id == "video";
+        if (video_park) {
+            const auto v = video_.state();
+            hold_drain = v.overlay_video && v.overlay_video->playing;
+        } else if (!input_this_tick_) {
+            if (wait_->kind == oa::runtime::WaitReason::Kind::Timed) {
+                // Long pacing waits (the splash logo's 2500 ms) must not be
+                // replaced by the pre-enqueued rows; short ones (0..300 ms) are
+                // the framework's own animation steps — holding those would turn a
+                // UI entrance into stop-motion.
+                hold_drain = wait_remaining_ms_ > 300;
+            } else if (wait_->kind == oa::runtime::WaitReason::Kind::Stop) {
+                // Only while the park is genuinely running on the clock. An
+                // armed-but-dead park (transition the host never captured)
+                // keeps the old drain-through behaviour so the script can move
+                // on.
+                if (wait_->id == "trans") {
+                    hold_drain = transition_.is_in_progress(now_ms_);
+                } else if (wait_->id == "alldelete") {
+                    hold_drain = alldelete_active_;
+                }
+            }
+        }
+    }
     in_parked_drain_ = true;
     bool saw_call = false;
     bool saw_jump = false;
@@ -1003,6 +1097,7 @@ void GameRuntime::RuntimeState::drain_parked_queue() {
     };
     int guard = 0;
     while (interpreter_->has_queued_tags() && guard++ < 64) {
+        if (hold_drain) break; // keep the batch for after the clock-driven park
         const std::string* script_before = interpreter_->current_script();
         const size_t line_before = interpreter_->current_line();
         const size_t stack_before = interpreter_->call_stack().size();
@@ -1021,7 +1116,16 @@ void GameRuntime::RuntimeState::drain_parked_queue() {
             paused = true;
             const oa::runtime::Event* ev = interpreter_->last_wait_event();
             if (ev && ev->kind == oa::runtime::Event::Kind::Wait_) {
+                if (std::getenv("OA_STORYDBG") && g_storydbg_arm < 40) {
+                    ++g_storydbg_arm;
+                    std::fprintf(stderr,
+                                 "[story] arm(queued) tag='%s' kind=%d ms=%llu input=%d\n",
+                                 ev->tag.c_str(), (int)ev->reason.kind,
+                                 (unsigned long long)ev->reason.milliseconds,
+                                 ev->reason.input);
+                }
                 wait_ = ev->reason;
+                wait_armed_this_tick_ = true;
                 wait_remaining_ms_ = 0;
                 if (ev->reason.kind == oa::runtime::WaitReason::Kind::Timed) {
                     wait_remaining_ms_ = ev->reason.milliseconds;
@@ -1166,6 +1270,15 @@ bool GameRuntime::RuntimeState::apply_text_event(const oa::runtime::Event& e) {
     switch (e.kind) {
         case K::ScenarioLine: {
             ++text_events_;
+            if (std::getenv("OA_TEXTTRACE")) {
+                const auto* tl = text_.layer(text_.active_layer_id());
+                std::fprintf(stderr,
+                             "[text] f=%llu push active='%s' n=%zu page_chars=%zu "
+                             "content='%.40s'\n",
+                             (unsigned long long)tick_count_,
+                             text_.active_layer_id().c_str(), e.content.size(),
+                             tl ? tl->char_count : 0, e.content.c_str());
+            }
             text_.push_text(e.content);
             // every drawable message layer owns a scene node — content
             // pushed before any chgmsg (default/active layer) materializes it
@@ -1200,6 +1313,9 @@ bool GameRuntime::RuntimeState::apply_text_event(const oa::runtime::Event& e) {
             const std::string ly = par("layered");
             if (!ly.empty()) layered = parse_i32(ly, -1);
             text_.switch_layer(mid, stack, layered);
+            if (std::getenv("OA_TEXTTRACE"))
+                std::fprintf(stderr, "[text] chgmsg id='%s' stack=%d -> active='%s'\n",
+                             id.c_str(), stack ? 1 : 0, text_.active_layer_id().c_str());
             // 绑定：活动消息层 id → 场景目标 + 默认消息层
             const std::string active = text_.active_layer_id();
             const oa::render::MessageLayer* al = text_.layer(active);
@@ -1211,10 +1327,23 @@ bool GameRuntime::RuntimeState::apply_text_event(const oa::runtime::Event& e) {
             scene_.set_message_layer_binding(active, scene_id);
             scene_.revive_message_layer(active);
             scene_.set_default_message_layer(active);
+            // Published engine state: the iMel frameworks read
+            // `$s.current_message_layer` to decide whether a message layer is
+            // still open on the way out of a block macro (chara_v.iet's
+            // */chgmsg_name closes the name window with [/chgmsg] only when the
+            // active layer is still 'name'). Leaving it unset made every such
+            // guard read 0, so the name window stayed open and the story body
+            // printed into it from the next scene on.
+            if (interpreter_)
+                interpreter_->set_variable("s.current_message_layer",
+                                           oa::runtime::Value::make_string(active));
             return true;
         }
         case K::MessageLayerPop: {
             text_.pop_layer();
+            if (std::getenv("OA_TEXTTRACE"))
+                std::fprintf(stderr, "[text] /chgmsg -> active='%s'\n",
+                             text_.active_layer_id().c_str());
             const std::string active = text_.active_layer_id();
             const oa::render::MessageLayer* al = text_.layer(active);
             if (al) {
@@ -1225,6 +1354,9 @@ bool GameRuntime::RuntimeState::apply_text_event(const oa::runtime::Event& e) {
                 scene_.revive_message_layer(active);
             }
             scene_.set_default_message_layer(active);
+            if (interpreter_)
+                interpreter_->set_variable("s.current_message_layer",
+                                           oa::runtime::Value::make_string(active));
             return true;
         }
         case K::TextConfig: {
@@ -1299,10 +1431,70 @@ bool GameRuntime::RuntimeState::apply_text_event(const oa::runtime::Event& e) {
     }
 }
 
+void GameRuntime::RuntimeState::apply_lyc2_csv(std::map<std::string, std::string>* props) {
+    const auto fit = props->find("file");
+    if (fit == props->end() || fit->second.empty()) return;
+    // An explicit geometry on the tag wins (the framework sometimes overrides
+    // a csv-placed layer inline).
+    if (props->count("left") || props->count("top") || props->count("width") ||
+        props->count("height"))
+        return;
+    if (!interpreter_ || !interpreter_->hooks().resource_read) return;
+    const std::string csv = fit->second + ".csv";
+    std::optional<std::vector<uint8_t>> bytes;
+    if (auto b = interpreter_->hooks().resource_read(interpreter_->resolve_magic_path(csv)))
+        bytes = std::move(b);
+    else if (csv.rfind("_data/", 0) != 0 && csv[0] != ':')
+        bytes = interpreter_->hooks().resource_read("_data/" + csv);
+    if (!bytes) return;
+    const std::string text(reinterpret_cast<const char*>(bytes->data()), bytes->size());
+    // Two shapes in the wild: positional "left,top" (the mw plates) and
+    // key=value rows (`left = 290`). Both are merged as layer props; comment
+    // rows and blanks are skipped.
+    std::vector<std::string> nums;
+    size_t pos = 0;
+    while (pos <= text.size()) {
+        size_t nl = text.find_first_of("\r\n", pos);
+        if (nl == std::string::npos) nl = text.size();
+        std::string line = text.substr(pos, nl - pos);
+        pos = nl + 1;
+        while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) line.erase(0, 1);
+        while (!line.empty() && (line.back() == ' ' || line.back() == '\t')) line.pop_back();
+        if (line.empty() || (line.size() > 1 && line[0] == '/' && line[1] == '/')) continue;
+        if (const size_t eq = line.find('='); eq != std::string::npos) {
+            std::string key = line.substr(0, eq);
+            std::string val = line.substr(eq + 1);
+            while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) key.pop_back();
+            while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) val.erase(0, 1);
+            if (const size_t sp = val.find_first_of(" \t"); sp != std::string::npos)
+                val.resize(sp); // drop a trailing // comment
+            if (!key.empty() && !val.empty()) (*props)[key] = val;
+            continue;
+        }
+        size_t p = 0;
+        while (p <= line.size()) {
+            size_t c = line.find(',', p);
+            if (c == std::string::npos) c = line.size();
+            std::string tok = line.substr(p, c - p);
+            while (!tok.empty() && (tok.front() == ' ' || tok.front() == '\t')) tok.erase(0, 1);
+            while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\t')) tok.pop_back();
+            if (!tok.empty()) nums.push_back(tok);
+            if (c >= line.size()) break;
+            p = c + 1;
+        }
+    }
+    static const char* kOrder[] = {"left", "top", "width", "height", "xscale",
+                                   "yscale", "alpha", "rotate"};
+    for (size_t i = 0; i < nums.size() && i < sizeof(kOrder) / sizeof(kOrder[0]); ++i)
+        if (!props->count(kOrder[i])) (*props)[kOrder[i]] = nums[i];
+}
+
 bool GameRuntime::RuntimeState::apply_scene_event(const oa::runtime::Event& e) {
     using K = oa::runtime::Event::Kind;
     if (e.kind == K::LayerCreate) {
-        scene_.create(e.id, e.params);
+        std::map<std::string, std::string> props = e.params;
+        if (e.tag == "lyc2") apply_lyc2_csv(&props);
+        scene_.create(e.id, props);
         ++scene_layer_events_;
         return true;
     }
@@ -1744,9 +1936,29 @@ void GameRuntime::RuntimeState::end_debug_skip() {
     }
 }
 
+/// OA_STORYDBG=1: log WHY a story wait was released (first 80 lines). The
+/// "story runs by itself" reports need the exact release source — physical
+/// click, scripted decide edge, skip mode, exskip fast-forward, or the clock.
+void storydbg(const oa::runtime::WaitReason& w, const char* why, bool clicked,
+              bool decide, bool skip, bool exskip) {
+    if (!std::getenv("OA_STORYDBG") || g_storydbg >= 20) return;
+    ++g_storydbg;
+    std::fprintf(stderr, "[story] release %s id='%s' by %s (click=%d decide=%d skip=%d exskip=%d)\n",
+                 w.kind == oa::runtime::WaitReason::Kind::Timed ? "timed" : "generic",
+                 w.id.c_str(), why, clicked ? 1 : 0, decide ? 1 : 0, skip ? 1 : 0,
+                 exskip ? 1 : 0);
+}
+
 bool GameRuntime::RuntimeState::resolve_wait(uint64_t delta_ms, const FrameInput& in, bool clicked) {
     if (!wait_) return true;
     (void)in;
+    // A wait armed by this very tick never resolves in the same tick: Artemis
+    // consumes at least one frame even for [wait time=0] (macro.iet: "wait
+    // time = 0 でも 1ms 消費するため"). Resolving in-tick made every zero-time
+    // yield a no-op and let the script run several "frames" of logic inside
+    // one frame.
+    const bool armed_now = wait_armed_this_tick_;
+    wait_armed_this_tick_ = false;
     // FPM e:debugSkip fast-forward — every non-Stop wait
     // releases instantly while the engine exskip state is active (the Lua
     // flg.exskip half already suppresses text/sound/emote rows, so waits are
@@ -1759,13 +1971,23 @@ bool GameRuntime::RuntimeState::resolve_wait(uint64_t delta_ms, const FrameInput
     }
     switch (wait_->kind) {
         case oa::runtime::WaitReason::Kind::Timed: {
+            if (armed_now) return false;
             const bool clickable = wait_->input == 1;
-            const bool skip_pass = wait_->input == 2;
+            // input=2 ([wait2]): click-skip is NOT allowed; only skip mode
+            // passes early. It used to be treated as "always pass", which
+            // turned every [wait2 3000] in the scenario into a zero wait and
+            // made the whole story auto-advance at frame rate.
             // A scripted decide edge (e:overrideKey status=32, the FPM
             // "dummy click") counts like a physical click for input waits.
-            if ((clickable && (clicked || decide_edge_)) || skip_active_ || skip_pass)
+            if ((clickable && (clicked || decide_edge_)) || skip_active_) {
+                storydbg(*wait_, clickable ? "click/decide-or-skip" : "skip",
+                         clicked, decide_edge_, skip_active_, exskip_active_);
                 return true;
-            if (wait_remaining_ms_ <= delta_ms) return true;
+            }
+            if (wait_remaining_ms_ <= delta_ms) {
+                storydbg(*wait_, "clock", clicked, decide_edge_, skip_active_, exskip_active_);
+                return true;
+            }
             wait_remaining_ms_ -= delta_ms;
             return false;
         }
@@ -1837,8 +2059,11 @@ bool GameRuntime::RuntimeState::resolve_wait(uint64_t delta_ms, const FrameInput
         }
         case oa::runtime::WaitReason::Kind::Generic:
         case oa::runtime::WaitReason::Kind::Generic0: {
-            // decide edges advance input waits too.
-            const bool input_advance = clicked || decide_edge_;
+            // decide edges advance input waits too — except a plain [wt]
+            // (splash/logo "click to continue"): the boot-time setexclick
+            // dummy click must not skip it.
+            const bool input_advance =
+                clicked || (decide_edge_ && wait_->id != "wt");
             // 点击等待且文本仍在逐字揭示 → 先整页揭示，不推进
             // （reveal_text_now 并 return false）
             if (input_advance && !text_.is_reveal_complete()) {
@@ -1860,13 +2085,19 @@ bool GameRuntime::RuntimeState::resolve_wait(uint64_t delta_ms, const FrameInput
                 text_.reveal_all();
                 return false;
             }
-            if (input_advance) return true;
+            if (input_advance) {
+                storydbg(*wait_, clicked ? "click" : "decide", clicked, decide_edge_,
+                         skip_active_, exskip_active_);
+                return true;
+            }
             // skip (command/control) releases generic waits after a full reveal.
             if (skip_active_) {
                 if (!text_.is_reveal_complete()) {
                     text_.reveal_all();
                     return false;
                 }
+                storydbg(*wait_, "skip_active", clicked, decide_edge_, skip_active_,
+                         exskip_active_);
                 return true;
             }
             if (automode_) {
@@ -2062,6 +2293,31 @@ GameRuntime::RuntimeState::PointerConsumption GameRuntime::RuntimeState::process
     std::vector<std::string> interactive;
     for (const std::string& id : hits)
         if (scene_.has_any_enabled_handler(id)) interactive.push_back(id);
+    if (std::getenv("OA_POINTERDBG") && (pointer_moved || left_down_edge)) {
+        std::string hl;
+        for (const std::string& id : hits) hl += id + " ";
+        std::fprintf(stderr, "[ptr] (%d,%d) moved=%d click=%d hits=%zu [%s] inter=%zu\n",
+                     in.mouse_x, in.mouse_y, pointer_moved ? 1 : 0,
+                     left_down_edge ? 1 : 0, hits.size(), hl.c_str(), interactive.size());
+        if (left_down_edge) {
+            for (const oa::render::Layer* l : scene_.draw_order()) {
+                if (l->event_handlers.empty()) continue;
+                size_t enabled_handlers = 0;
+                std::string handler_kinds;
+                for (const auto& [etype, h] : l->event_handlers) {
+                    if (h.enabled) ++enabled_handlers;
+                    handler_kinds += (h.enabled ? "+" : "-") + etype + ":" + h.handler + ",";
+                }
+                std::fprintf(stderr,
+                             "[ptr]   layer %s left=%.0f top=%.0f w=%.0f h=%.0f clip=%d "
+                             "visible=%.0f eff=%d handlers=%zu/%s\n",
+                             l->id.c_str(), l->left, l->top, l->width, l->height,
+                             l->has_clip ? 1 : 0, l->visible ? 1.0 : 0.0,
+                             scene_.is_effectively_visible(l->id) ? 1 : 0,
+                             enabled_handlers, handler_kinds.c_str());
+            }
+        }
+    }
 
     // event_dispatch_layers: top + penetration, reversed.
     auto dispatch_list = [&](const std::vector<std::string>& base,
@@ -2209,7 +2465,25 @@ GameRuntime::RuntimeState::PointerConsumption GameRuntime::RuntimeState::process
         // right button / ESC first walk the engine rclick chain (hide
         // recovery or the configured rclick script); only when unconsumed does
         // the same key reach the push row.
-        if ((key == kKeyMouseRight || key == 27) && trigger_rclick()) continue;
+        if (key == kKeyMouseRight || key == 27) {
+            if (trigger_rclick()) continue;
+            // The framework's [exkey] ("extended key input wait") is built on
+            // a QUEUE-armed click wait: exkeyin enqueues
+            //   [keyconfig role=0 keys=124][chgmsg dummy][@][/chgmsg]
+            //   [calllua exkeyin_exit label=...]
+            // where key 124 = "any input". A cancel-key press (right button /
+            // ESC) must satisfy that wait, otherwise the CG viewer parked on
+            // [@] forever ("right-click freezes, menu buttons dead"). Normal
+            // script-armed [@] waits are unaffected (last_wait_from_queue is
+            // false there).
+            if (wait_ &&
+                (wait_->kind == oa::runtime::WaitReason::Kind::Generic ||
+                 wait_->kind == oa::runtime::WaitReason::Kind::Generic0) &&
+                interpreter_ && interpreter_->last_wait_from_queue()) {
+                pc.role_advance = true;
+                continue;
+            }
+        }
         // keyconfig role edges (advance/hide/backlog/automode/skip).
         // Role-0 edges count as a
         // click substitute (pc.role_advance feeds the clicked formula).
@@ -2255,6 +2529,36 @@ bool GameRuntime::RuntimeState::dispatch_layer_row(
     const auto fn_it = params.find("function");
     bool handled = true;
     bool fn_queued = false; // this row's fn enqueued >=1 engine tag
+    if (std::getenv("OA_POINTERDBG")) {
+        const auto n = params.find("name");
+        std::fprintf(stderr, "[ptr] row id=%s handler=%s fn=%s name=%s file=%s label=%s\n",
+                     id.c_str(), row.handler.c_str(),
+                     fn_it == params.end() ? "-" : fn_it->second.c_str(),
+                     n == params.end() ? "-" : n->second.c_str(), row.file.c_str(),
+                     row.label.c_str());
+    }
+    // handler="var" rows (the iMel framework's buttons): the row itself is a
+    // [var name=... data=...] assignment — button.iet registers its click as
+    //   lyevent type=click handler=var name=t.button_data data=<packed event>
+    //   file=system/button.iet label=pushed call=1
+    // and the *pushed macro then dispatches the packed file/label/call. Without
+    // this branch every click on a macro-built button (language choice, title
+    // menu, config rows) was a no-op.
+    if (row.handler == "var") {
+        const auto name_it = params.find("name");
+        if (name_it != params.end() && !name_it->second.empty()) {
+            std::map<std::string, std::string> var_params;
+            var_params["name"] = name_it->second;
+            const auto data_it = params.find("data");
+            var_params["data"] = data_it == params.end() ? std::string() : data_it->second;
+            interpreter_->apply_var(var_params);
+            PointerDispatch d;
+            d.kind = kind;
+            d.layer = id;
+            d.function = "var:" + name_it->second;
+            notify_pointer(d);
+        }
+    }
     if (fn_it != params.end() && !fn_it->second.empty()) {
         PointerDispatch d;
         d.kind = kind;
@@ -2279,6 +2583,9 @@ bool GameRuntime::RuntimeState::dispatch_layer_row(
     // origin ("inline" execution round trip); plain `jump` navigates
     // permanently. Runs on the next tag drain.
     if (!row.file.empty() || !row.label.empty()) {
+        // Protect the caller chain for this click's tag drain (see
+        // Interpreter::set_return_floor).
+        interpreter_->set_return_floor(interpreter_->call_stack().size());
         std::map<std::string, std::string> nav;
         if (!row.file.empty()) nav["file"] = row.file;
         if (!row.label.empty()) nav["label"] = row.label;

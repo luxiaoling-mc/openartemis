@@ -239,6 +239,88 @@ void test_unclosed_bracket_kept_as_text() {
              "bracket restored in tail text");
 }
 
+void test_preprocessor_autoinsert() {
+    // Artemis script-input support (Docs/tag/preprocessor/autoinsert.txt):
+    // the directives decorate every following line and emit nothing
+    // themselves. iMel titles depend on this for the per-line page break —
+    // [onlineend] is where `[wait scenario="1" input="1"]` lives.
+    const std::string content = R"(
+[&scpsupport mode="init"]
+[&autoinsert target="linehead" command="[onlinehead]"]
+[&autoinsert target="lineend" command="[onlineend]"]
+[&autoinsert target="blankline" command="[onblankline]"]
+[背景 st="BG01"]
+
+[lang ja]――ごきげんよう。[/lang]
+)";
+    const auto s = oa::runtime::Script::parse("scenario", content);
+    check_eq(tags_of(s),
+             (std::vector<std::string>{"onlinehead", "背景", "onlineend",
+                                       "onblankline", "onlinehead", "lang",
+                                       "TEXT", "/lang", "onlineend"}),
+             "autoinsert decorates head/end/blank lines");
+    bool leaked = false;
+    for (const auto& i : s.instructions)
+        if (!i.tag.empty() && i.tag.front() == '&') leaked = true;
+    check(!leaked, "preprocessor directives are not emitted as instructions");
+}
+
+void test_preprocessor_scpsupport_char() {
+    // scpsupport mode="add" attaches a tag where the line's text ends with
+    // `char`; without `char` it applies to every scenario-text line.
+    const std::string content = R"(
+[&scpsupport mode="init"]
+[&scpsupport mode="add" char="】" command="[rt]"]
+【スライム】
+ただの文
+)";
+    const auto s = oa::runtime::Script::parse("scenario", content);
+    check_eq(tags_of(s), (std::vector<std::string>{"TEXT", "rt", "TEXT"}),
+             "char rule fires only on the matching line end");
+}
+
+void test_preprocessor_absent_is_inert() {
+    // No directives: the parser must behave exactly as before (FPM scripts).
+    const auto s = oa::runtime::Script::parse("test", "ただのテキスト\n[var name=\"a\" data=\"1\"]\n");
+    check_eq(tags_of(s), (std::vector<std::string>{"TEXT", "var"}),
+             "no directives -> no injected rows");
+}
+
+void test_preprocessor_linetag() {
+    // [&linetag] marks "#command p0,p1" rows as COMMANDS instead of prose.
+    const std::string content = R"(
+[&linetag allow="1" prefix="#"]
+#立ち絵表示 中_星_制服,c,210
+普通の文章
+)";
+    const auto s = oa::runtime::Script::parse("scenario", content);
+    check_eq(s.instructions.size(), size_t(2), "linetag row + one prose row");
+    check(s.instructions[0].kind == oa::runtime::Instruction::Kind::LineTag,
+          "prefixed row is a line tag");
+    check_eq(s.instructions[0].get_or("text", ""),
+             std::string("立ち絵表示 中_星_制服,c,210"), "command payload kept raw");
+    check(s.instructions[1].kind == oa::runtime::Instruction::Kind::Text,
+          "unprefixed row stays prose");
+}
+
+void test_linetag_tag_ini_columns() {
+    // tag.ini supplies the column names for a line tag command.
+    oa::runtime::Interpreter it;
+    const std::string ini =
+        "; line type command\n[立ち絵表示]\n0=st\n1=pos\n2=time\n";
+    it.hooks().file_loader = [&ini](const std::string& name)
+        -> std::optional<std::vector<uint8_t>> {
+        if (name == "tag.ini")
+            return std::vector<uint8_t>(ini.begin(), ini.end());
+        return std::nullopt;
+    };
+    const auto& cols = it.line_tag_params("立ち絵表示");
+    check_eq(cols.size(), size_t(3), "three columns");
+    check_eq(cols[0], std::string("st"), "column 0 = st");
+    check_eq(cols[2], std::string("time"), "column 2 = time");
+    check(it.line_tag_params("未定義").empty(), "unknown command -> positional");
+}
+
 } // namespace
 
 void test_real_first_iet() {
@@ -290,6 +372,11 @@ int main() {
     test_instruction_methods();
     test_unclosed_quote_errors();
     test_unclosed_bracket_kept_as_text();
+    test_preprocessor_autoinsert();
+    test_preprocessor_scpsupport_char();
+    test_preprocessor_absent_is_inert();
+    test_preprocessor_linetag();
+    test_linetag_tag_ini_columns();
     if (failures) {
         std::fprintf(stderr, "script_test: %d failure(s)\n", failures);
         return 1;

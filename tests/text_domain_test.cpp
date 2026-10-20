@@ -942,6 +942,37 @@ void test_no_cross_layer_geometry_inheritance() {
     e.pop_layer();
 }
 
+void test_entire_scale_folds_into_glyph_metrics() {
+    // iMel's mw font rows are authored in a 1.5x glyph space and ask the engine
+    // to fold it in (entirexscale/entireyscale = 66). The glyph metrics and the
+    // TEXT BOX width/height are in that space; left/top are screen coordinates.
+    // Getting this wrong drew the body 1.5x too large / above the window and
+    // pushed the name out of its plate.
+    TextEngine e;
+    e.apply_font(tag({{"left", "400"},
+                      {"top", "810"},
+                      {"width", "1600"},
+                      {"height", "255"},
+                      {"size", "70"},
+                      {"entirexscale", "66"},
+                      {"entireyscale", "66"}}));
+    const oa::render::MessageLayer* l = e.layer("adv01");
+    check(l != nullptr, "T20 entire: layer exists");
+    check(l && approx(l->left, 400.0) && approx(l->top, 810.0),
+          "T20 entire: left/top stay screen coordinates");
+    check(l && approx(l->width, 1056.0, 1e-3) && approx(l->height, 168.3, 1e-2),
+          "T20 entire: box width/height fold the factor");
+    check(l && approx(l->font.size(), 46.2, 1e-2),
+          "T20 entire: glyph size folds the factor");
+    // No entire* keys -> untouched (every other title's font rows).
+    TextEngine plain;
+    plain.apply_font(tag({{"left", "400"}, {"top", "810"}, {"width", "1600"},
+                          {"size", "70"}}));
+    const oa::render::MessageLayer* pl = plain.layer("adv01");
+    check(pl && approx(pl->width, 1600.0) && approx(pl->font.size(), 70.0),
+          "T20 no entire* -> metrics pass through");
+}
+
 } // namespace
 
 int main() {
@@ -957,6 +988,7 @@ int main() {
     test_overlay_text_hides_with_tree_ancestor();
     test_runtime_text_flow();
     test_content_newline_semantics();
+    test_entire_scale_folds_into_glyph_metrics();
     test_content_newline_runtime_e2e();
     test_orphan_print_paint_gate();
     test_no_cross_layer_geometry_inheritance();

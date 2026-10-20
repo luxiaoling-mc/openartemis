@@ -403,6 +403,12 @@ struct GameRuntime::RuntimeState {
     /// when the event belongs to the compositor boundary and was consumed.
     /// Host event stream never sees these.
     bool apply_scene_event(const oa::runtime::Event& e);
+    /// [lyc2] = "lyc with the image's csv": `<file>.csv` carries the layer's
+    /// placement ("168,747" = left,top, or key=value rows). Merges those keys
+    /// into `props` unless the tag already names the geometry itself. Without
+    /// it every lyc2-created plate — the message window and the name plate
+    /// included — was created at 0,0.
+    void apply_lyc2_csv(std::map<std::string, std::string>* props);
     /// "内容在场面"的每帧推进唯一
     /// 逐面序列(reveal → scene 轨 → emote 双时钟之一 → click-wait 图标 →
     /// 媒体帧末;相位保真红线 R6 —— 顺序逐帧不变,重排即改动画
@@ -526,6 +532,17 @@ struct GameRuntime::RuntimeState {
     std::pair<double, double> bound_image_size(const oa::render::Layer& l);
     // [B] E: open_project 的平台串；[reset] 重启复用
     std::string platform_; // project platform of open_project (restart re-open)
+    /// True when the current tick carries fresh player input (click/decide/
+    /// key edge). The clock-driven park guard must let such a tick drain the
+    /// queue: FPM's click-to-skip on the splash/lines is a Lua handler that
+    /// e:tags the next step, so holding the batch would swallow the click.
+    bool input_this_tick_ = false;
+    /// Framework family probe (open_project): true when the project ships
+    /// system/script.asb — the FPM family (scriptMainloop + estag drivers,
+    /// ハミダシクリエイティブ/まどそふと …). Those titles need the queued
+    /// e:tag order (see InterpreterHooks::immediate_tags) and must not let
+    /// pre-enqueued scenario rows replace a clock-driven park.
+    bool fpm_family_ = false;
     // [B] E+L: 宿主重建 VM（boot）；读档只 restore_position + Lua restore() 回填。A 面投影源；Lua 全局/闭包与 tag 队列归 [B]（无存档面）
     std::unique_ptr<oa::runtime::Interpreter> interpreter_;
     // [B] E: 读档 reset 后由恢复位置的那一行重跑重导出（停驻时 current_line 指停驻行）
@@ -534,6 +551,9 @@ struct GameRuntime::RuntimeState {
     uint64_t tick_count_ = 0; // per-tick frame number for e:getFrameNumber
     // [C] E: wait_ 的派生量；读档清零
     uint64_t wait_remaining_ms_ = 0;
+    /// The active wait was armed by the current tick: it must survive to the
+    /// next tick (Artemis yields at least one frame for every wait, even 0ms).
+    bool wait_armed_this_tick_ = false;
     // [B] E: [exit] 控制闩；读档保留（reset_domains 清）
     bool exit_requested_ = false;
     // [C] E: 每 tick 由 skip_active() 重算

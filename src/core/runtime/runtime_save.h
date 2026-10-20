@@ -76,6 +76,22 @@ struct LayerSnap {
     std::vector<LayerEventHandlerSnap> handlers;
 };
 
+/// One message layer's visible page. The text engine's stream is runtime
+/// structure (never part of the scene snapshot), so without this the window
+/// comes back empty after a load: the saved position sits PAST the [print]
+/// that produced the line on screen, and nothing re-issues it. iMel titles
+/// autosave at every line end, so the very first thing a returning player sees
+/// is that empty window.
+struct TextLayerSnap {
+    std::string id;
+    bool active = false;
+    bool positioned = false;
+    double left = 0, top = 0, width = 0, height = 0;
+    std::map<std::string, std::string> font; // FontDesc::raw (box + face + size…)
+    std::string text;                        // flattened page, '\n' = line break
+    bool revealed = true;                    // fully revealed when saved
+};
+
 // ---------------------------------------------------------------------------
 // One numbered save.
 //
@@ -105,6 +121,9 @@ struct SaveData {
     // Audio (optional).
     bool has_audio = false;
     AudioSnap audio;
+    // Message-layer text pages (optional; see TextLayerSnap).
+    bool has_text = false;
+    std::vector<TextLayerSnap> text_layers;
 
     /// Encode to one binary document.
     std::string encode() const;

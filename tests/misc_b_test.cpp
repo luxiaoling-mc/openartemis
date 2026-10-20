@@ -208,6 +208,60 @@ void test_file_exists_save_bridge() {
 }
 
 // ---------------------------------------------------------------------------
+// W17: a save carries the message-layer text pages
+// ---------------------------------------------------------------------------
+void test_text_pages_survive_save_load() {
+    // The scene snapshot deliberately skips the engine message slots and the
+    // text stream is runtime structure, so without a page snapshot the window
+    // comes back empty after [load]: iMel titles autosave at every line end, so
+    // the first thing a returning player sees is that empty window (Watamari
+    // "再启动一次文字就没了").
+    auto store = std::make_shared<MemSaveStore>();
+    auto fs = boot_fs(
+        "[chgmsg id=\"adv\"]\n"
+        "[font left=\"400\" top=\"810\" width=\"1200\" height=\"200\" size=\"40\""
+        " align=\"center\"]\n"
+        "[print data=\"一二三\"]\n"
+        "[@]\n"
+        "[stop]\n");
+    oa::runtime::FrameInput idle;
+    oa::runtime::GameRuntime rt(fs);
+    rt.set_save_store(store);
+    rt.open_project("windows");
+    rt.boot_project();
+    for (int i = 0; i < 4; ++i) {
+        rt.tick(16, idle);
+        (void)rt.drain_events();
+    }
+    const auto* ml = rt.text().layer("adv");
+    check(ml && ml->char_count == 3, "W17 the line is on screen before saving");
+    check(rt.save_game_to("save/q01.dat"), "W17 save writes");
+
+    oa::runtime::GameRuntime rt2(fs);
+    rt2.set_save_store(store);
+    rt2.open_project("windows");
+    rt2.boot_project();
+    for (int i = 0; i < 2; ++i) {
+        rt2.tick(16, idle);
+        (void)rt2.drain_events();
+    }
+    check(rt2.load_game_from("save/q01.dat", 0), "W17 load succeeds");
+    for (int i = 0; i < 3; ++i) {
+        rt2.tick(16, idle);
+        (void)rt2.drain_events();
+    }
+    const auto* ml2 = rt2.text().layer("adv");
+    check(ml2 && ml2->char_count == 3,
+          "W17 a loaded save restores the message-layer text");
+    check(ml2 && ml2->reveal_index == 3 && !ml2->reveal_pending,
+          "W17 the restored page is fully revealed (not mid-typing)");
+    check(ml2 && ml2->positioned && ml2->width == 1200.0,
+          "W17 the restored page keeps its text box");
+    const auto active = rt2.text().active_layer_id();
+    check(active == "adv", "W17 the restored page keeps its active layer");
+}
+
+// ---------------------------------------------------------------------------
 // W4: deferred [takess] + savess resize
 // ---------------------------------------------------------------------------
 void test_takess_deferred_and_resize() {
@@ -678,6 +732,7 @@ int main() {
     test_get_sound_info_bridge();
     test_file_update_time_bridge();
     test_file_exists_save_bridge();
+    test_text_pages_survive_save_load();
     test_takess_deferred_and_resize();
     test_skip_reaches_media();
     test_lytween_cancel_completion_survival();

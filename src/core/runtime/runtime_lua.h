@@ -62,6 +62,9 @@ struct LuaHost {
     // -- files ----------------------------------------------------------------
     std::function<std::optional<std::vector<uint8_t>>(const std::string&)> read_file;
     std::function<bool(const std::string&)> is_file_exists;
+    /// Absolute save-area root for the Lua `io.open` redirect (see
+    /// InterpreterHooks::save_root). Empty = stock behaviour (process CWD).
+    std::function<std::string()> save_root;
 
     // -- variables ------------------------------------------------------------
     std::function<const oa::runtime::Value*(const std::string&)> get_var;
@@ -73,6 +76,10 @@ struct LuaHost {
         enqueue_tag;
     /// Sync e:tag{"var",...} application (never queued).
     std::function<bool(std::map<std::string, std::string> params)> apply_var_tag;
+    /// e:tag{...}: execute a presentation tag synchronously. Returns false when
+    /// the engine cannot run it inline (control flow / not wired) so the Lua
+    /// side falls back to the deferred queue.
+    std::function<bool(const std::string&, std::map<std::string, std::string>)> run_tag_now;
     /// Sync Lua-originated e:tag{"calllua",...} dispatch.
     /// Mirrors the inline [calllua] tag semantics of .asb streams: the Lua
     /// callback runs at enqueue time — before the enclosing Lua flow can
@@ -114,6 +121,19 @@ struct LuaHost {
     /// Monotonic per-tick frame number (e:getFrameNumber); absent host ->
     /// interpreter falls back to an fps projection of its clock.
     std::function<uint64_t()> frame_number;
+    /// e:getScriptStack(): outermost call frame first, currently executing
+    /// script LAST (Lua indexes stack[#stack] as "this file" and
+    /// stack[#stack-1] as "the caller" — macro.iet's get_filename /
+    /// get_prefilename filters). Absent host -> empty table.
+    std::function<std::vector<std::pair<std::string, size_t>>()> script_stack;
+    /// e:getScriptBlock(frame): the tag row at frame.file : frame.index —
+    /// {command = tag name, parameter = raw params}. The iMel framework's
+    /// return filter (macro.iet tagFilters["return"]) inspects the row the
+    /// return lands on to decide whether to reset eventfilter; the previous
+    /// nil stub crashed it with "attempt to index local 'currentTag'".
+    std::function<std::optional<std::pair<std::string,
+        std::map<std::string, std::string>>>(const std::string& file, size_t index)>
+        script_block;
     /// FPM e:debugSkip (次の選択肢に進む / 高速スキップ; select.lua
     /// goNextSelectLoop). index = 99999 in FPM calls. Wired by GameRuntime to
     /// start the engine exskip fast-forward state.
@@ -197,6 +217,10 @@ public:
     /// Inline tag filter dispatch (registry table + dotted lookup + call).
     FilterDecision run_tag_filter(const std::string& tag,
                                   const std::map<std::string, std::string>& params);
+    /// Whether the script registered any tag filter at all (e:setTagFilter).
+    /// The interpreter uses this to decide whether a scenario text row has a
+    /// framework `print` handler to consult (iMel multi-language).
+    bool has_tag_filters() const;
 
     /// e:setEventFilter dispatch: calls the stored eventFilter(e, name,
     /// params). Returns
@@ -221,6 +245,9 @@ public:
 
 private:
     void install_engine_api();
+    /// Wrap io.open so relative paths land in the save area (the framework
+    /// persists system.dat/saveg.dat through plain Lua file I/O).
+    void install_save_open_redirect(lua_State* L);
     /// Push the engine handle userdata onto the stack (the `e` value of
     /// host->Lua calls); engine_ref_ is its anonymous registry anchor.
     void push_engine(lua_State* L) const;

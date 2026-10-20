@@ -205,6 +205,71 @@ bool legacy_reserved_file(const std::string& file) {
            file.rfind("__emote_layer__:", 0) == 0;
 }
 
+/// Flatten a message layer's page into the one string the engine can re-issue:
+/// Text/RubyBase units keep their bytes, a Newline unit becomes '\n' (push_text
+/// splits it back into the same unit sequence).
+void collect_text_snapshot(oa::runtime::SaveData* data, const oa::render::TextEngine& text) {
+    data->has_text = true;
+    const std::string active = text.active_layer_id();
+    for (const auto& [id, ml] : text.layers()) {
+        std::string flat;
+        for (const auto& u : ml.page) {
+            if (u.kind == oa::render::PageUnit::Kind::Newline) flat.push_back('\n');
+            else flat += u.data;
+        }
+        if (flat.empty() && !ml.positioned) continue;
+        oa::runtime::TextLayerSnap s;
+        s.id = id;
+        s.active = (id == active);
+        s.positioned = ml.positioned;
+        s.left = ml.left;
+        s.top = ml.top;
+        s.width = ml.width;
+        s.height = ml.height;
+        s.font = ml.font.raw;
+        s.text = std::move(flat);
+        s.revealed = !ml.reveal_pending && ml.reveal_index >= ml.char_count;
+        data->text_layers.push_back(std::move(s));
+    }
+    if (std::getenv("OA_SAVETRACE"))
+        std::fprintf(stderr, "[save] text layers=%zu active=%s\n",
+                     data->text_layers.size(), active.c_str());
+}
+
+/// Rebuild the message layers' pages and re-bind them to the restored scene.
+/// The scene snapshot deliberately skips the engine message slots, so the
+/// binding has to be re-made here exactly like the [chgmsg] handler does.
+void restore_text_snapshot(oa::render::TextEngine* text, oa::render::Compositor* scene,
+                           const oa::runtime::SaveData& data) {
+    if (!data.has_text || data.text_layers.empty()) return;
+    text->clear_scene();
+    std::string active;
+    for (const auto& s : data.text_layers) {
+        if (s.id.empty()) continue;
+        std::map<std::string, std::string> font = s.font;
+        if (s.positioned) {
+            font["left"] = std::to_string(s.left);
+            font["top"] = std::to_string(s.top);
+            font["width"] = std::to_string(s.width);
+            font["height"] = std::to_string(s.height);
+        }
+        text->switch_layer(s.id, /*stack=*/false, std::nullopt);
+        if (!font.empty()) text->apply_font(font);
+        if (!s.text.empty()) text->push_text(s.text);
+        if (s.revealed) text->reveal_all();
+        const oa::render::MessageLayer* ml = text->layer(s.id);
+        const bool layered = ml && ml->layered;
+        const std::string scene_id = scene->ensure_message_scene_node(s.id, layered);
+        scene->set_message_layer_binding(s.id, scene_id);
+        scene->revive_message_layer(s.id);
+        if (s.active) active = s.id;
+    }
+    if (!active.empty()) {
+        text->switch_layer(active, /*stack=*/false, std::nullopt);
+        scene->set_default_message_layer(active);
+    }
+}
+
 void collect_scene_snapshot(oa::runtime::SaveData* data, const oa::render::Compositor& scene) {
     data->has_scene = true;
     const oa::render::Layer& root = scene.root_props();
@@ -398,6 +463,7 @@ bool GameRuntime::RuntimeState::save_game_to(const std::string& file) {
     }
     collect_scene_snapshot(&data, scene_);
     collect_audio_snapshot(&data, audio_);
+    collect_text_snapshot(&data, text_);
     const std::string doc = data.encode();
     const std::string path = qualify_save_file(file);
     if (path.empty()) {
@@ -672,6 +738,7 @@ LoadResult GameRuntime::RuntimeState::load_game(const std::string& file, int64_t
     const size_t cleared = reset_ephemeral_on_load();
 
     const SceneRestoreStats rst = restore_scene_snapshot(&scene_, data);
+    restore_text_snapshot(&text_, &scene_, data);
     for (const auto& [k, row] : live_input) {
         scene_.restore_input_row(k.first, k.second, row);
     }
@@ -1067,6 +1134,13 @@ constexpr const char* kLoopPlay = "loop_play";
 constexpr const char* kGain = "gain";
 constexpr const char* kPan = "pan";
 constexpr const char* kSkippable = "skippable";
+constexpr const char* kText = "text";
+constexpr const char* kTextLayers = "text_layers";
+constexpr const char* kActive = "active";
+constexpr const char* kPositioned = "positioned";
+constexpr const char* kFont = "font";
+constexpr const char* kBox = "box";
+constexpr const char* kRevealed = "revealed";
 
 /// 版本门（**未来跨版本策略的唯一分派点**）：新于本引擎 → 抛
 /// FormatError（拒绝读，不猜）；旧于本引擎 → 按缺省值读下去（decode 的字段循环
@@ -1301,8 +1375,33 @@ LayerEventHandlerSnap read_handler(Reader& r) {
     return h;
 }
 
-void write_layer(Writer& w, const LayerSnap& ls) {
-    w.map_begin(ls.handlers.empty() ? 2 : 3);
+void write_text_layer(Writer& w, const TextLayerSnap& ts) {
+    w.map_begin(7);
+    w.str(kId);
+    w.str(ts.id);
+    w.str(kActive);
+    w.boolean(ts.active);
+    w.str(kPositioned);
+    w.boolean(ts.positioned);
+    w.str(kRevealed);
+    w.boolean(ts.revealed);
+    w.str(kBox);
+    w.map_begin(4);
+    w.str("left");
+    w.f64(ts.left);
+    w.str("top");
+    w.f64(ts.top);
+    w.str("width");
+    w.f64(ts.width);
+    w.str("height");
+    w.f64(ts.height);
+    w.str(kFont);
+    write_str_map(w, ts.font);
+    w.str(kText);
+    w.str(ts.text);
+}
+
+void write_layer(Writer& w, const LayerSnap& ls) {    w.map_begin(ls.handlers.empty() ? 2 : 3);
     w.str(kId);
     w.str(ls.id);
     w.str(kProps);
@@ -1312,6 +1411,40 @@ void write_layer(Writer& w, const LayerSnap& ls) {
         w.array_begin(ls.handlers.size());
         for (const auto& h : ls.handlers) write_handler(w, h);
     }
+}
+
+TextLayerSnap read_text_layer(Reader& r) {
+    TextLayerSnap ts;
+    const size_t n = r.map_entries();
+    for (size_t i = 0; i < n; ++i) {
+        const std::string key = r.str();
+        if (key == kId) {
+            ts.id = r.str();
+        } else if (key == kActive) {
+            ts.active = r.boolean();
+        } else if (key == kPositioned) {
+            ts.positioned = r.boolean();
+        } else if (key == kRevealed) {
+            ts.revealed = r.boolean();
+        } else if (key == kBox) {
+            const size_t bn = r.map_entries();
+            for (size_t j = 0; j < bn; ++j) {
+                const std::string bkey = r.str();
+                if (bkey == "left") ts.left = r.f64();
+                else if (bkey == "top") ts.top = r.f64();
+                else if (bkey == "width") ts.width = r.f64();
+                else if (bkey == "height") ts.height = r.f64();
+                else r.skip_value();
+            }
+        } else if (key == kFont) {
+            ts.font = read_str_map(r);
+        } else if (key == kText) {
+            ts.text = r.str();
+        } else {
+            r.skip_value();
+        }
+    }
+    return ts;
 }
 
 LayerSnap read_layer(Reader& r) {
@@ -1342,7 +1475,7 @@ std::string SaveData::encode() const {
         throw FormatError("save position out of int64 range");
     }
     Writer w;
-    w.map_begin(4 + (has_scene ? 1 : 0) + (has_audio ? 1 : 0));
+    w.map_begin(4 + (has_scene ? 1 : 0) + (has_audio ? 1 : 0) + (has_text ? 1 : 0));
     w.str(kLocalVars);
     w.map_begin(local_variables.size());
     for (const auto& [k, v] : local_variables) {
@@ -1377,6 +1510,13 @@ std::string SaveData::encode() const {
     if (has_audio) {
         w.str(kAudio);
         write_audio(w, audio);
+    }
+    if (has_text) {
+        w.str(kText);
+        w.map_begin(1);
+        w.str(kTextLayers);
+        w.array_begin(text_layers.size());
+        for (const auto& ts : text_layers) write_text_layer(w, ts);
     }
     return w.data();
 }
@@ -1439,6 +1579,19 @@ SaveData SaveData::decode(const std::string& bytes) {
         } else if (key == kAudio) {
             d.has_audio = true;
             d.audio = read_audio(r);
+        } else if (key == kText) {
+            d.has_text = true;
+            const size_t tn = r.map_entries();
+            for (size_t j = 0; j < tn; ++j) {
+                const std::string tkey = r.str();
+                if (tkey != kTextLayers) {
+                    r.skip_value();
+                    continue;
+                }
+                const size_t ln = r.array_items();
+                d.text_layers.reserve(ln);
+                for (size_t k = 0; k < ln; ++k) d.text_layers.push_back(read_text_layer(r));
+            }
         } else {
             r.skip_value();
         }

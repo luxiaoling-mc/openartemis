@@ -3,7 +3,7 @@
 //
 // TEST-ONLY: deterministic windowed UI journeys (OA_AUTODRIVE=exit|title|help|
 // conf|r10save|r10t|r10blog|qld|d38|nmfg|scale|fontscan|kdemote|langidle|
-// slnywalk), synthetic-input
+// slnywalk|eu13), synthetic-input
 // probes, pixel metrics and the evidence dumps. The plain user binary never
 // compiles this file. main.cpp / main_test.cpp keep only the small
 // #if OA_TEST_BUILD hooks that call into this TU (ad_drive / ad_pre_tick /
@@ -4548,6 +4548,185 @@ static bool ad_fontscan_drive(AppState* s) {
 }
 
 // ---------------------------------------------------------------------------
+// OA_AUTODRIVE=eu13 — test13 story walk (Eustia, Ethornell-converted project).
+//
+// This family registers the title rows from Lua (`csvbtn2` / `exec=title_click`)
+// with no `key=` param — every other journey addresses the start button by
+// `key=bt_start`, which simply does not exist here, so the story is never
+// entered. The start row is the first title button: id 400.2.1 (bt_start at
+// 456,314 368x52). Stage 0 parks on the title `[stop]` and clicks it; stage 1
+// clicks the first-run help card through; stage 2 walks the opening scene,
+// printing the story sprite layers (1.1.0.20.*, the baked text images this
+// converter emits) and the message layers per page, and freezes a PNG.
+//   OA_EU_PAGES (default 6)   pages to walk before the freeze
+//   OA_EU_GAP   (default 45)  frames between advance clicks
+//   OA_EU_QUIET (default 240) frames held still before the settled frame
+//   OA_EU_START (default 0)   first stage to run (1 = skip the title click)
+static void ad_eu_story_dump(AppState* s, oa::runtime::GameRuntime* rt,
+                             const char* tag) {
+    std::printf("[eu13] %s f=%llu wait=%s layers=%zu\n", tag,
+                (unsigned long long)s->frames,
+                wait_desc(rt->current_wait()).c_str(), rt->scene().size());
+    for (const oa::render::Layer* l : rt->scene().draw_order()) {
+        if (l->id.rfind("1.1.0.20.", 0) != 0) continue;
+        std::printf("[eu13]  sprite %-18s left=%.0f top=%.0f w=%.0f h=%.0f "
+                    "vis=%.0f alpha=%.3f file=%s%s%s\n",
+                    l->id.c_str(), l->left, l->top, l->width, l->height,
+                    l->visible ? 1.0 : 0.0, l->alpha,
+                    l->file.c_str(), l->mask.empty() ? "" : " mask=",
+                    l->mask.c_str());
+    }
+    const std::string active = rt->text().active_layer_id();
+    if (const oa::render::MessageLayer* ml = rt->text().layer(active)) {
+        std::string sample;
+        for (const auto& u : ml->page)
+            if (u.kind != oa::render::PageUnit::Kind::Newline && !u.data.empty()) {
+                sample = u.data.substr(0, 24);
+                break;
+            }
+        std::printf("[eu13]  msg %s chars=%zu reveal=%zu/%zu visible=%d box=(%.0f,%.0f "
+                    "%.0fx%.0f) sample='%s'\n",
+                    active.c_str(), ml->char_count, ml->reveal_index, ml->char_count,
+                    rt->scene().is_message_layer_visible(active) ? 1 : 0, ml->left,
+                    ml->top, ml->width, ml->height, sample.c_str());
+    }
+    // Anything still dimming the stage: a stranded film/blackout layer covers
+    // the story sprites (the whole page reads as "no text").
+    size_t shown = 0;
+    for (const oa::render::Layer* l : rt->scene().draw_order()) {
+        if (l->alpha > 0.99 && l->visible) continue;
+        std::printf("[eu13]  dim %-16s alpha=%.3f vis=%.0f file=%s color=%d\n",
+                    l->id.c_str(), l->alpha, l->visible ? 1.0 : 0.0, l->file.c_str(),
+                    l->has_color ? 1 : 0);
+        if (++shown >= 10) break;
+    }
+    // Only the settled/aborted frames are worth a PNG: a readback per page
+    // caps the walk at a few frames per second.
+    if (!s->ad_out.empty() &&
+        (std::strcmp(tag, "settled") == 0 || std::strcmp(tag, "nostory") == 0))
+        ad_png_shot(s, tag);
+}
+
+static bool ad_eu13_drive(AppState* s) {
+    oa::runtime::GameRuntime* rt = s->rt.get();
+    ++s->ad_stage_f;
+    static int sub = -1;      // 0 title park / 1 help+start / 2 story walk
+    static int gap = -1, pages = -1, quiet = -1;
+    static int walk_f = 0, pages_done = 0, idle = 0;
+    if (sub < 0) {
+        sub = 0;
+        const char* v = std::getenv("OA_EU_GAP");
+        gap = (v && *v) ? std::max(5, std::atoi(v)) : 45;
+        v = std::getenv("OA_EU_PAGES");
+        pages = (v && *v) ? std::max(0, std::atoi(v)) : 6;
+        v = std::getenv("OA_EU_QUIET");
+        quiet = (v && *v) ? std::max(0, std::atoi(v)) : 240;
+        if ((v = std::getenv("OA_EU_START")) && *v && std::atoi(v) >= 1) sub = 2;
+        std::printf("[eu13] gap=%d pages=%d start_stage=%d\n", gap, pages, sub);
+    }
+    const int sw = rt->project_.config.stage_width;
+    const int sh = rt->project_.config.stage_height;
+    const auto story_layer = [rt]() -> const oa::render::Layer* {
+        for (const oa::render::Layer* l : rt->scene().draw_order())
+            if (l->id.rfind("1.1.0.20.", 0) == 0) return l;
+        return nullptr;
+    };
+    if (sub == 0) {
+        // Title parked on the asbmacro `[stop]` with its rows registered: the
+        // row geometry (id 400.2.1 / 456,314 368x52 from csv.ui_title) is what
+        // stage 1 aims at, so all this stage does is wait for it.
+        const oa::runtime::WaitReason* w = rt->current_wait();
+        if (w && w->kind == oa::runtime::WaitReason::Kind::Stop &&
+            rt->scene().find("400.2.1")) {
+            std::printf("[eu13] f=%llu title parked; walking the start row\n",
+                        (unsigned long long)s->frames);
+            sub = 1;
+            idle = 0;
+        }
+        if (s->frames > 40000) {
+            std::printf("[eu13] title never parked; abort\n");
+            s->quit = true;
+        }
+        return false;
+    }
+    if (sub == 1) {
+        // First-run help card parks on `[allkeyclick EMERGENCY]`; the game then
+        // resets into scenario/main.iet -> main/aiy00010.asb. Click the centre
+        // until the opening scene's sprites show up.
+        if (const oa::render::Layer* l = story_layer()) {
+            std::printf("[eu13] f=%llu story reached (first sprite %s)\n",
+                        (unsigned long long)s->frames, l->id.c_str());
+            sub = 2;
+            walk_f = 0;
+            return false;
+        }
+        // The title rows are rollover-driven (`title_click` reads btn_cursor,
+        // set by the row's rollover handler), and hover only diffs when the
+        // POINTER MOVES. A plain click at a fixed point therefore lands with
+        // btn_cursor == nil. Walk the pointer in from off the row every beat:
+        // away -> onto the row (hover) -> press.
+        const int ph = ++idle % 30;
+        const int row_x = sw / 2, row_y = int(sh * 0.48); // bt_start row centre
+        if (ph == 0) {
+            s->ad_hover = true;
+            s->ad_cx = 40;
+            s->ad_cy = 40;
+        } else if (ph == 8) {
+            s->ad_hover = true;
+            s->ad_cx = row_x;
+            s->ad_cy = row_y;
+            std::printf("[eu13] f=%llu hover row (%d,%d) wait=%s\n",
+                        (unsigned long long)s->frames, row_x, row_y,
+                        wait_desc(rt->current_wait()).c_str());
+        } else if (ph == 10) {
+            s->ad_hover = false;
+            s->ad_cx = row_x;
+            s->ad_cy = row_y;
+            s->ad_click = true;
+            std::printf("[eu13] f=%llu start click (%d,%d) wait=%s\n",
+                        (unsigned long long)s->frames, row_x, row_y,
+                        wait_desc(rt->current_wait()).c_str());
+        }
+        if (s->frames > 60000) {
+            std::printf("[eu13] story never started; abort\n");
+            ad_eu_story_dump(s, rt, "nostory");
+            s->quit = true;
+        }
+        return false;
+    }
+    if (sub == 3) {
+        if (++walk_f >= quiet) {
+            ad_eu_story_dump(s, rt, "settled");
+            s->quit = true;
+        }
+        return false;
+    }
+    // Stage 2: the opening is a timed sprite sequence — text images appear on
+    // their own. Sample every `gap` frames, click to cut the waits, then hold
+    // still for `quiet` frames (OA_EU_QUIET, default 240) and freeze the
+    // settled page — a mid-transition frame is dimmed/ghosted and reads like
+    // "no text" when it is only the fade.
+    if (++walk_f % gap == 0) {
+        ad_eu_story_dump(s, rt, ("page" + std::to_string(pages_done)).c_str());
+        if (++pages_done < pages) {
+            s->ad_cx = sw / 2;
+            s->ad_cy = int(sh * 0.87);
+            s->ad_click = true;
+        } else {
+            std::printf("[eu13] walk done (%d pages); holding %d frames\n",
+                        pages_done, quiet);
+            sub = 3;
+            walk_f = 0;
+        }
+    }
+    if (s->frames > 80000) {
+        std::printf("[eu13] walk timeout\n");
+        s->quit = true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 // OA_AUTODRIVE=langidle — first-boot LANGUAGE page dwell journey (research/131:
 // "waiting a little on the language page without clicking freezes the game";
 // investigated on ArStreamLoveVoyage — iMel/krkrsdl3 family, 1280x720,
@@ -6601,6 +6780,7 @@ bool ad_drive(AppState* s) {
     if (s->ad_flow == "rrtext") return ad_rrtext_drive(s);
     if (s->ad_flow == "rrconf") return ad_rrconf_drive(s);
     if (s->ad_flow == "fontscan") return ad_fontscan_drive(s);
+    if (s->ad_flow == "eu13") return ad_eu13_drive(s);
     if (s->ad_flow == "langidle") return ad_langidle_drive(s);
     if (s->ad_flow == "hover") return ad_hover_drive(s);
     if (s->ad_flow == "confreturn") return ad_confret_drive(s);
