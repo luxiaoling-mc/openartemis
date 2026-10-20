@@ -388,6 +388,9 @@ struct DrawEntry {
     int stencil_group = -1;
     int mask_for_group = -1;
     int mask_scope_depth = -1; // transient: deepest matching scope depth
+    // the motion this node lives in — the fallback mask-binding key (see the
+    // same-motion rule in eval_node's mask tagging).
+    const void* node_motion = nullptr;
     // transient index into emote_collect_parts' per-entry
     // grid slices; it survives the z sort so the geometry pass can look up the
     // grid points the bounds pass already evaluated.
@@ -1390,19 +1393,25 @@ void eval_node(EvalCtx& ctx, const EmoteMotion& motion, int nodeIdx, double inco
         en.authoredMeshDivision = node.meshDivision;
         en.type12Depth = type12Depth + (node.type == 12 ? 1 : 0);
         en.stencil_group = stencil_group;
-        // mask-shape tagging: this node's label appears in a stencil group's
-        // mask list whose scope (the stencil's parent) is an ancestor of —
-        // or is — the current node. Deepest scope wins (binds each eye's
-        // 'shirome' to its own 目L/目R stencil).
+        en.node_motion = &motion;
+        // mask-shape tagging, two rules in priority order:
         //
-        // Deliberately STRICT: a label that only matches a cousin branch is
-        // NOT adopted. The head stencil's mask list is
-        // ['■輪郭','■耳L','■耳R'] and ■輪郭 lives under ■頭部セット, so the
-        // head group ends up with no mask — which is the shipped look: an
-        // empty group draws its content plainly (see the raster loop), i.e.
-        // the 頬 blush is composited unclipped, exactly like the host's GPU
-        // path did before. Adopting the cousin ■輪郭 made the blush clip
-        // against the face shape and visibly damaged it.
+        // 1. STRICT (scope prefix): this node's label is in a stencil group's
+        //    mask list AND the stencil's ancestor chain is a prefix of this
+        //    node's chain. This is what keeps the two eyes apart — each 目L/目R
+        //    carries its own 'shirome', and only the one in the same eye branch
+        //    is adopted. Deepest scope wins.
+        //
+        // 2. SAME-MOTION fallback, used only when (1) matched nothing: a mask
+        //    list may name shapes that live in a SIBLING branch of the
+        //    stencil's parent. The head stencil (type 12, under face_LR) lists
+        //    ['■輪郭','■耳L','■耳R'] while ■輪郭 sits in the 輪郭_le branch next
+        //    to face_UD — never a descendant of the stencil. Resolving that
+        //    group to zero shapes is not harmless: an empty mask is composited
+        //    as an empty mask (no fallback), so the 頬 blush — the only content
+        //    inside the head stencil — vanished from both characters. Binding
+        //    within the same motion still separates left from right (目L and
+        //    目R are distinct motions), so the eye/blink binding is untouched.
         for (int gi = 0; gi < int(ctx.stencil_groups.size()); ++gi) {
             const StencilGroup& g = ctx.stencil_groups[gi];
             if (g.scope_chain.size() > chain.size()) continue;
@@ -1421,6 +1430,27 @@ void eval_node(EvalCtx& ctx, const EmoteMotion& motion, int nodeIdx, double inco
             if (int(g.scope_chain.size()) > en.mask_scope_depth) {
                 en.mask_scope_depth = int(g.scope_chain.size());
                 en.mask_for_group = gi; // deepest scope wins (L/R eyes)
+            }
+        }
+        if (en.mask_for_group < 0) {
+            for (int gi = 0; gi < int(ctx.stencil_groups.size()); ++gi) {
+                const StencilGroup& g = ctx.stencil_groups[gi];
+                if (g.owner_motion != (const void*)&motion) continue;
+                if (std::find(g.labels.begin(), g.labels.end(), node.label) ==
+                    g.labels.end())
+                    continue;
+                // several stencils in one motion: prefer the one sharing the
+                // longest ancestor prefix with this node (the head stencil is
+                // the nearest one to the face outline as well).
+                size_t common = 0;
+                while (common < g.scope_chain.size() && common < chain.size() &&
+                       g.scope_chain[common].motion == chain[common].motion &&
+                       g.scope_chain[common].node == chain[common].node)
+                    ++common;
+                if (int(common) > en.mask_scope_depth) {
+                    en.mask_scope_depth = int(common);
+                    en.mask_for_group = gi;
+                }
             }
         }
         if (ctx.debug || emote_mesh_debug()) {
@@ -2353,8 +2383,13 @@ bool render_static_frame(const EmoteFile& file, const std::map<std::string, doub
     Mat fit = mul(translate(offX, offY), scale(k, k));
 
     // stencil composite: per group, the mask shapes' union alpha rasterized
-    // once (lazily, at the first content entry of the group in draw order)
-    // and multiplied into every content entry's coverage.
+    // once, up front, and multiplied into every content entry's coverage.
+    // Building it BEFORE the paint walk (not lazily at the first content
+    // entry) is what the GPU path does too (renderer.cpp: "Masks are collected
+    // UP FRONT"): the draw list is z-sorted, so a mask shape can sort after
+    // the content it clips — the eyelid/eye-white pair does at some blink
+    // poses, and the head group's face outline does at some head angles.
+    // Painting content against a half-built mask erases it.
     const size_t nGroups = stencil_groups.size();
     std::vector<char> mask_built(nGroups, 0);
     std::vector<std::vector<uint8_t>> mask_bits(nGroups);
@@ -2382,6 +2417,14 @@ bool render_static_frame(const EmoteFile& file, const std::map<std::string, doub
         const char* c = std::strchr(e, ':');
         return c ? std::atoi(c + 1) : -1;
     }();
+    // pass 0: every mask shape feeds its group's bitmap. Nothing lands on the
+    // canvas here — each shape is drawn again as normal artwork in the walk
+    // below (it is both a clip source and a picture).
+    for (const DrawEntry& en : entries)
+        if (en.mask_for_group >= 0)
+            paint_entry(en, fit, canvasW, canvasH, rgba, nullptr,
+                        mask_bits_of(en.mask_for_group));
+
     for (const DrawEntry& en : entries) {
         static const int skip_src_only = [] {
             const char* e = std::getenv("OA_SKIP_SRC");
@@ -2417,10 +2460,9 @@ bool render_static_frame(const EmoteFile& file, const std::map<std::string, doub
             // emotenoderef::draw: maskTarget pass + the ordinary canvas pass).
             // Skipping the canvas pass erased the eye-white, which read as the
             // iris floating on bare skin ("眼珠飘出去") at every eye_open pose.
+            // Its bitmap was accumulated in pass 0; here it is only the picture.
             const uint8_t* own =
                 en.stencil_group >= 0 ? mask_bits_of(en.stencil_group) : nullptr;
-            paint_entry(en, fit, canvasW, canvasH, rgba, nullptr,
-                        mask_bits_of(en.mask_for_group));
             paint_entry(en, fit, canvasW, canvasH, rgba, own, nullptr);
             continue;
         }

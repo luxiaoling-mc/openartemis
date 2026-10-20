@@ -93,11 +93,46 @@ void checku(bool cond, const char* what, unsigned long long got) {
 
 constexpr double kEps = 1e-9;
 
+// Labels the player drives OUTSIDE the timeline slots, i.e. the writers that
+// keep moving on every progress() no matter what the slot model does:
+//   * the automatic blink clock (metadata.eyeControl -> face_eye_open), whose
+//     interval is drawn from an RNG seeded with `file_.uid()` — a counter that
+//     advances on every load(), so two player instances are intentionally out
+//     of phase (emote_player.cpp init/blink_advance);
+//   * the physics integrator (metadata.bustControl / hairControl /
+//     partsControl -> bust_*/hair_*/quake_*), whose springs take hundreds of
+//     frames to settle (emote_tick_physics / emote_physics.*).
+// Every signature in this file is a whole-domain hash, so while these labels
+// are included a "static expression stays constant" or "the ended timeline
+// leaves a stable pose" assertion measures the blink/physics state instead of
+// the slot model under test. g_async_labels holds the active arm's set.
+std::set<std::string> async_driven_labels(const oa::emote::EmoteFile& f) {
+    std::set<std::string> out;
+    const auto add = [&out](const std::string& s) {
+        if (!s.empty()) out.insert(s);
+    };
+    for (const auto& ec : f.eyeControls) add(ec.label);
+    for (const auto& r : f.bustControls) {
+        add(r.varLR);
+        add(r.varUD);
+    }
+    for (const auto* rules : {&f.hairControls, &f.partsControls})
+        for (const auto& r : *rules) {
+            add(r.varLR);
+            add(r.varLRM);
+            add(r.varUD);
+        }
+    return out;
+}
+std::set<std::string> g_async_labels;
+
 // FNV-1a over the composed variable snapshot (values quantised to 1e-3, the
-// pose-relevant precision used by the S1 freeze probe / research/121 §7.3).
+// pose-relevant precision used by the S1 freeze probe / research/121 §7.3),
+// skipping the async writers above (see async_driven_labels).
 std::string var_sig(const std::map<std::string, double>& v) {
     unsigned long long h = 1469598103934665603ULL;
     for (const auto& [k, val] : v) {
+        if (g_async_labels.count(k)) continue;
         const long long q = (long long)std::llround(val * 1000.0);
         for (char c : k) {
             h ^= (unsigned char)c;
@@ -284,7 +319,10 @@ void run_arm(const Arm& arm) {
     // not pixels — no CPU raster work per frame.
     p.set_external_pose(true);
     const auto& file = p.file();
-    std::printf("[%s] %s: timelines=%zu\n", arm.tag, arm.entry, file.timelines.size());
+    g_async_labels = async_driven_labels(file); // see var_sig
+    std::printf("[%s] %s: timelines=%zu (async writers excluded from signatures: "
+                "%zu)\n",
+                arm.tag, arm.entry, file.timelines.size(), g_async_labels.size());
 
     // --- G1a: classification scan over every timeline ----------------------
     size_t gestures = 0, statics = 0, frozenGestures = 0, movedStatics = 0;
@@ -421,7 +459,13 @@ void run_arm(const Arm& arm) {
         }
     }
 
-    // --- G1c: loop boundary reachability (待機 loop=[0,290]) ---------------
+    // --- G1c: loop boundary (待機 loop=[0,290]) ----------------------------
+    // Reference rule: the loop wraps on `local >= loopEnd`, so the duration
+    // marker itself is never sampled — the clock lives on
+    // [loopBegin, loopEnd - 1] and wraps back to loopBegin. The same rule is
+    // pinned on the NekoMiko idle in emote_playback_test (S3/G7); the older
+    // reading here ("the loopEnd frame is reachable") predates that
+    // correction and no longer matches the engine.
     {
         const std::string label = "待機";
         const auto* tl = find_tl(file, label);
@@ -444,9 +488,10 @@ void run_arm(const Arm& arm) {
                         "loopEndReached=%d wraps=%d sigs=%zu\n",
                         arm.tag, label.c_str(), tl->loopBegin, loopEnd, frames, maxT,
                         hitEnd ? 1 : 0, wraps, r.uniqueSigs);
-            check(hitEnd, "G1c: the authored loopEnd frame is reachable");
-            check(maxT <= double(loopEnd) + kEps,
-                  "G1c: the loop clock never exceeds loopEnd");
+            check(hitEnd == false,
+                  "G1c: the loop clock never exposes the loopEnd marker (G7)");
+            check(maxT <= double(loopEnd) - kEps,
+                  "G1c: the loop clock stops one frame before loopEnd");
             check(wraps >= 1, "G1c: the loop wraps (period = loopEnd - loopBegin)");
             checku(r.uniqueSigs >= 2, "G1c: the idle loop keeps animating",
                    (unsigned long long)r.uniqueSigs);
@@ -686,6 +731,7 @@ void run_arm(const Arm& arm) {
             const size_t n = std::min(rr.snaps.size(), rn.snaps.size());
             for (size_t f = 0; f < n; ++f) {
                 for (const auto& [k, v] : rn.snaps[f]) {
+                    if (g_async_labels.count(k)) continue; // blink/physics, not a surface
                     const auto it = rr.snaps[f].find(k);
                     const double rv = it == rr.snaps[f].end() ? 0.0 : it->second;
                     if (std::fabs(rv - v) > 1e-9) {
@@ -727,7 +773,11 @@ void run_arm(const Arm& arm) {
                   "REF/NEW: differences stay inside the timeline's own tracks");
             check(!diffLabels.empty(), "REF/NEW: the gesture timeline actually differs");
         }
-        // loop-boundary REF/NEW (待機): the loopEnd frame is NEW-only
+        // loop-boundary REF/NEW (待機): both arms obey the reference wrap
+        // (`local >= loopEnd`), so neither exposes the loopEnd marker and both
+        // stop at loopEnd - 1. The loop can therefore no longer discriminate
+        // the two slot models — the gesture probes above do that (legacy
+        // frozen at t0 vs the S3 model moving).
         const std::string label = "待機";
         const auto* tl = find_tl(file, label);
         if (tl) {
@@ -748,10 +798,10 @@ void run_arm(const Arm& arm) {
                         "new maxT=%.0f hit=%d\n",
                         arm.tag, label.c_str(), tl->loopBegin, loopEnd, rr.maxT,
                         refHit ? 1 : 0, rn.maxT, newHit ? 1 : 0);
-            check(ok && !refHit && newHit,
-                  "REF/NEW: only the S3 wrap rule reaches the loopEnd frame");
-            checkf(std::fabs(rn.maxT - double(loopEnd)) < kEps,
-                   "REF/NEW: the new model stops at loopEnd (not beyond)", rn.maxT);
+            check(ok && !refHit && !newHit,
+                  "REF/NEW: neither arm exposes the loopEnd marker (G7)");
+            checkf(std::fabs(rn.maxT - double(loopEnd - 1)) < kEps,
+                   "REF/NEW: the new model stops at loopEnd-1", rn.maxT);
             checkf(std::fabs(rr.maxT - double(loopEnd - 1)) < kEps,
                    "REF/NEW: the legacy model stops at loopEnd-1", rr.maxT);
         }
@@ -858,7 +908,7 @@ void run_arm(const Arm& arm) {
                     std::snprintf(b, sizeof(b), "%016llx/%zu", h, parts.size());
                     return std::string(b);
                 };
-                size_t inRange = 0, live = 0;
+                size_t inRange = 0;
                 for (const auto& vars : std::vector<std::map<std::string, double>>{
                          {}, {{"head_slant", 20}}, {{"body_slant", -20}},
                          {{"head_UD", 12}}, {{"body_UD", -8}}}) {
@@ -869,24 +919,18 @@ void run_arm(const Arm& arm) {
                     oa::emote::emote_set_s2_policy(-1, -1, -1, -1);
                     if (off != on) ++inRange;
                 }
-                for (const char* axis : {"head_UD", "body_UD", "head_slant", "body_slant",
-                                         "face_talk", "head_LR"}) {
-                    std::map<std::string, double> vars{{axis, 500.0}};
-                    oa::emote::emote_set_s2_policy(-1, 0, -1, -1);
-                    const std::string off = hash_of(vars);
-                    oa::emote::emote_set_s2_policy(-1, 1, -1, -1);
-                    const std::string on = hash_of(vars);
-                    oa::emote::emote_set_s2_policy(-1, -1, -1, -1);
-                    if (off != on) ++live;
-                }
-                std::printf("[%s] S2 G8b: in-range differing=%zu/5 out-of-range firing=%zu/6\n",
-                            arm.tag, inRange, live);
+                std::printf("[%s] S2 G8b: in-range differing=%zu/5\n", arm.tag, inRange);
                 checku(inRange == 0,
                        "S2 G8b: the tail fallback is inert for in-range axis values",
                        (unsigned long long)inRange);
-                checkf(live > 0,
-                       "S2 G8b: the fallback fires when a tick passes the authored tail",
-                       (unsigned long long)live);
+                // The out-of-range reachability arm is gone. d72a2cb made the
+                // content-less-tail rule reference behaviour instead of a
+                // policy arm: pick_frame() applies it for `node.type == 1`
+                // shape containers unconditionally, so
+                // EmoteS2Policy::tailFallback is an assigned-but-never-read
+                // switch and toggling it cannot change geometry. The in-range
+                // arm above still pins that the rule is inert in range. (The
+                // same assertion was removed from emote_playback_test.)
             } else {
                 check(false, "S2: emote file load for the angle/tail arms");
             }

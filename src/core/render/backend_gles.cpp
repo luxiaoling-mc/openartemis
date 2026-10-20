@@ -613,8 +613,15 @@ void GlesRenderBackend::apply_draw_state(GlesTexture* tex, BlendMode blend)
                 glBlendFuncSeparate(GL_ZERO_, GL_SRC_COLOR_, GL_ZERO_, GL_ONE_);
                 break;
             case BlendMode::AlphaMultiply:
-                // dstRGB kept, dstA *= srcA (stencil mask composite)
-                glBlendFuncSeparate(GL_ZERO_, GL_ONE_, GL_DST_ALPHA_, GL_ZERO_);
+                // stencil mask step: RGBA *= srcA (the content target holds
+                // premultiplied rgb, see BlendPremult)
+                glBlendFuncSeparate(GL_ZERO_, GL_SRC_ALPHA_, GL_ZERO_,
+                                    GL_SRC_ALPHA_);
+                break;
+            case BlendMode::BlendPremult:
+                // "over" for a premultiplied source (target -> target/canvas)
+                glBlendFuncSeparate(GL_ONE_, GL_ONE_MINUS_SRC_ALPHA_, GL_ONE_,
+                                    GL_ONE_MINUS_SRC_ALPHA_);
                 break;
             case BlendMode::None: break;
         }

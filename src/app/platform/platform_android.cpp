@@ -56,11 +56,11 @@ bool lifecycle_watch(void*, SDL_Event* ev) {
 namespace oa::plat {
 
 std::string default_save_root(const std::string& data_path, bool data_is_dir) {
-    if (const char* p = SDL_GetAndroidInternalStoragePath(); p && *p) {
-        // App-private writable dir (/data/data/<pkg>/files, no permissions
-        // needed). Documented to be available after SDL_Init on Android.
-        return p;
-    }
+    //if (const char* p = SDL_GetAndroidInternalStoragePath(); p && *p) {
+    //    // App-private writable dir (/data/data/<pkg>/files, no permissions
+    //    // needed). Documented to be available after SDL_Init on Android.
+    //    return p;
+    //}
     // SDL storage not available yet (should not happen in a booted shell):
     // fall back to the desktop rule so saves stay next to the data file.
     std::string save_root = (data_is_dir ? std::filesystem::path(data_path)

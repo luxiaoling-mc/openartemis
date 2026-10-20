@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -148,6 +149,32 @@ int main() {
     check(cov > 4.0 && cov < 70.0, "opaque coverage band");
     check(colored > 4000, "colored pixels present (atlas decode colours)");
     check(midColored > 2000, "coloured pixels in the central band (figure body)");
+
+    // stencil mask binding (the 頬 blush): the head group's mask list is
+    // ['■輪郭','■耳L','■耳R'], of which only ■輪郭 exists here — and it sits in
+    // a SIBLING branch (輪郭_le, next to face_UD), never inside the stencil.
+    // Resolving mask labels by the ancestor-chain rule alone leaves that group
+    // with zero shapes, and an empty mask is composited as an empty mask (no
+    // "draw it plainly" fallback), so the blush inside it is erased from both
+    // characters. The same-motion fallback is what keeps it visible; this
+    // asserts the picture actually reacts to the cheek axis. (measured:
+    // 0 vs 4 differences 225 px at 480x400)
+    std::map<std::string, double> cheek_on{{"face_cheek", 0.0}};
+    std::map<std::string, double> cheek_off{{"face_cheek", 4.0}};
+    std::vector<uint8_t> px_on, px_off;
+    check(oa::emote::render_static_frame(f, cheek_on, 480, 400, opt, &px_on, &err),
+          "render face_cheek=0");
+    check(oa::emote::render_static_frame(f, cheek_off, 480, 400, opt, &px_off, &err),
+          "render face_cheek=4");
+    if (px_on.size() == px_off.size() && !px_on.empty()) {
+        size_t diff = 0;
+        for (size_t i = 0; i + 3 < px_on.size(); i += 4)
+            if (px_on[i] != px_off[i] || px_on[i + 1] != px_off[i + 1] ||
+                px_on[i + 2] != px_off[i + 2] || px_on[i + 3] != px_off[i + 3])
+                ++diff;
+        std::printf("cheek axis: %zu px differ\n", diff);
+        check(diff > 100, "face_cheek changes the picture (blush not erased)");
+    }
 
     std::printf("%s\n", failures ? "FAILED" : "PASS");
     return failures ? 1 : 0;

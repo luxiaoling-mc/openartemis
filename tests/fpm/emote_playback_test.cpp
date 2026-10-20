@@ -82,6 +82,106 @@ uint64_t diff_px(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
     }
     return d;
 }
+
+/// Labels the player drives ASYNCHRONOUSLY, i.e. outside the timeline slots
+/// the domain assertions below are about:
+///   * the automatic blink clock (metadata.eyeControl -> face_eye_open for
+///     NekoMiko), whose idle interval is drawn from an RNG seeded with
+///     `file_.uid()` — a counter that increments on EVERY load(), so two
+///     players of the same bytes blink on different schedules by
+///     construction (emote_player.cpp blink_advance / init);
+///   * the physics integrator (metadata.bustControl / hairControl /
+///     partsControl), whose spring state depends on how many frames that
+///     player instance has already seen (emote_physics.*).
+/// Both keep moving after a one-shot timeline ends, and both differ between
+/// players with different frame histories, so every domain lock below has to
+/// name them explicitly instead of comparing raw snapshots.
+std::set<std::string> async_driven_labels(const oa::emote::EmoteFile& f) {
+    std::set<std::string> out;
+    const auto add = [&out](const std::string& s) {
+        if (!s.empty()) out.insert(s);
+    };
+    for (const auto& ec : f.eyeControls) add(ec.label);
+    for (const auto& r : f.bustControls) {
+        add(r.varLR);
+        add(r.varUD);
+    }
+    for (const auto* rules : {&f.hairControls, &f.partsControls})
+        for (const auto& r : *rules) {
+            add(r.varLR);
+            add(r.varLRM);
+            add(r.varUD);
+        }
+    return out;
+}
+
+/// Domain-snapshot equality with the async-driven labels skipped (see
+/// async_driven_labels). Both directions are checked so a label appearing on
+/// only one side still counts as a difference.
+bool same_domain(const std::map<std::string, double>& a,
+                 const std::map<std::string, double>& b,
+                 const std::set<std::string>& ignore) {
+    const auto once = [&ignore](const std::map<std::string, double>& x,
+                                const std::map<std::string, double>& y) {
+        for (const auto& kv : x) {
+            if (ignore.count(kv.first)) continue;
+            const auto it = y.find(kv.first);
+            if (it == y.end() || std::fabs(it->second - kv.second) > 1e-9) return false;
+        }
+        return true;
+    };
+    return once(a, b) && once(b, a);
+}
+
+/// The labels a timeline authors (its own write surface), minus the async
+/// writers. This — not the whole variable map — is the set the domain locks
+/// are about: the idle loop (通常待機) keeps rewriting the body/head axes on
+/// every frame after an expression ends, so "every label is unchanged" can
+/// never hold and comparing it tested the idle loop, not the release.
+std::set<std::string> timeline_labels(const oa::emote::EmoteFile& f, const char* label) {
+    std::set<std::string> out;
+    const int ti = f.find_timeline(label);
+    if (ti < 0) return out;
+    const std::set<std::string> async = async_driven_labels(f);
+    for (const auto& track : f.timelines[size_t(ti)].variables)
+        if (!async.count(track.label)) out.insert(track.label);
+    return out;
+}
+
+/// Equality restricted to `keys`: both snapshots must carry every key with the
+/// same value. Labels outside `keys` are irrelevant (other writers own them).
+bool same_keys(const std::map<std::string, double>& a,
+               const std::map<std::string, double>& b,
+               const std::set<std::string>& keys) {
+    for (const auto& k : keys) {
+        const auto ia = a.find(k);
+        const auto ib = b.find(k);
+        if (ia == a.end() || ib == b.end()) return false;
+        if (std::fabs(ia->second - ib->second) > 1e-9) return false;
+    }
+    return true;
+}
+
+/// Diagnosis aid for the domain-snapshot locks (OA_EP_DIAG=1): prints every
+/// label that differs between two snapshots, with the async set marked.
+void dump_domain_diff(const char* tag, const std::map<std::string, double>& a,
+                      const std::map<std::string, double>& b,
+                      const std::set<std::string>& ignore) {
+    if (!std::getenv("OA_EP_DIAG")) return;
+    std::printf("[diag] %s domain diff:\n", tag);
+    for (const auto& kv : b) {
+        const auto it = a.find(kv.first);
+        if (it == a.end()) {
+            std::printf("[diag]   +%s = %.6f%s\n", kv.first.c_str(), kv.second,
+                        ignore.count(kv.first) ? " (async)" : "");
+        } else if (std::fabs(it->second - kv.second) > 1e-9) {
+            std::printf("[diag]   ~%s %.6f -> %.6f%s\n", kv.first.c_str(), it->second,
+                        kv.second, ignore.count(kv.first) ? " (async)" : "");
+        }
+    }
+    for (const auto& kv : a)
+        if (!b.count(kv.first)) std::printf("[diag]   -%s\n", kv.first.c_str());
+}
 } // namespace
 
 int main() {
@@ -258,8 +358,15 @@ int main() {
     // variables keep their last values (krkr domain behaviour) — the old
     // per-frame rebuild released them to defaults, snapping the face back
     // to neutral the moment a one-shot voice timeline ended mid-wait. Lock:
-    // the face values captured mid-expression are unchanged after the
-    // timeline auto-ends and on further frames.
+    // the domain captured mid-expression is unchanged after the timeline
+    // auto-ends and on further frames.
+    //
+    // Scope: the lock is on the labels the one-shot itself authors. Two
+    // writers were added to the player after this lock and both keep moving
+    // independently of it: the automatic blink clock (metadata.eyeControl ->
+    // face_eye_open, a per-instance random interval) and the idle loop
+    // (通常待機 rewrites body_*/head_*/face_eye_LR every frame). Comparing the
+    // whole variable map therefore measured those two, never the release.
     {
         oa::emote::EmotePlayer ne;
         if (ne.load(*bytes, 960, 810, &err)) {
@@ -269,20 +376,56 @@ int main() {
             ne.play_timeline("怒り_ボイス再生用");
             ne.advance_ms(400); // mid-expression (~24 frames in)
             const double browMid = ne.get_variable("face_eyebrow");
-            const double brow0 = ne.get_variable("face_eye_open");
+            const std::set<std::string> async = async_driven_labels(ne.file());
+            // The idle loop authors the SAME 41 tracks this expression does,
+            // but its breathing curves (body_*/head_*/face_eye_LR/UD) keep
+            // animating after the one-shot ends — that is the idle doing its
+            // job, not a release. Everything else in the one-shot's write
+            // surface must survive its natural end verbatim. WHICH labels those
+            // are is measured, not hardcoded: a pure-idle player is stepped
+            // over more than one full 通常待機 loop (300 frames) and every label
+            // it moves is taken out of scope.
+            std::set<std::string> watched = timeline_labels(ne.file(), "怒り_ボイス再生用");
+            {
+                oa::emote::EmotePlayer idle;
+                if (idle.load(*bytes, 960, 810, &err)) {
+                    idle.set_scale(0.6, 0, 0);
+                    idle.set_coord(0, 3695.0 * 0.6 - 810.0 / 2.0 + 100.0);
+                    idle.set_external_pose(true); // state only, no raster cost
+                    idle.fade_in_timeline("通常待機");
+                    auto pv = idle.variables();
+                    for (int i = 0; i < 320; ++i) {
+                        idle.advance_ms(16);
+                        const auto cv = idle.variables();
+                        for (const auto& kv : cv) {
+                            const auto it = pv.find(kv.first);
+                            if (it != pv.end() && std::fabs(it->second - kv.second) > 1e-9)
+                                watched.erase(kv.first);
+                        }
+                        pv = cv;
+                    }
+                }
+            }
+            const std::map<std::string, double> mid = ne.variables();
             ne.advance_ms(1600); // well past the one-shot tail
             const bool ended = ne.foreground_timeline().empty();
-            const bool kept =
-                ne.get_variable("face_eyebrow") == browMid &&
-                ne.get_variable("face_eye_open") == brow0;
+            const auto afterOne = ne.variables();
+            const bool kept = same_keys(mid, afterOne, watched);
             ne.advance_ms(1000); // still held on further frames
-            const bool held = ne.get_variable("face_eyebrow") == browMid &&
-                              ne.get_variable("face_eye_open") == brow0;
-            std::printf("natural end: fg ended=%d browMid=%.1f kept=%d held=%d\n",
-                        ended ? 1 : 0, browMid, kept ? 1 : 0, held ? 1 : 0);
+            const auto afterTwo = ne.variables();
+            const bool held = same_keys(mid, afterTwo, watched);
+            if (!kept) dump_domain_diff("natural end +1600ms", mid, afterOne, async);
+            if (!held) dump_domain_diff("natural end +2600ms", mid, afterTwo, async);
+            std::printf("natural end: fg ended=%d browMid=%.1f kept=%d held=%d "
+                        "watched=%zu\n",
+                        ended ? 1 : 0, browMid, kept ? 1 : 0, held ? 1 : 0,
+                        watched.size());
             checkf(browMid != 0.0,
                    "mid-expression face is non-neutral (assert meaningful)",
                    browMid);
+            checkf(watched.size() > 0,
+                   "natural-end: the one-shot authors labels the idle does not animate",
+                   (unsigned long long)watched.size());
             checkf(ended && kept && held,
                    "one-shot natural end keeps the domain pose (no release snap)",
                    browMid);
@@ -304,6 +447,14 @@ int main() {
     // domain values. Lock: after step()/skip(), immediate or mid-expression,
     // variables() equals the natural-end snapshot and arm_type equals the
     // natural-end value (tay 驚き_ボイス再生用 ends 1, tka ends 2).
+    //
+    // Scope: "equals the natural-end snapshot" is over the persistent domain
+    // fed by the timeline slots, NOT the async writers. The physics integrator
+    // (metadata.bustControl/hairControl/partsControl) writes bust_*/hair_*/
+    // quake_* into that domain every tick and its spring state depends on how
+    // many frames the player instance has already seen — the reference arm
+    // runs the whole line (~2 s), the mid arm only 250 ms, so those labels can
+    // never match and comparing them tested the integrator, not the fold.
     auto fold_check = [&](const char* file, const char* tag, double armEnd) {
         oa::emote::EmotePlayer f;
         std::string ferr;
@@ -312,16 +463,11 @@ int main() {
             std::fprintf(stderr, "FAIL: %s fold load\n", tag);
             return;
         }
+        const std::set<std::string> async = async_driven_labels(f.file());
         auto arm = [&]() { return f.get_variable("arm_type"); };
-        auto same_vars = [](const std::map<std::string, double>& a,
-                            const std::map<std::string, double>& b) {
-            if (a.size() != b.size()) return false;
-            for (const auto& kv : a) {
-                const auto it = b.find(kv.first);
-                if (it == b.end() || std::fabs(it->second - kv.second) > 1e-9)
-                    return false;
-            }
-            return true;
+        auto same_vars = [&](const std::map<std::string, double>& a,
+                             const std::map<std::string, double>& b) {
+            return same_domain(a, b, async);
         };
         // reference: the same line played out to its natural end (16 ms ticks
         // sample every track's final content window before the slot stops)
@@ -1073,6 +1219,20 @@ int main() {
                 "通常待機", "通常",          "笑顔",     "照れ",           "悲しみ",
                 "怒り",     "呆れ",          "驚き",     "笑顔_ボイス再生用",
                 "照れ_ボイス再生用"};
+            // The frame-by-frame identity is over the timeline write surface.
+            // The async writers (automatic blink, physics) are excluded:
+            //   * the blink interval is seeded from `file_.uid()`, a counter
+            //     that increments on every load(), so REF and NEW blink at
+            //     different times by construction — the eye-open label can
+            //     never be frame-identical between two player instances;
+            //   * physics labels are written by the integrator, not by either
+            //     write surface, and their spring state follows each player's
+            //     own frame history.
+            // Neither carries information about the S2 surfaces this test
+            // locks, and both also fall outside `known_labels()` (which is the
+            // PSB's variable/parameter/selector universe), so counting them as
+            // "unknown composed labels" measured the metadata gap instead.
+            const std::set<std::string> async = async_driven_labels(nw.file());
             size_t diffFrames = 0, unknownLabels = 0, frames = 0;
             std::string firstDiffTl, firstDiffLabel;
             for (const char* tl : kTls) {
@@ -1084,19 +1244,28 @@ int main() {
                     const auto a = ref.variables();
                     const auto b = nw.variables();
                     ++frames;
-                    bool frameDiff = a.size() != b.size();
-                    for (const auto& kv : b) {
-                        const auto it = a.find(kv.first);
-                        if (it == a.end() || std::fabs(it->second - kv.second) > 1e-9) {
-                            frameDiff = true;
-                            if (firstDiffLabel.empty()) firstDiffLabel = kv.first;
+                    bool frameDiff = false;
+                    // both directions, so a label present on one side only is
+                    // still a difference
+                    const auto cmp = [&](const std::map<std::string, double>& x,
+                                         const std::map<std::string, double>& y) {
+                        for (const auto& kv : x) {
+                            if (async.count(kv.first)) continue;
+                            const auto it = y.find(kv.first);
+                            if (it == y.end() ||
+                                std::fabs(it->second - kv.second) > 1e-9) {
+                                frameDiff = true;
+                                if (firstDiffLabel.empty()) firstDiffLabel = kv.first;
+                            }
+                            if (known.find(kv.first) == known.end()) {
+                                ++unknownLabels;
+                                if (firstDiffLabel.empty())
+                                    firstDiffLabel = "unknown:" + kv.first;
+                            }
                         }
-                        if (known.find(kv.first) == known.end()) {
-                            ++unknownLabels;
-                            if (firstDiffLabel.empty())
-                                firstDiffLabel = "unknown:" + kv.first;
-                        }
-                    }
+                    };
+                    cmp(a, b);
+                    cmp(b, a);
                     if (frameDiff) {
                         ++diffFrames;
                         if (firstDiffTl.empty()) firstDiffTl = tl;
@@ -1104,9 +1273,9 @@ int main() {
                 }
             }
             std::printf("S2 REF/NEW (NekoMiko): timelines=%zu frames=%zu differingFrames=%zu "
-                        "unknownLabels=%zu firstDiff=%s/%s\n",
+                        "unknownLabels=%zu asyncExcluded=%zu firstDiff=%s/%s\n",
                         sizeof(kTls) / sizeof(kTls[0]), frames, diffFrames, unknownLabels,
-                        firstDiffTl.c_str(), firstDiffLabel.c_str());
+                        async.size(), firstDiffTl.c_str(), firstDiffLabel.c_str());
             checku(diffFrames == 0,
                    "S2 REF/NEW: pre-S2 and aligned write surfaces compose identically "
                    "(G4 lazy, G6 observationally equivalent)",
@@ -1189,23 +1358,14 @@ int main() {
                (unsigned long long)oobDiff);
         checku(nfDiff == 0, "S2 G8c: the non-finite guard is inert (0 non-finite frames)",
                (unsigned long long)nfDiff);
-        // The mechanism itself must stay reachable: an axis value far outside
-        // the authored range drives the parameter tick past the content-less
-        // tail frames the fallback exists for.
-        size_t liveAxes = 0;
-        for (const char* axis : {"head_UD", "body_UD", "head_slant", "body_slant",
-                                 "face_talk", "head_LR"}) {
-            std::map<std::string, double> vars{{axis, 500.0}};
-            oa::emote::emote_set_s2_policy(-1, 0, -1, -1);
-            const std::string off = collect_hash(vars);
-            oa::emote::emote_set_s2_policy(-1, 1, -1, -1);
-            const std::string on = collect_hash(vars);
-            oa::emote::emote_set_s2_policy(-1, -1, -1, -1);
-            if (off != on) ++liveAxes;
-        }
-        std::printf("S2 G8b mechanism: %zu/6 out-of-range axes change geometry\n", liveAxes);
-        checkf(liveAxes > 0, "S2 G8b: the tail fallback fires on out-of-range ticks",
-               (unsigned long long)liveAxes);
+        // G8b has no reachability assertion any more. d72a2cb made the
+        // content-less-tail rule reference behaviour instead of a policy arm:
+        // pick_frame() now applies it for `node.type == 1` shape containers
+        // unconditionally (the terminal empty key ends an icon's playback,
+        // non-drawing containers keep their geometry), so
+        // EmoteS2Policy::tailFallback is an assigned-but-never-read switch and
+        // toggling it cannot change geometry. The in-range inertness arm above
+        // still pins that the rule changes nothing for in-range poses.
 
         // G5 counter-guard on NekoMiko: its data has no >180 angle key, so the
         // wrap must be a no-op here (the tg3/slny arm lives in emote_timeline).
