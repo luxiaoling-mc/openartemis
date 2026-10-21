@@ -3285,6 +3285,313 @@ static bool ad_bt119_drive(AppState* s) {
 }
 
 // ---------------------------------------------------------------------------
+// OA_AUTODRIVE=t3cg — test3 (アマカノ３, iMel/Artemis family) EXTRA → CG鑑賞：
+// title -> 強制開放 → bt_extra -> 点一个缩略图 -> 鉴赏器内连续点击，逐次 dump
+// flg.excgbuff（count/max/set）、t.check、ui.asb 执行位置、600/700 层树与整帧
+// 哈希。用来定位「点开 CG 后再点没有差分、直接退出」。
+// 旋钮：OA_T3_CG（缩略图 key，默认 cg01）OA_T3_CLICKS（默认 6）
+//       OA_T3_AT（中性点，默认 960,540）OA_T3_TRACE=0（不做 Lua 追踪）
+// ---------------------------------------------------------------------------
+static const char* kAdT3Inject = R"LUA(
+-- CG 鉴赏の強制開放。実データに無い差分名（配布版の csv には載っているが
+-- 画像が入っていない行）まで gscr.ev に入れると、本物のプレイでは起こり得ない
+-- 「黒画面の差分」を踏むので、cg.lua と同じパス組み立てで実在するものだけ開く。
+local function oa_t3_path(set, n)
+  local m = ":ev/" .. set .. "/"
+  local h = n:sub(1, 2)
+  if h == "bg" then m = ":bg/"
+  elseif h == "sd" then m = ":sd/" .. set .. "/" end
+  return m .. n
+end
+_G.oa_t3_unlock = function()
+  local n = 0
+  for set, v in pairs(csv.extra_cgmode) do
+    gscr.evset[set] = true
+    for i = 3, table.maxn(v) do
+      local nm = v[i]
+      local p = oa_t3_path(set, nm)
+      if isFile(p) or isFile(p .. ".png") or isFile(p .. ".ipt") then
+        gscr.ev[nm] = true
+        n = n + 1
+      end
+    end
+  end
+  return n
+end
+gscr.extraopen = true
+if set_eval then set_eval("g.extraopen=1") end
+if setBtnStat then setBtnStat("bt_extra", nil) end
+print("[t3cg] lua unlock variants=" .. tostring(oa_t3_unlock()))
+-- 差分ファイルの実在確認（エンジン視点の VFS）
+for i = 1, 10 do
+  local n = string.format("ev_kan_c01_%02d", i)
+  local p = ":ev/ev_kan_c01/" .. n
+  print(string.format("[t3cg] probe %s raw=%s png=%s ipt=%s",
+        n, tostring(isFile(p)), tostring(isFile(p .. ".png")), tostring(isFile(p .. ".ipt"))))
+end
+)LUA";
+
+static const char* kAdT3Trace = R"LUA(
+local _spc = setonpush_calllua
+function setonpush_calllua(e, p)
+  local before = tostring(flg.keycode)
+  local r1, r2 = pcall(_spc, e, p)
+  print(string.format("[t3cg] lua setonpush key=%s ui=%s keycode %s->%s",
+        tostring(p and p.key), tostring(p and p.ui), before, tostring(flg.keycode)))
+  if not r1 then print("[t3cg] lua setonpush ERR " .. tostring(r2)) end
+end
+local _exkeyin = exkeyin
+function exkeyin(p)
+  print(string.format("[t3cg] lua exkeyin p0=%s p1=%s keycode=%s",
+        tostring(p and p["0"]), tostring(p and p["1"]), tostring(flg.keycode)))
+  return _exkeyin(p)
+end
+local _exkeyin_exit = exkeyin_exit
+function exkeyin_exit(e, p)
+  local before = tostring(flg.keycode)
+  _exkeyin_exit(e, p)
+  print(string.format("[t3cg] lua exkeyin_exit label=%s keycode_before=%s after=%s",
+        tostring(p and p.label), before, tostring(flg.keycode)))
+end
+local _cgviewer = extra_cg_viewer
+function extra_cg_viewer()
+  local v = flg.excgbuff or {}
+  print(string.format("[t3cg] lua viewer count=%s max=%s set=%s n=%s",
+        tostring(v.count), tostring(v.max), tostring(v.set), tostring(v[v.count or 0])))
+  return _cgviewer()
+end
+local _cgcheck = extra_cg_check
+function extra_cg_check(e, p)
+  local v = flg.excgbuff or {}
+  print(string.format("[t3cg] lua cgcheck IN cgcg=%s count=%s max=%s cursor=%s pname=%s",
+        tostring(flg.cgcg), tostring(v.count), tostring(v.max),
+        tostring(exf.cgcgcursor or (p and p.name) or btn.cursor), tostring(p and p.name)))
+  local ok, err = pcall(_cgcheck, e, p)
+  if not ok then print("[t3cg] lua cgcheck ERR " .. tostring(err)) end
+  local ok2, tc = pcall(function() return tostring(e:var("t.check")) end)
+  print(string.format("[t3cg] lua cgcheck OUT count=%s tcheck=%s",
+        tostring(flg.excgbuff and flg.excgbuff.count), tostring(tc)))
+end
+)LUA";
+
+static void ad_t3cg_click_keys(AppState* s, const char* prefix) {
+    const size_t n = std::strlen(prefix);
+    for (const oa::render::Layer* l : s->rt->scene().draw_order()) {
+        if (l->id.size() < n || l->id.compare(0, n, prefix) != 0) continue;
+        const auto* h = s->rt->scene().find_event_handler(l->id, "click");
+        if (!h) continue;
+        const auto k = h->params.find("key");
+        const auto f = h->params.find("function");
+        std::printf("[t3cg]   click %-22s key=%s fn=%s\n", l->id.c_str(),
+                    k == h->params.end() ? "-" : k->second.c_str(),
+                    f == h->params.end() ? "-" : f->second.c_str());
+    }
+    std::fflush(stdout);
+}
+
+static const char* kAdT3State = R"LUA(
+local v = flg.excgbuff or {}
+print(string.format("[t3cg] lua state count=%s max=%s set=%s n=%s cgcg=%s btnstop=%s cursor=%s appexname=%s",
+      tostring(v.count), tostring(v.max), tostring(v.set), tostring(v[v.count or 0]),
+      tostring(flg.cgcg), tostring(flg.btnstop), tostring(btn.cursor),
+      tostring(appex and appex.name)))
+)LUA";
+
+static void ad_t3cg_state(AppState* s) {
+    try {
+        s->rt->interpreter().lua_bridge().run_code(kAdT3State, "oa_t3state");
+    } catch (const std::exception& e) {
+        std::printf("[t3cg] state query failed: %s\n", e.what());
+    }
+    std::fflush(stdout);
+}
+
+static bool ad_t3cg_drive(AppState* s) {
+    oa::runtime::GameRuntime* rt = s->rt.get();
+    static int sub = 0; // 0 title wait / 1 extra menu / 2 gallery wait /
+                        // 3 viewer wait / 4 arm click / 5 settle+dump
+    static int settle = 0;
+    static int clicks = 0;
+    static int click_budget = 6;
+    static std::string cg_key = "cg01";
+    static int at_x = 960, at_y = 540;
+    static std::string at;
+    static bool armed = false;
+
+    if (!armed) {
+        // Disarm the legacy P1b title probe: it latches onto the first
+        // bt_start-keyed layer and ends the run 900 frames after the pointer
+        // happens to hover it — which would cut the gallery journey short.
+        armed = true;
+        s->probe_id.clear();
+        s->hover_end_armed = false;
+        s->opt.frames_target = 0;
+    }
+
+    if (sub == 0) {
+        const char* v = std::getenv("OA_T3_CG");
+        if (v && *v) cg_key = v;
+        v = std::getenv("OA_T3_CLICKS");
+        if (v && *v && std::atoi(v) > 0) click_budget = std::atoi(v);
+        v = std::getenv("OA_T3_AT");
+        if (v && *v) {
+            at = v;
+            std::sscanf(at.c_str(), "%d,%d", &at_x, &at_y);
+        }
+        // Title is up as soon as both title rows carry click handlers (the
+        // title park's wait id differs per project, so key on the rows).
+        if (!(ad_has_handler(rt, "bt_extra") && ad_has_handler(rt, "bt_start"))) {
+            if (s->ad_stage_f > 20000) {
+                std::printf("[t3cg] no title; abort\n");
+                s->quit = true;
+            }
+            return false;
+        }
+        rt->interpreter().on_step = [](const std::string& script, size_t line,
+                                       const oa::runtime::Instruction& i) {
+            if (script.find("ui.asb") == std::string::npos) return;
+            static const char* kKeep[] = {"exkey", "wt",    "wt0", "calllua",
+                                          "jump",  "call",  "return", "stop",
+                                          "lydel", "setonpush", "keyconfig"};
+            bool keep = false;
+            for (const char* k : kKeep)
+                if (i.tag == k) keep = true;
+            if (!keep) return;
+            std::string p;
+            for (const auto& [k, v] : i.params) p += " " + k + "=" + v;
+            std::printf("[t3cg] STEP %s:%zu [%s]%s\n", script.c_str(), line,
+                        i.tag.c_str(), p.c_str());
+            std::fflush(stdout);
+        };
+        try {
+            rt->interpreter().lua_bridge().run_code(kAdT3Inject, "oa_t3");
+            const char* tr = std::getenv("OA_T3_TRACE");
+            if (!(tr && *tr && std::atoi(tr) == 0))
+                rt->interpreter().lua_bridge().run_code(kAdT3Trace, "oa_t3tr");
+        } catch (const std::exception& e) {
+            std::printf("[t3cg] inject failed: %s\n", e.what());
+            s->quit = true;
+            return false;
+        }
+        std::printf("[t3cg] title reached: bt_extra handler=%d\n",
+                    (int)ad_has_handler(rt, "bt_extra"));
+        ad_bt119_layer_dump(s, "500.");
+        ad_arm_click_key(s, "bt_extra");
+        std::printf("[t3cg] click bt_extra at (%d,%d)\n", s->ad_cx, s->ad_cy);
+        sub = 1;
+        settle = 60;
+        return false;
+    }
+    if (sub == 1) { // extra menu (CG鑑賞 / シーン / 音楽 / 戻る) is up
+        if (--settle > 0) return false;
+        if (!ad_has_handler(rt, "extra01")) {
+            if (s->ad_stage_f > 5000) {
+                std::printf("[t3cg] extra menu did not open; click keys:\n");
+                ad_t3cg_click_keys(s, "500.");
+                s->quit = true;
+            }
+            return false;
+        }
+        std::printf("[t3cg] === extra menu open, clicking CG鑑賞 (extra01) ===\n");
+        ad_arm_click_key(s, "extra01");
+        std::printf("[t3cg] click extra01 at (%d,%d)\n", s->ad_cx, s->ad_cy);
+        sub = 2;
+        settle = 90;
+        return false;
+    }
+    if (sub == 2) {
+        if (--settle > 0) return false;
+        if (!ad_has_handler(rt, cg_key.c_str())) {
+            if (s->ad_stage_f > 5000) {
+                std::printf("[t3cg] gallery thumbnail '%s' absent; click keys:\n",
+                            cg_key.c_str());
+                ad_t3cg_click_keys(s, "500.");
+                s->quit = true;
+            }
+            return false;
+        }
+        std::printf("[t3cg] === gallery open, clicking '%s' ===\n", cg_key.c_str());
+        ad_bt119_layer_dump(s, "500.z.bt.");
+        ad_t3cg_click_keys(s, "500.");
+        ad_arm_click_key(s, cg_key.c_str());
+        std::printf("[t3cg] click '%s' at (%d,%d)\n", cg_key.c_str(), s->ad_cx, s->ad_cy);
+        sub = 3;
+        settle = 120;
+        return false;
+    }
+    if (sub == 3) {
+        if (--settle > 0) return false;
+        if (!ad_bt119_any_prefix(rt, "600.1")) {
+            if (s->ad_stage_f > 5000) {
+                std::printf("[t3cg] CG viewer did not open\n");
+                s->quit = true;
+            }
+            return false;
+        }
+        std::printf("[t3cg] === CG viewer open (state #0) ===\n");
+        ad_bt119_wait_dump(s, "open");
+        ad_t3cg_state(s);
+        ad_bt119_layer_dump(s, "600");
+        ad_bt119_layer_dump(s, "700");
+        ad_bt119_shot(s, "s0");
+        sub = 4;
+        settle = 0;
+        return false;
+    }
+    if (sub == 4) {
+        if (--settle > 0) return false;
+        if (clicks >= click_budget) {
+            std::printf("[t3cg] DONE clicks=%d\n", clicks);
+            s->quit = true;
+            return false;
+        }
+        ++clicks;
+        s->ad_cx = at_x;
+        s->ad_cy = at_y;
+        ad_bt119_hit_probe(s, s->ad_cx, s->ad_cy);
+        // OA_T3_RCLICK=N: the Nth click is a RIGHT button edge (key 2) — the
+        // framework turns it into a dummy click + flg.keycode=2, and the
+        // cgviewer's exkeyin_exit then jumps to *cgviewer_exit (CANCEL list).
+        // A NEGATIVE N sends ESC (key 27) instead (same cancel path).
+        const char* rc = std::getenv("OA_T3_RCLICK");
+        int right_at = (rc && *rc) ? std::atoi(rc) : 0;
+        const bool esc = right_at < 0;
+        if (esc) right_at = -right_at;
+        if (right_at == clicks) {
+            std::printf("[t3cg] %s #%d at neutral (%d,%d)\n", esc ? "ESC" : "RIGHT-click",
+                        clicks, at_x, at_y);
+            s->ad_press_key = esc ? 27 : 2;
+        } else {
+            std::printf("[t3cg] click #%d at neutral (%d,%d)\n", clicks, at_x, at_y);
+            s->ad_click = true;
+        }
+        sub = 5;
+        settle = 45;
+        return false;
+    }
+    // sub == 5: settle, then dump everything for this click.
+    if (--settle > 0) return false;
+    char tag[32];
+    std::snprintf(tag, sizeof(tag), "s%d", clicks);
+    std::printf("[t3cg] === after click #%d ===\n", clicks);
+    ad_bt119_wait_dump(s, "post-click");
+    ad_t3cg_state(s);
+    const bool still = ad_bt119_any_prefix(rt, "600.1");
+    std::printf("[t3cg] viewer layers present=%d\n", (int)still);
+    ad_bt119_layer_dump(s, "600");
+    ad_bt119_layer_dump(s, "700");
+    ad_bt119_shot(s, tag);
+    if (!still) {
+        std::printf("[t3cg] === viewer CLOSED after click #%d ===\n", clicks);
+        s->quit = true;
+        return false;
+    }
+    sub = 4;
+    settle = 0;
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 // OA_AUTODRIVE=n2title — NUKITASHI2 (1600x900, pf6 base + .000/.020 volumes,
 // Qruppo/kiyopi-family CN build) title-UI crash reproduction.
 // User journey: title -> Exit -> confirm-dialog cancel -> Config
@@ -6781,6 +7088,7 @@ bool ad_drive(AppState* s) {
     if (s->ad_flow == "rrconf") return ad_rrconf_drive(s);
     if (s->ad_flow == "fontscan") return ad_fontscan_drive(s);
     if (s->ad_flow == "eu13") return ad_eu13_drive(s);
+    if (s->ad_flow == "t3cg") return ad_t3cg_drive(s);
     if (s->ad_flow == "langidle") return ad_langidle_drive(s);
     if (s->ad_flow == "hover") return ad_hover_drive(s);
     if (s->ad_flow == "confreturn") return ad_confret_drive(s);

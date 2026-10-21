@@ -479,6 +479,40 @@ void test_rt_layer_click_swallows_wait_click() {
           "RT7 unhandled left edge releases the clickable wait");
 }
 
+void test_rt_cancel_key_runs_push_row_in_queue_park() {
+    // The framework's [exkey] is a QUEUE-armed [@]: keyconfig -> chgmsg dummy
+    // -> [@] -> /chgmsg -> [calllua exkeyin_exit label=..]. exkeyin_exit jumps
+    // to its label only when csv.advkey.list.CANCEL[flg.keycode] is set, and
+    // flg.keycode is written by the script's OWN setonpush row. Releasing the
+    // park without running that row (the old right-button shortcut) made the
+    // cancel press behave like a left click: the CG viewer advanced its 差分
+    // counter instead of closing ("右键退出鉴赏没有反应").
+    Harness h(std::string(kBaseScript) +
+              "[setonpush key=\"2\" handler=\"calllua\" function=\"push_h\"]\n"
+              "[lua]\n"
+              "function push_h(e, p) oa_push = (oa_push or '') .. tostring(p.key) .. ';' end\n"
+              "function after_wait(e, p) oa_after = (oa_after or '') .. 'x' end\n"
+              "function arm(e)\n"
+              "  e:enqueueTag{'keyconfig', role='0', keys='124'}\n"
+              "  e:enqueueTag{'@'}\n"
+              "  e:enqueueTag{'calllua', ['function'] = 'after_wait'}\n"
+              "end\n"
+              "[/lua]\n"
+              "[calllua function=\"arm\"]\n"
+              "[stop]\n");
+    h.warm(3);
+    check(h.rt->current_wait() != nullptr &&
+              (h.rt->current_wait()->kind == oa::runtime::WaitReason::Kind::Generic ||
+               h.rt->current_wait()->kind == oa::runtime::WaitReason::Kind::Generic0),
+          "RT8 parked on the queue-armed click wait");
+    check(h.rt->interpreter().last_wait_from_queue(), "RT8 park came from the tag queue");
+    h.tick(-5, -5, false, false, {2}); // right button edge
+    h.tick(-5, -5);
+    check(h.lua_string("oa_push") == "2;",
+          "RT8 cancel key runs the script's setonpush row (flg.keycode)");
+    check(h.lua_string("oa_after") == "x", "RT8 cancel key releases the queue-armed park");
+}
+
 } // namespace
 
 int main() {
@@ -495,6 +529,7 @@ int main() {
     test_rt_drag_chain_and_move();
     test_rt_global_push_and_filter_verdicts();
     test_rt_layer_click_swallows_wait_click();
+    test_rt_cancel_key_runs_push_row_in_queue_park();
     if (failures) {
         std::fprintf(stderr, "input_dispatch_test: %d failure(s)\n", failures);
         return 1;

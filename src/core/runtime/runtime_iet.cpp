@@ -2135,7 +2135,21 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
         const std::string raw_label = resolve_or_empty("label");
         const std::string label = eval.resolve_param_str(raw_label);
         if (const std::string* cond = ins.get("cond")) {
-            const Value v = eval.resolve_param("$" + *cond);
+            // `cond` is authored BOTH ways in the wild: some scripts write the
+            // bare expression (`cond="t.check==0"`), iMel/Artemis-family
+            // scripts write it with the `$` marker (`cond="$t.check==0"`,
+            // test3 system/ui.asb cgviewer). Prepending another `$` to the
+            // latter produced "$$t.check==0", which resolve_param reads as an
+            // INDIRECT reference: it evaluates the comparison ("1"/"0") and
+            // then looks up a variable literally named "1" — always nil, so
+            // the condition was permanently false. The CG viewer then never
+            // looped back to the next 差分: the first click fell straight
+            // through to `*cgviewer_exit` ("点开 CG 后再点直接退出"). Same
+            // shape in test13 (macro2.iet tweet_exit, system.iet save errors).
+            const std::string expr = (!cond->empty() && cond->front() == '$')
+                                         ? *cond
+                                         : "$" + *cond;
+            const Value v = eval.resolve_param(expr);
             if (!v.to_bool()) return out;
         }
         if (const std::string* file = ins.get("file")) {

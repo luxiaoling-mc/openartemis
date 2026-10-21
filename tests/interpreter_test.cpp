@@ -578,9 +578,54 @@ void test_forcedcalllua_runs_like_calllua() {
     check(m && m->as_int() == 1, "forcedcalllua calls the Lua function like calllua");
 }
 
+void test_jump_cond_dollar_form() {
+    // `[jump cond="$t.check==0"]` — the iMel/Artemis-family scripts write the
+    // condition WITH the `$` marker (test3 system/ui.asb cgviewer:
+    // `[jump cond="$t.check==0" label="cgviewer"]`). The engine prepended
+    // another `$`, so resolve_param saw "$$t.check==0" = INDIRECT reference:
+    // it evaluated the comparison ("1"/"0") and then looked up a variable
+    // named "1" — always nil — so the condition was permanently false and the
+    // CG viewer fell through to *cgviewer_exit on the first click ("点开一个
+    // CG，再点一下没有差分、直接退出").
+    Interpreter it;
+    Harness h;
+    it.load_script("test", R"(
+*main
+[var name="t.check" data="0"]
+[jump cond="$t.check==0" label="looped"]
+[var name="r" data="'fell-through'"]
+[return]
+*looped
+[var name="r" data="'jumped'"]
+[return]
+)");
+    run_script(it, h);
+    const auto r = it.variables().get("r");
+    check(r && r->str_val == "jumped", "jump cond with $ marker is evaluated");
+
+    // The bare form (cond="t.check==0") must keep working: the engine adds the
+    // marker only when the script did not write one.
+    Interpreter it2;
+    Harness h2;
+    it2.load_script("test", R"(
+*main
+[var name="t.check" data="1"]
+[jump cond="t.check==0" label="wrong"]
+[var name="r" data="'kept'"]
+[return]
+*wrong
+[var name="r" data="'jumped'"]
+[return]
+)");
+    run_script(it2, h2);
+    const auto r2 = it2.variables().get("r");
+    check(r2 && r2->str_val == "kept", "jump cond bare form still works");
+}
+
 int main() {
     test_if_else();
     test_jump_call_return();
+    test_jump_cond_dollar_form();
     test_line_tag_columns();
     test_text_row_reaches_print_filter();
     test_macro_runs_when_filter_declines();

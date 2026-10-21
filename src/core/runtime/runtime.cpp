@@ -2469,6 +2469,7 @@ GameRuntime::RuntimeState::PointerConsumption GameRuntime::RuntimeState::process
     std::vector<int> key_edges(down_edges_.begin(), down_edges_.end());
     std::sort(key_edges.begin(), key_edges.end());
     for (const int key : key_edges) {
+        bool cancel_park = false;
         // right button / ESC first walk the engine rclick chain (hide
         // recovery or the configured rclick script); only when unconsumed does
         // the same key reach the push row.
@@ -2483,13 +2484,10 @@ GameRuntime::RuntimeState::PointerConsumption GameRuntime::RuntimeState::process
             // [@] forever ("right-click freezes, menu buttons dead"). Normal
             // script-armed [@] waits are unaffected (last_wait_from_queue is
             // false there).
-            if (wait_ &&
-                (wait_->kind == oa::runtime::WaitReason::Kind::Generic ||
-                 wait_->kind == oa::runtime::WaitReason::Kind::Generic0) &&
-                interpreter_ && interpreter_->last_wait_from_queue()) {
-                pc.role_advance = true;
-                continue;
-            }
+            cancel_park = wait_ &&
+                          (wait_->kind == oa::runtime::WaitReason::Kind::Generic ||
+                           wait_->kind == oa::runtime::WaitReason::Kind::Generic0) &&
+                          interpreter_ && interpreter_->last_wait_from_queue();
         }
         // keyconfig role edges (advance/hide/backlog/automode/skip).
         // Role-0 edges count as a
@@ -2497,7 +2495,12 @@ GameRuntime::RuntimeState::PointerConsumption GameRuntime::RuntimeState::process
         if (handle_role_key_edge(key)) pc.role_advance = true;
         const std::string key_string = std::to_string(key);
         const auto* row = scene_.get_input_handler("push", key_string);
-        if (!row) continue;
+        if (!row) {
+            // No push row (project registers no key handler for this key):
+            // the cancel press still has to release the exkey park.
+            if (cancel_park) pc.role_advance = true;
+            continue;
+        }
         if (std::getenv("OA_NM_SELDBG") && key == kKeyMouseLeft) {
             const auto it = row->params.find("function");
             std::fprintf(stderr, "[seldbg] t=%llu push key1 fn=%s\n",
@@ -2509,6 +2512,14 @@ GameRuntime::RuntimeState::PointerConsumption GameRuntime::RuntimeState::process
             "setonpush", *row,
             {{"key", key_string}, {"type", event_type}}, PointerDispatch::Kind::Push);
         if (key == kKeyMouseLeft && handled) pc.left_push_handled = true;
+        // The cancel press must ALSO run the script's own push row (the
+        // framework's setonpush_calllua records flg.keycode = key, so the
+        // queued [calllua exkeyin_exit label=...] can see it in
+        // csv.advkey.list.CANCEL and jump to the exit label). Releasing the
+        // wait WITHOUT the row made right-click behave like a left click —
+        // it advanced the CG viewer's 差分 counter instead of closing the
+        // viewer ("右键退出鉴赏没有反应").
+        if (cancel_park) pc.role_advance = true;
     }
     return pc;
 }
