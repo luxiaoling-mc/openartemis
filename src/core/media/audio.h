@@ -255,8 +255,33 @@ public:
 
     /// Resolve + read a whole media asset (logical name, magic paths already
     /// applied by the caller's loader). Return nullopt when missing/unreadable.
+    ///
+    /// The reader is wrapped with the container probe the sound tags rely on:
+    /// the Ethornell-derived project families (test10, test13) name the file
+    /// WITHOUT its container — `[splay] file="bgm/bgm0304_a"`,
+    /// `[seplay] file="se/system/<name>"`, `[voice] file="voice/001_x/aiy010000010"`
+    /// — because their Lua layer is written against a sound loader that
+    /// appended ".ogg"/".wav" itself (test10's system/sound.iet only builds the
+    /// extension on its wasm branch, where it must consult a file list first).
+    /// Artemis-native projects (iMel/FPM) concatenate `game.soundext` in Lua,
+    /// so their exact names resolve on the first read and the probe never runs.
+    /// An already-qualified name is never re-probed, and the exact name always
+    /// wins, so this cannot change an existing project's resolution.
     void set_loader(std::function<std::optional<std::vector<uint8_t>>(const std::string&)> l) {
-        loader_ = std::move(l);
+        loader_ = [l = std::move(l)](const std::string& name)
+            -> std::optional<std::vector<uint8_t>> {
+            if (auto bytes = l(name)) return bytes;
+            const size_t slash = name.find_last_of("/\\");
+            const size_t dot = name.find_last_of('.');
+            if (dot != std::string::npos &&
+                (slash == std::string::npos || dot > slash)) {
+                return std::nullopt; // already names a container
+            }
+            for (const char* ext : {".ogg", ".wav"}) {
+                if (auto bytes = l(name + ext)) return bytes;
+            }
+            return std::nullopt;
+        };
     }
 
     /// Attach the decode pool (optional). When present, active channels

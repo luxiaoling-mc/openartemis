@@ -370,6 +370,9 @@ void GameRuntime::RuntimeState::open_project(std::string_view platform) {
     };
     // The decode host reads media assets through the same resolution:
     // the interpreter's magic-path table first, then the project filesystem.
+    // (MediaPlayers::set_loader also probes the ".ogg"/".wav" containers for
+    // extension-less sound names — the Ethornell-derived projects hand the
+    // sound tags a bare base name.)
     media_players_->set_loader([this](const std::string& logical)
                                    -> std::optional<std::vector<uint8_t>> {
         if (!interpreter_) return std::nullopt;

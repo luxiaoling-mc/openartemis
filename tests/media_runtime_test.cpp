@@ -438,6 +438,57 @@ void test_ab_loop_switch() {
           "R8 no spurious fade on the looped BGM");
 }
 
+// ---------------------------------------------------------------------------
+// R9: extension-less sound names resolve through their container (.ogg/.wav).
+// The Ethornell-derived families (test10 黒色ドール, test13 穢翼のユースティア)
+// address audio by base name — `[splay] file="bgm/bgm_0304_a"`,
+// `[voice] file="voice/001_ユースティア/aiy010000010"` — while the archive holds
+// `<name>.ogg`. Their Lua layer only appends the extension on the wasm branch,
+// so the desktop engine has to probe it (the original sound loader did).
+// The probe must stay invisible to projects that already qualify the name.
+// ---------------------------------------------------------------------------
+void test_sound_extension_fallback() {
+    Boot b("[splay file=\"bgm/theme_a\" loop=\"1\"]\n"
+           "[stop]\n");
+    std::vector<std::string> requested;
+    b.rt->set_media_loader([&](const std::string& name)
+                               -> std::optional<std::vector<uint8_t>> {
+        requested.push_back(name);
+        if (name == "bgm/theme_a.ogg") return oafix::tone_ogg(0.5, 1, 44100, 440.0, 0.3f);
+        if (name == "bgm/theme_b.ogg") return oafix::tone_ogg(0.5, 1, 44100, 660.0, 0.3f);
+        return std::nullopt;
+    });
+    const auto seen = [&requested](const std::string& want) {
+        for (const std::string& n : requested)
+            if (n == want) return true;
+        return false;
+    };
+    oa::runtime::FrameInput idle;
+    bool probed_ogg = false;
+    for (size_t frame = 0; frame < 120; ++frame) {
+        b.rt->tick(16, idle);
+        if (seen("bgm/theme_a.ogg")) {
+            probed_ogg = true;
+            break;
+        }
+    }
+    std::printf("[R9] probed_exact=%s probed_ogg=%s requested=%zu\n",
+                seen("bgm/theme_a") ? "yes" : "no", probed_ogg ? "yes" : "no",
+                requested.size());
+    check(seen("bgm/theme_a"), "R9 the exact name is read first");
+    check(probed_ogg, "R9 an extension-less name falls through to .ogg");
+    check(b.rt->audio().is_bgm_playing(), "R9 the extension-less BGM stays live");
+
+    // A name that already carries a container is never re-probed.
+    requested.clear();
+    b.rt->apply_media_event(
+        tag_event("splay", {{"file", "bgm/explicit.ogg"}, {"loop", "0"}}));
+    for (size_t frame = 0; frame < 60 && !seen("bgm/explicit.ogg"); ++frame)
+        b.rt->tick(16, idle);
+    check(!seen("bgm/explicit.ogg.ogg"),
+          "R9 an already-qualified name is not probed again");
+}
+
 } // namespace
 
 int main() {
@@ -450,6 +501,7 @@ int main() {
     test_video_layer_content_binding();
     test_system_volume_bridge();
     test_ab_loop_switch();
+    test_sound_extension_fallback();
     if (failures) {
         std::fprintf(stderr, "media_runtime_test: %d failure(s)\n", failures);
         return 1;
