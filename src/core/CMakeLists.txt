@@ -9,6 +9,9 @@ add_library(libopenartemis STATIC
   runtime/runtime.cpp        # 内核 + 控制域 + 对外薄转发
   runtime/runtime_media.cpp
   runtime/runtime_save.cpp
+  # 官方（原生 SDK）存档容器 BOWX/BOWG/BOWS 的只读解码器：zlib 流 + 尾部
+  # 字段目录，与 OASB 文档是两套格式（布局见 runtime_save_official.h）。
+  runtime/runtime_save_official.cpp
   # Lua 域：整个 Lua 宿主面收成一个 TU 并放进
   # runtime 家族——桥对象 + 各域注册段（tag/sys/input/surface/
   # emote/filter/pluto），原 src/core/lua/ 的 8 个 .cpp 与 lua_api.h 全部
@@ -70,6 +73,10 @@ find_package(JPEG REQUIRED)
 # PhysicsFS (physfs_fs.cpp): single project-source VFS. The Artemis PFS pack
 # support is a custom PHYSFS_Archiver built into the core library.
 find_package(PhysFS CONFIG REQUIRED)
+# zlib: official Artemis save containers (BOWX/BOWG/BOWS) are one zlib stream
+# behind a 12-byte header — runtime_save_official.cpp inflates them. Already in
+# the dependency closure (libpng/freetype), so this adds no new port.
+find_package(ZLIB CONFIG REQUIRED)
 target_link_libraries(libopenartemis PUBLIC
     SDL3::SDL3
     lua51
@@ -77,6 +84,7 @@ target_link_libraries(libopenartemis PUBLIC
     unofficial::theora::theora
     PNG::PNG
     JPEG::JPEG
+    ZLIB::ZLIB
     $<IF:$<TARGET_EXISTS:PhysFS::PhysFS>,PhysFS::PhysFS,PhysFS::PhysFS-static>)
 
 # ---------------------------------------------------------------------------

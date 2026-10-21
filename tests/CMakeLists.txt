@@ -158,6 +158,13 @@ target_link_libraries(save_domain_test PRIVATE libopenartemis lua51 Vorbis::vorb
 add_test(NAME save_domain_test COMMAND save_domain_test)
 set_tests_properties(save_domain_test PROPERTIES ENVIRONMENT "OA_TEST_FPM_PFS=${OA_TEST_FPM_PFS}")
 
+# 官方（原生 SDK）存档容器 BOWX/BOWG/BOWS 的只读解码器：自造 zlib 夹具 +
+# 坏容器拒绝路径；OA_TEST_OFFICIAL_SAVE_DIR 指向真实 savedata 时再加跑一遍
+# 真档（不设就跳过那一段，测试本身仍然自足）。
+add_executable(official_save_test official_save_test.cpp)
+target_link_libraries(official_save_test PRIVATE libopenartemis ZLIB::ZLIB)
+add_test(NAME official_save_test COMMAND official_save_test)
+
 # U15: save-area image read-back (slot thumbnails) routes through the
 # runtime SaveStore, so plain runs (default ./save) can display [savess]
 # PNGs without OA_SAVE_ROOT. RenderEngine pulls font.cpp's FreeType calls.

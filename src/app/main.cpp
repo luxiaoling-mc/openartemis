@@ -692,6 +692,20 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char* argv[])
         state->opt.headless ? "headless: driving GameRuntime with virtual 16ms ticks"
         : "rendering Lua layer events");
 
+#if OA_TEST_BUILD
+    // OA_LOAD_SLOT=<file> — 启动后立刻读一个编号存档，用于"官方档能不能读进来"
+    // 的回归（docs/OFFICIAL_SAVES.md）。语义与游戏里 [load] 完全一样（走
+    // RuntimeState::load_game，位置预检/清场/快照恢复都在），只是省掉点菜单。
+    if (const char* slot = std::getenv("OA_LOAD_SLOT"); slot && *slot) {
+        const auto result = state->rt->load_game(slot, 0);
+        std::printf("[app] OA_LOAD_SLOT=%s → %s\n", slot,
+                    result == oa::runtime::LoadResult::Ok ? "loaded"
+                    : result == oa::runtime::LoadResult::MissingFile ? "missing"
+                    : result == oa::runtime::LoadResult::Corrupt ? "corrupt"
+                                                                : "position-unavailable");
+    }
+#endif
+
     if (state->opt.headless) {
         // No pixels exist headless: complete the capture immediately so a
         // [trans] type!=0 cannot deadlock the wait machine (same fallback the

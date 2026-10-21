@@ -21,6 +21,7 @@
 #include <limits>
 
 #include "core/util/binary_stream.h"
+#include "core/runtime/runtime_save_official.h"
 
 #include "core/media/image.h"
 #include "core/render/layer.h"
@@ -134,9 +135,47 @@ void GameRuntime::RuntimeState::sysload() {
         if (path.empty()) continue;
         const auto bytes = save_store_->read(path);
         if (!bytes) continue; // first boot: no file is the default state
+        const std::string doc(bytes->begin(), bytes->end());
+        // 官方（原生引擎）写下的 BOW* 容器是**另一个格式家族**：容器/目录/
+        // 值编码都不同（runtime_save_official.h）。以前这里只认 OASB，
+        // 于是玩家把官方 savedata 搬过来只会看到 "bad magic"、设置与全局
+        // 进度全丢。现在按魔数分流，官方档走官方导入器。
+        if (oa::runtime::is_official_save(doc)) {
+            try {
+                const auto off = oa::runtime::decode_official_save(doc);
+                const auto stats = oa::runtime::import_official_variables(
+                    off, [this](const std::string& name, oa::runtime::Value v) {
+                        interpreter_->set_variable(name, v);
+                    });
+                std::fprintf(stderr,
+                             "[runtime] sysload %s: official %s v%u -> %zu variable(s), "
+                             "%zu host-path key(s) skipped, %zu Pluto table(s) converted\n",
+                             path.c_str(),
+                             is_global ? "BOWG" : "BOWX", off.version, stats.applied,
+                             stats.skipped_host_path, stats.pluto_converted);
+                if (stats.pluto_failed) {
+                    std::fprintf(stderr,
+                                 "[runtime] sysload %s: %zu official Pluto table(s) could not "
+                                 "be converted (kept as raw bytes)\n",
+                                 path.c_str(), stats.pluto_failed);
+                }
+                if (!off.read_lines.empty()) {
+                    // 引擎目前没有"已读行"状态存储（skip 不做已读判定），所以
+                    // 只报数量；将来接 skip-read 时这张表就是入口。
+                    std::fprintf(stderr,
+                                 "[runtime] sysload %s: %zu script(s) / %zu read-line(s) in "
+                                 "the official progress table (not applied: the engine keeps "
+                                 "no read state)\n",
+                                 path.c_str(), off.read_lines.size(), stats.read_lines);
+                }
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "[runtime] sysload official decode %s failed: %s\n",
+                             path.c_str(), e.what());
+            }
+            continue;
+        }
         try {
-            const auto map = oa::runtime::decode_domain_map(
-                std::string(bytes->begin(), bytes->end()));
+            const auto map = oa::runtime::decode_domain_map(doc);
             const std::string prefix = is_global ? "g." : "s.";
             for (const auto& [k, v] : map) {
                 interpreter_->set_variable(prefix + k, v);
@@ -150,6 +189,34 @@ void GameRuntime::RuntimeState::sysload() {
     }
 }
 
+namespace {
+
+/// 覆盖前保住官方原件：如果目标位置现在是 BOW* 容器（玩家从原生引擎搬来的
+/// 档），第一次覆盖前把原字节另存为 `<file>.official.bak`。官方引擎还能读回
+/// 那一份，我们也不会"读进来就把它抹掉"。备份失败不阻止写入（否则玩家存不
+/// 了档），但一定留日志。
+void preserve_official_original(oa::runtime::SaveStore& store, const std::string& path) {
+    const auto existing = store.read(path);
+    if (!existing) return;
+    const std::string doc(existing->begin(), existing->end());
+    if (!oa::runtime::is_official_save(doc)) return;
+    const std::string backup = path + ".official.bak";
+    if (store.read(backup)) return; // 已经备份过（只保第一份原件）
+    if (store.write(backup, *existing)) {
+        std::fprintf(stderr,
+                     "[runtime] syssave: kept the original official save as %s before the "
+                     "first overwrite\n",
+                     backup.c_str());
+    } else {
+        std::fprintf(stderr,
+                     "[runtime] syssave: could NOT back up the official save at %s; the "
+                     "overwrite destroys it (save still proceeds)\n",
+                     path.c_str());
+    }
+}
+
+} // namespace
+
 bool GameRuntime::RuntimeState::syssave() {
     if (!save_store_ || !interpreter_) return false;
     const auto& vars = interpreter_->variables();
@@ -162,6 +229,7 @@ bool GameRuntime::RuntimeState::syssave() {
                                                                 oa::runtime::Value>& m) {
         const std::string path = qualify_save_file(file);
         if (path.empty()) return;
+        preserve_official_original(*save_store_, path);
         // Strip the domain prefix off each key.
         std::map<std::string, oa::runtime::Value> stripped;
         for (const auto& [k, v] : m) {
@@ -1521,7 +1589,248 @@ std::string SaveData::encode() const {
     return w.data();
 }
 
+// ---------------------------------------------------------------------------
+// 官方 BOWS 槽位 → SaveData（尽力而为的导入）
+// ---------------------------------------------------------------------------
+namespace {
+
+/// BOWS 的"现场"是命令栈；这里把它翻成本引擎的快照模型：
+///   变量 bank        → local_variables（Pluto 表先转成本引擎 pluto 文档）
+///   field 26 命令栈  → scene layers（lyc/lyprop 的属性合并 + lyevent 处理）
+///   field 24 命令栈  → text layers（print 的 data 拼成文本页 + font 属性）
+///   field 29         → 当前 BGM（splay）
+///   field 4 第一帧   → current_script/current_line，后续帧进 call_stack
+/// 已知缺口（docs/OFFICIAL_SAVES.md）：字段 4 的后续帧形状未定论、命令栈里
+/// 的 [lytween]/[wait] 等时序状态无法重放 —— 恢复出来的是"画面 + 文本 +
+/// 变量 + 位置"，不是逐字节等价的现场。
+oa::runtime::SaveData official_slot_to_save_data(
+    const oa::runtime::OfficialSlot& slot) {
+    oa::runtime::SaveData d;
+    d.version = kSaveFormatVersion;
+
+    size_t pluto_converted = 0;
+    for (const auto& [key, raw] : slot.header.variables) {
+        if (key.empty()) continue;
+        std::string value = raw;
+        if (auto doc = oa::runtime::convert_official_pluto(raw)) {
+            value = std::move(*doc);
+            ++pluto_converted;
+        }
+        d.local_variables[key] = oa::runtime::Value::make_string(std::move(value));
+    }
+
+    // 位置：内层在前（frames[0] = 当前执行位置）。
+    const oa::runtime::OfficialFrame* current = nullptr;
+    if (!slot.frames.empty()) {
+        current = &slot.frames.front();
+    } else if (slot.has_system_frame) {
+        current = &slot.system_frame;
+    }
+    if (current) {
+        d.current_script = current->script;
+        d.current_line = current->line;
+    }
+    // 调用栈：`return_line` 是"本帧结束后回到上层脚本的哪一行"，属于本帧而不是
+    // 下一帧 ⇒ 成对地取 (frames[i].return_line, frames[i+1].script)。0 表示
+    // "没有调用者行"（实测 test4 的单帧、test13 的根帧都是 0），不入栈——否则
+    // 会凭空多出一个回到第 0 行的假帧。
+    for (size_t i = 0; i + 1 < slot.frames.size(); ++i) {
+        const auto& f = slot.frames[i];
+        const auto& caller = slot.frames[i + 1];
+        if (caller.script.empty() || f.return_line == 0) continue;
+        d.call_stack.emplace_back(caller.script, f.return_line);
+    }
+
+    if (!slot.image_layers.empty()) {
+        d.has_scene = true;
+        d.layers.reserve(slot.image_layers.size());
+        for (const auto& layer : slot.image_layers) {
+            if (layer.id.empty()) continue;
+            oa::runtime::LayerSnap snap;
+            snap.id = layer.id;
+            for (const auto& cmd : layer.commands) {
+                if (cmd.name == "lyc" || cmd.name == "lyprop") {
+                    // 属性就是命令的 attrs（名字→值），"id" 由图层键给出，跳过。
+                    for (const auto& [name, value] : cmd.attrs) {
+                        if (name.empty() || name == "id") continue;
+                        snap.props[name] = value;
+                    }
+                } else if (cmd.name == "lyevent") {
+                    // lyevent 的 attrs 与脚本里的 [lyevent] 同构，所以按
+                    // Compositor::apply_lyevent 的规则还原：已知字段进 row，
+                    // **其余全部进 params**（function/name/key/lua/… 是回调要
+                    // 用的注册参数），filter_params 再补上完整的那一份。
+                    const auto get = [&cmd](const char* k) {
+                        const auto it = cmd.attrs.find(k);
+                        return it == cmd.attrs.end() ? std::string() : it->second;
+                    };
+                    const std::string mode = get("mode");
+                    if (mode == "reset") continue; // reset = 删掉这一行
+                    static const char* kKnown[] = {"id",           "type",   "mode",
+                                                   "file",         "label",  "call",
+                                                   "handler",      "penetration"};
+                    std::map<std::string, std::string> extra;
+                    for (const auto& [name, value] : cmd.attrs) {
+                        if (name.empty()) continue;
+                        bool known = false;
+                        for (const char* k : kKnown) known = known || name == k;
+                        if (!known) extra[name] = value;
+                    }
+                    const auto make_row = [&](const std::string& type,
+                                              const std::string& function_key,
+                                              const std::string& function) {
+                        oa::runtime::LayerEventHandlerSnap h;
+                        h.type = type;
+                        h.enabled = mode != "disable";
+                        const std::string handler = get("handler");
+                        h.handler = handler;
+                        h.file = get("file");
+                        h.label = get("label");
+                        const std::string call = get("call");
+                        h.call = save_i64(call, 0) != 0;
+                        h.penetration = save_i64(get("penetration"), 0) != 0;
+                        h.params = extra;
+                        if (!function_key.empty()) h.params[function_key] = function;
+                        h.filter_params = extra;
+                        const std::pair<const char*, std::string> fields[] = {
+                            {"id", layer.id}, {"type", type},       {"mode", mode},
+                            {"file", h.file}, {"label", h.label},   {"handler", handler}};
+                        for (const auto& [k, v] : fields) {
+                            if (!v.empty()) h.filter_params[k] = v;
+                        }
+                        if (h.call) h.filter_params["call"] = "1";
+                        if (h.penetration) h.filter_params["penetration"] = "1";
+                        return h;
+                    };
+                    const std::string type = get("type");
+                    if (!type.empty()) {
+                        snap.handlers.push_back(make_row(type, "", ""));
+                        continue;
+                    }
+                    // type 缺席 = FPM glue（button.lua 的写法）：一个 click/over/
+                    // out… 键各展开一行，与 apply_lyevent 的展开同一张表。
+                    static const char* kGlue[][2] = {{"click", "click"},   {"over", "rollover"},
+                                                     {"out", "rollout"},   {"dragin", "dragin"},
+                                                     {"drag", "drag"},     {"dragout", "dragout"}};
+                    bool expanded = false;
+                    for (const auto& pair : kGlue) {
+                        const auto it = cmd.attrs.find(pair[0]);
+                        if (it == cmd.attrs.end()) continue;
+                        expanded = true;
+                        auto row = make_row(pair[1], "function", it->second);
+                        if (row.handler.empty()) row.handler = "calllua";
+                        snap.handlers.push_back(std::move(row));
+                    }
+                    (void)expanded;
+                }
+            }
+            d.layers.push_back(std::move(snap));
+        }
+    }
+
+    if (!slot.text_layers.empty()) {
+        d.has_text = true;
+        for (const auto& layer : slot.text_layers) {
+            if (layer.id.empty()) continue;
+            oa::runtime::TextLayerSnap ts;
+            ts.id = layer.id;
+            ts.active = layer.id == slot.current_message_layer;
+            ts.revealed = true;
+            for (const auto& cmd : layer.commands) {
+                if (cmd.name == "print") {
+                    const auto it = cmd.attrs.find("data");
+                    if (it != cmd.attrs.end()) ts.text += it->second;
+                } else if (cmd.name == "font") {
+                    for (const auto& [name, value] : cmd.attrs) {
+                        if (name.empty() || name == "id") continue;
+                        ts.font[name] = value;
+                    }
+                }
+            }
+            // 文字框几何：官方把 (left, top, width, height) 存在排版状态（f25）
+            // 里，[font] 指令本身经常只带颜色/字号（test4 就是这样），只带
+            // left/top 而不带宽高的也有（test13）——所以以 f25 的框为准，指令
+            // 里剩下的属性照样用。
+            const auto rect = slot.text_rects.find(layer.id);
+            if (rect != slot.text_rects.end()) {
+                ts.positioned = true;
+                ts.left = rect->second.left;
+                ts.top = rect->second.top;
+                ts.width = rect->second.width;
+                ts.height = rect->second.height;
+            }
+            // 只有带文本（或当前活动）的层才进快照：f24 里 40 多个层大多是
+            // 名字框/ruby 框，没有正文，恢复它们只会平白多建消息槽。
+            if (!ts.text.empty() || ts.active) {
+                d.text_layers.push_back(std::move(ts));
+            }
+        }
+    }
+
+    if (!slot.bgm.empty()) {
+        const auto& cmd = slot.bgm.front();
+        if (cmd.name == "splay") {
+            const auto attr = [&cmd](const char* k) {
+                const auto it = cmd.attrs.find(k);
+                return it == cmd.attrs.end() ? std::string() : it->second;
+            };
+            oa::runtime::AudioChannelSnap ch;
+            ch.id = "bgm";
+            ch.file = attr("file");
+            const std::string loop = attr("loop");
+            ch.loop_play = !loop.empty() && loop != "0";
+            ch.gain = int(save_i64(attr("gain"), 1000));
+            ch.pan = int(save_i64(attr("pan"), 0));
+            if (!ch.file.empty()) {
+                d.has_audio = true;
+                d.audio.bgm = std::move(ch);
+            }
+        }
+    }
+
+    std::string tail;
+    if (slot.frames.size() > 1) tail = " stack=" + std::to_string(slot.frames.size());
+    if (!slot.frames.empty() && slot.frames.front().has_current) {
+        tail += " at-tag=" + slot.frames.front().current.name;
+        const size_t pending = slot.frames.front().pending.size();
+        if (pending != 0) tail += "+" + std::to_string(pending) + " pending";
+    }
+    size_t boxes = 0;
+    for (const auto& t : d.text_layers) {
+        if (t.positioned) ++boxes;
+    }
+    size_t handlers = 0;
+    for (const auto& l : d.layers) handlers += l.handlers.size();
+    std::fprintf(stderr,
+                 "[save] official BOWS v%u → SaveData: %zu variable(s) (%zu Pluto table(s) "
+                 "converted), %zu layer(s)/%zu handler(s), %zu text layer(s) (%zu box(es)), "
+                 "bgm=%s, at %s:%zu%s%s\n",
+                 slot.header.version, d.local_variables.size(), pluto_converted, d.layers.size(),
+                 handlers, d.text_layers.size(), boxes,
+                 d.has_audio ? d.audio.bgm->file.c_str() : "(none)", d.current_script.c_str(),
+                 d.current_line,
+                 slot.frames_truncated ? " [call stack truncated: unknown frame shape]" : "",
+                 tail.c_str());
+    return d;
+}
+
+} // namespace
+
 SaveData SaveData::decode(const std::string& bytes) {
+    // 官方编号存档（BOWS）：容器 + 命令栈能解，但官方的模型是"每图层命令栈 +
+    // 脚本栈"，与本文档的"脚本位置 + 快照"不是一对一。这里做**导入**：
+    // 位置/变量/图层/文本/音频逐项搬过来（见 official_slot_to_save_data），
+    // 解不出来的部分（例如字段 4 的后续帧）留在日志里，不假装成功。
+    if (oa::runtime::is_official_save(bytes)) {
+        const auto slot = oa::runtime::decode_official_slot(bytes);
+        SaveData imported = official_slot_to_save_data(slot);
+        if (imported.current_script.empty()) {
+            throw FormatError(
+                "official BOWS save: no script frame could be decoded, so there is no "
+                "position to resume from (see docs/OFFICIAL_SAVES.md)");
+        }
+        return imported;
+    }
     Reader r(bytes);
     check_version(r);
     SaveData d;

@@ -377,7 +377,13 @@ struct Event {
 };
 
 enum class CallbackResult { Continue, Pause, Abort };
-enum class ExecutionResult { Completed, Wait };
+enum class ExecutionResult {
+    Completed,
+    Wait,
+    /// 单次 run() 用完了每帧 tag 预算（轮询型主循环）：既没停也没结束，
+    /// 下一帧从当前位置继续。宿主**不要**因此清场或算作完成。
+    BudgetExhausted,
+};
 
 struct CallFrame {
     std::string script;

@@ -265,10 +265,27 @@ function install_filter(e) e:setTagFilter(tags) end
 
 } // namespace
 
+void test_sandbox_shell_surface() {
+    oa::runtime::LuaBridge eng(oa::runtime::LuaHost{});
+    eng.run_code(R"(
+function check_sandbox(e)
+  -- os.execute() 是"有没有 shell"的标准探测，框架启动时会调（Artemis 的
+  -- updater.lua）。名字要留着、能力要去掉：返回 0 表示没有 shell。
+  assert(type(os.execute) == 'function', 'os.execute stays callable')
+  assert(os.execute() == 0, 'no shell reported')
+  assert(os.execute('echo hi') == 0, 'stub never runs the command')
+  assert(os.system == nil, 'os.system still removed')
+  assert(os.remove == nil and os.rename == nil, 'filesystem mutation still removed')
+  assert(io.popen == nil, 'io.popen still removed')
+end)", "sandbox");
+    check(eng.call_function("check_sandbox", {}), "sandbox shell surface");
+}
+
 int main() {
     try {
     test_pluto_roundtrip();
     test_random_31bit();
+    test_sandbox_shell_surface();
     test_var_semantics();
     test_engine_handle_shape();
     test_interpreter_lua_flow();

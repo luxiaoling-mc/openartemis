@@ -199,6 +199,10 @@ int l_traceback(lua_State* L) {
 // surface a desktop scripting library of that era exposes:
 //
 //   os.execute / os.system      run an arbitrary host command
+//                               (os.execute survives as a stub that always
+//                               answers 0 = "no shell available": it is the
+//                               standard capability probe frameworks call at
+//                               boot, and a nil field would raise instead)
 //   os.exit                     terminate the engine process
 //   os.remove / os.rename       rewrite the host filesystem
 //   os.setlocale                process-wide locale change
@@ -234,13 +238,32 @@ void drop_table_fields(lua_State* L, const char* tname, const char* const* names
     lua_pop(L, 1);
 }
 
+/// `os.execute()` with no argument is Lua 5.1's "is a shell available?" probe.
+/// Frameworks probe it before deciding to spawn an external helper — Artemis'
+/// system/extend/updater.lua does exactly that (`os.execute() == 1 and
+/// isFile("Updater.exe")`). Removing the field outright turned that probe into
+/// "attempt to call field 'execute' (a nil value)" at boot. Answer 0 ("no
+/// shell"): the caller takes its "updater unavailable" branch and nothing is
+/// ever executed, so the process-level surface stays closed.
+int l_os_execute_unavailable(lua_State* L) {
+    lua_pushinteger(L, 0);
+    return 1;
+}
+
 void apply_stdlib_block_list(lua_State* L) {
     if (stdlib_block_disabled()) return;
 
     static const char* const kOsBanned[] = {
-        "execute", "exit", "remove", "rename", "setlocale", "tmpname", "system",
+        "exit", "remove", "rename", "setlocale", "tmpname", "system",
     };
     drop_table_fields(L, LUA_OSLIBNAME, kOsBanned, sizeof(kOsBanned) / sizeof(kOsBanned[0]));
+    // os.execute: keep the name, drop the capability (see the stub above).
+    lua_getglobal(L, LUA_OSLIBNAME);
+    if (lua_istable(L, -1)) {
+        lua_pushcfunction(L, l_os_execute_unavailable);
+        lua_setfield(L, -2, "execute");
+    }
+    lua_pop(L, 1);
 
     // io keeps open/close plus the handle-oriented helpers (read/write/lines/
     // seek/flush/setvbuf); only stream redirection and process spawn go.
@@ -1887,8 +1910,25 @@ int l_pluto_unpersist(lua_State* L) {
         oa::util::Reader r(reinterpret_cast<const uint8_t*>(s), len);
         read_pluto_value(L, r, 0);
         r.expect_eof("pluto unpersist");
-    } catch (const std::exception&) {
+    } catch (const std::exception& e) {
         lua_settop(L, base);
+        // 契约：读不出来就给空表（游戏侧 fload_pluto 拿 {} 也能跑）。但**静默**
+        // 失败会把人坑死：test4 的 g.config 是官方 native Pluto 的字节，读完
+        // 变成 {}，于是 conf.language 丢失、每次启动都重弹语言选择，而日志里
+        // 一个字都没有。只在负载"看起来是二进制"时报（"0"/"" 是"没有数据"的
+        // 约定，纯文本垃圾是调用方自己的问题，不必刷屏）。
+        bool binary_like = false;
+        for (size_t i = 0; i < len; ++i) {
+            const unsigned char c = static_cast<unsigned char>(s[i]);
+            if (c < 0x20 && c != '\t' && c != '\n' && c != '\r') {
+                binary_like = true;
+                break;
+            }
+        }
+        if (len > 2 && binary_like) {
+            std::fprintf(stderr, "[lua] pluto.unpersist: %s (%zu-byte document)\n", e.what(),
+                         len);
+        }
     }
     if (lua_type(L, -1) != LUA_TTABLE) {
         lua_settop(L, base);

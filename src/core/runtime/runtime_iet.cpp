@@ -2712,7 +2712,25 @@ bool Interpreter::dispatch_text_row_to_print_filter(const std::string& text) {
 }
 
 ExecutionResult Interpreter::run() {
+    // 单次 run() 的 tag 预算（= 每帧最多推进多少条指令）。
+    //
+    // Artemis 的脚本是按帧推进的，**轮询型**脚本靠"每帧只跑有限条 tag"把控制权
+    // 交回宿主：HENPRI 的 system/script.asb `*main` 就是
+    // `calllua scriptMainloop/scriptMainAdd ×11 + [jump label=main]`，没有任何
+    // wait —— 官方的读档位置（frame 0 = system/script.asb:40）正落在这种主循环
+    // 里。没有预算时 `run()` 会在**单帧内**永久自旋（tick 不返回、帧计数冻结），
+    // 表现就是"读档成功然后卡死"。默认 4096：常见剧情段一帧几十条 tag，
+    // 后台重建这类突发也在千级以内，而轮询主循环每帧推进约 340 轮，既能响应
+    // 输入又不会烧满 CPU。OA_RUN_BUDGET 可覆盖（逗号安全：0/非数字时用默认值）。
+    size_t budget = [] {
+        if (const char* v = std::getenv("OA_RUN_BUDGET")) {
+            const long n = std::strtol(v, nullptr, 10);
+            if (n > 0) return size_t(n);
+        }
+        return size_t(4096);
+    }();
     for (;;) {
+        if (budget-- == 0) return ExecutionResult::BudgetExhausted;
         // Drain tags queued by Lua (e:tag/e:enqueueTag) before inline steps.
         if (const auto wait_result = flush_tag_queue()) return *wait_result;
 

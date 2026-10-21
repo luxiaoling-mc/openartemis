@@ -1028,6 +1028,10 @@ void GameRuntime::RuntimeState::run_until_wait() {
             // fade-out + clear finished (Stop{id:"alldelete"}).
             arm_stop_wait("alldelete");
         }
+    } else if (r == oa::runtime::ExecutionResult::BudgetExhausted) {
+        // 轮询型主循环（game 自己的 script VM）：本帧的 tag 预算用完，
+        // 但脚本还在跑。**不**清 pending sync tween、**不**装 wait —— 下一帧
+        // 从当前位置继续；帧循环的输入/媒体推进照常发生。
     } else {
         // Completed without parking: if the run saw a [lytween sync=1] whose
         // layer tweens are still running, block frame progression until they
