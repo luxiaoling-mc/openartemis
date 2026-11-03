@@ -1,19 +1,5 @@
 #pragma once
-// audio domain — public contract.
-//
-// "Small interface, big file": this is the ONE audio header. It carries the
-// sound logic state machine (AudioEngine + its config/state structs)
-// AND the playback host (MediaPlayers); the merged
-// implementation lives in core/media/audio.cpp (§1 state machine, §2 vorbis
-// decode source, §3 playback host). The implementation-only declarations of
-// the playback host (AudioSink, sink_diag_after_push) moved to the
-// internal header core/media/media_internal.h, so this header no longer needs
-// the SDL audio or the libvorbis C headers at all. VorbisSource itself stays
-// declared here: MediaPlayers::Player owns one through std::unique_ptr and the
-// implicit-instantiation chain (make_unique<MediaPlayers> -> map default ctor
-// -> node destruction) needs the complete type in every TU that instantiates
-// MediaPlayers; internalising it would require out-of-line special members on
-// Player.
+// audio domain — public contract. "Small interface, big file": this is the ONE audio header. It carries the sound logic state machine (Audi...
 struct OggVorbis_File;
 
 #include <condition_variable>
@@ -204,14 +190,7 @@ private:
 /// A-B loop segment naming ([splay] foo_a.ogg -> foo_b.ogg; splay.md).
 std::optional<std::string> ab_loop_file(const std::string& file);
 
-// ---------------------------------------------------------------------------
-// §2 vorbis decode source: per-channel streaming decode.
-// ---------------------------------------------------------------------------
-// Ogg Vorbis decode source over an in-memory file image, using libvorbisfile
-// (Vorbis::vorbisfile) with memory callbacks. The engine reads whole asset
-// files through its virtual filesystem (PFS), so no OS file I/O happens here.
-// Decode is planar float at the file's native rate/channels; resampling and
-// mixing live in oa::media::MediaPlayers.
+// --------------------------------------------------------------------------- §2 vorbis decode source: per-channel streaming decode.
 class VorbisSource {
 public:
     ~VorbisSource();
@@ -254,19 +233,6 @@ public:
     ~MediaPlayers(); // cancels prefetch workers before the players die
 
     /// Resolve + read a whole media asset (logical name, magic paths already
-    /// applied by the caller's loader). Return nullopt when missing/unreadable.
-    ///
-    /// The reader is wrapped with the container probe the sound tags rely on:
-    /// the Ethornell-derived project families (test10, test13) name the file
-    /// WITHOUT its container — `[splay] file="bgm/bgm0304_a"`,
-    /// `[seplay] file="se/system/<name>"`, `[voice] file="voice/001_x/aiy010000010"`
-    /// — because their Lua layer is written against a sound loader that
-    /// appended ".ogg"/".wav" itself (test10's system/sound.iet only builds the
-    /// extension on its wasm branch, where it must consult a file list first).
-    /// Artemis-native projects (iMel/FPM) concatenate `game.soundext` in Lua,
-    /// so their exact names resolve on the first read and the probe never runs.
-    /// An already-qualified name is never re-probed, and the exact name always
-    /// wins, so this cannot change an existing project's resolution.
     void set_loader(std::function<std::optional<std::vector<uint8_t>>(const std::string&)> l) {
         loader_ = [l = std::move(l)](const std::string& name)
             -> std::optional<std::vector<uint8_t>> {
@@ -300,11 +266,6 @@ public:
     void update(uint64_t delta_ms, AudioEngine& engine, const FinishFn& on_finish);
 
     /// External audio feed into the SAME device stream the channel mixer
-    /// uses — the movie-audio path (VideoEngine pushes its
-    /// decoded container sound here). SDL_AudioStream serializes internally,
-    /// so the video driver thread may call this while the tick thread mixes
-    /// channels. Frames are already gained/clamped by the producer; a null
-    /// sink (headless) drops them silently.
     void push_video_audio(const float* interleaved_stereo, size_t frames);
 
     /// dump the OA_AUDIO_DIAG delivery summary (no-op when the
@@ -348,11 +309,9 @@ public:
     /// catch-up frames produced on top of the wall-clock chunk
     /// to restore the level to the target (and the ticks that did it).
     uint64_t refill_frames() const { return refill_frames_; }
-    uint64_t refill_ticks() const { return refill_ticks_; }
     /// negative control (`OA_AUDIO_NO_REFILL=1`): restore the
     /// one-sided pacer (withhold only, level parks where it lands) so
     /// a run can measure the dropouts the refill removes.
-    void set_mix_refill_enabled(bool on);
     bool mix_refill_enabled() const { return mix_refill_enabled_; }
 
     /// Tear down every player (all-sound-stop / reset paths).

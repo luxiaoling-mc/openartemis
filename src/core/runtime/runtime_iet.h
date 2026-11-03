@@ -1,31 +1,5 @@
 #pragma once
-// openartemis script runtime (oa::runtime) — the single public header of the
-// .iet/.ast/.asb scenario module.
-//
-// Design: "small interface, big file". Everything this module
-// does — value/variable conversions, expression evaluation, the .iet/.ast text
-// parser, the .asb binary decoder, and the interpreter that executes the rows
-// (control tags, wait model, Lua hooks, script store + call stack + the
-// save/restore of the execution position) — is implemented in ONE translation
-// unit, runtime/runtime_iet.cpp. Every parser, tag dispatcher, depth scan and
-// formatting helper there is internal linkage (anonymous namespace) and never
-// appears below; this header carries only the types callers actually name.
-//
-//   Value / VariableStore  — variable model (+ runtime_save serialization)
-//   expressions            — ExpressionEvaluator ($expr resolution)
-//   instructions           — Instruction rows + parse_params
-//   Script                 — one parsed scenario (labels + rows)
-//   ASB decoder            — decode_asb: bytes -> Artemis text
-//   Interpreter            — execution state, events/waits, host hooks
-//
-// Organization mirrors krkrsdl3 cpp/core/script/tjsNativeKAGParser.cpp (the
-// KAG scenario unit this format descends from: scenario cache/loading,
-// parsing, execution state and its save/restore in one file). Only the
-// organization is borrowed.
-//
-// Provenance: merged from src/core/script/{value,expression,instruction,
-// script,asb,interpreter}.{h,cpp} (six headers + six TUs) with no behavior
-// change; the per-section banners below name the block's subject.
+// openartemis script runtime (oa::runtime) — the single public header of the .iet/.ast/.asb scenario module.
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -122,19 +96,7 @@ public:
     std::string platform; // "windows" / "android" / ... (not persisted)
 };
 
-// ---------------------------------------------------------------------------
-// expressions — ExpressionEvaluator
-// ---------------------------------------------------------------------------
-// Artemis expression evaluator.
-//   - single-quoted strings (no escapes), numbers (0x/dec/float),
-//   - identifiers may contain '.' and '_' (so g.score is one token),
-//   - operators: || && == != < <= > >= + - * / %  ,
-//   - no function calls, no bool literals, no unary '!',
-//   - precedence low->high: || && ==!= rel +- (string concat if either side
-//     is String) * / % unary-minus primary,
-//   - comparisons convert both sides to f64 (string fallback 0.0),
-//   - missing variables evaluate to Int(0),
-//   - dynamic names: foo.(expr) segments appended via to_string.
+// --------------------------------------------------------------------------- expressions — ExpressionEvaluator...
 struct ExpressionError : std::runtime_error {
     explicit ExpressionError(const std::string& msg) : std::runtime_error(msg) {}
 };
@@ -201,11 +163,6 @@ struct Instruction {
     std::map<std::string, std::string> params; // insertion-independent (last wins)
     size_t line = 0;
     /// Script that was executing when this row was ENQUEUED from Lua
-    /// (e:tag / e:enqueueTag). The framework queues `[jump label=...]` rows
-    /// from inside a macro/filter and expects them to resolve in the script
-    /// that issued them, not in whatever script the queue drain has moved to
-    /// after the surrounding [return] burst (macro.iet's returnjump /
-    /// button.iet's target dispatch). Empty for rows read from a script.
     std::string origin_script;
 
     const std::string* get(std::string_view key) const {
@@ -230,25 +187,7 @@ struct Instruction {
 /// unterminated quote is a ParseError. Numeric keys are stored verbatim.
 std::map<std::string, std::string> parse_params(std::string_view params_str, size_t line);
 
-// ---------------------------------------------------------------------------
-// script text — Script
-// ---------------------------------------------------------------------------
-// Parsed script (labels + instruction list). Textual .iet/.ast content
-// parsing follows the preprocessed-format rules:
-//   - empty lines, "//" and ";" comments skipped
-//   - "/* ... */" block comments skipped (content opaque; may span lines
-//     when opened at the start of a line; unterminated blocks error)
-//   - "*label" defines a label at the current instruction index
-//   - lines with '[' are split into tags and inline story text segments
-//   - "[lua] ... [/lua]" becomes one LuaBlock instruction (kind, not a
-//     reserved tag name; code in params["code"])
-//   - un-bracketed story text becomes Text instructions (kind, not a
-//     reserved tag name; text in params["text"])
-// Script-sourced rows always have kind Tag, so a script tag that happens
-// to be named like a magic marker can never collide with synthesized
-// text/lua rows (dispatch keys on Instruction::Kind, never on names).
-// Preprocessor directives ("[&...]") are not expanded yet (fast path rule:
-// only run when content contains "[&").
+// --------------------------------------------------------------------------- script text — Script...
 struct Script {
     std::string name;
     std::map<std::string, size_t> labels; // label -> instruction index
@@ -265,17 +204,7 @@ struct Script {
     }
 };
 
-// ---------------------------------------------------------------------------
-// ASB decoder — decode_asb
-// ---------------------------------------------------------------------------
-// ASB binary script decoder (format from asb-decrypt crate, verified against
-// fpm system/{ui,save,script}.asb):
-//   header: "ASB\0" + u8 flag + u32le entry_count
-//   entry : u32le type (1=label, 0=instruction), u32le name_len, name, NUL
-//   label  -> "*name"
-//   instr  -> u32le serial (ignored), u32le param_count,
-//             param_count x (u32le key_len, key, NUL, u32le val_len, val, NUL)
-// Output is Artemis text syntax so the regular Script parser can reuse it.
+// --------------------------------------------------------------------------- ASB decoder — decode_asb...
 struct AsbError : std::runtime_error {
     explicit AsbError(const std::string& msg) : std::runtime_error(msg) {}
 };
@@ -393,30 +322,8 @@ struct CallFrame {
 // Host-side capability hooks (filled by the engine runtime and its Lua layer).
 struct InterpreterHooks {
     /// Framework flavour switch for e:tag ordering: when true (default) the
-    /// presentation tags listed in run_tag_now's whitelist execute in place;
-    /// when false they are appended to the tag queue in program order.
-    /// The FPM family (system/script.asb + estag) needs the queued order: its
-    /// [trans] captures the CURRENT frame as the fade source, so applying the
-    /// next step's [lyc] in place paints over the image the transition is
-    /// about to fade from (test2's splash went blank).
     bool immediate_tags = true;
     /// Queued-[call] hold (see Interpreter::queue_hold_depth_). When true, a
-    /// queued [call] suspends the drain until that callee returns, so the
-    /// tags the caller queued BEHIND it resolve in the caller's script
-    /// (Eustia/August boot: e:enqueueTag{"call", file="system/msg.iet"} then
-    /// e:enqueueTag{"jump", label="game_start"} — draining the jump inside
-    /// msg.iet aborted with "label not found: game_start").
-    ///
-    /// The FPM family (system/script.asb + estag drivers) needs the opposite.
-    /// Its `[call file=system/script.asb label=estagNN]` targets are
-    /// FALL-THROUGH label chains: each estag_call enqueues one real UI tag
-    /// (lyc / lyprop / print / chmsg …), so holding them stacks the whole
-    /// entrance and releases it as one burst — the title never settles
-    /// ("title parked and stationary" fails) and the 次の選択肢 fast-forward
-    /// loses its ordering (nsel_jump: opts=0, chapter unchanged). FPM keeps
-    /// draining through the callee (HEAD behaviour) and relies on
-    /// Instruction::origin_script to resolve a queued bare-label jump in the
-    /// script that issued it.
     bool queue_call_hold = true;
     /// Execute a [lua] block (called at script load; fallback when stepped over).
     std::function<void(const std::string& code, const std::string& script_name, size_t line)>
@@ -470,11 +377,6 @@ struct InterpreterHooks {
     /// Save-area existence (e:var file_exists save=1). Absent => false.
     std::function<bool(const std::string& file)> save_file_exists;
     /// Absolute save-area root. Backs the Lua `io.open` redirect: the iMel
-    /// framework persists its own system/global data with relative paths
-    /// ("savedata/system.dat"), and on the original engine those resolve into
-    /// the save directory. Stock Lua io.open would hit the process CWD
-    /// instead, so syssave() failed with a nil file handle and every boot
-    /// re-ran config_default (and the language screen). Empty = no redirect.
     std::function<std::string()> save_root;
     /// Save-area modification time (e:var file_update_time).
     /// Absent => noexist default.
@@ -614,12 +516,6 @@ public:
     /// each drain round.
     bool queued_saw_call() const { return queued_saw_call_; }
     /// Click-handler return floor: while the queued tags of one pointer click
-    /// drain, [return]s may not pop below this depth. The iMel button macro
-    /// emits an explicit return burst computed from e:getScriptStack() (its
-    /// block-stack view); this engine's real frames are the click origin and
-    /// below, so an unguarded burst unwound first.iet/config.iet and left the
-    /// handler running at depth 0 (test10 language change -> system/0.iet).
-    /// 0 = no guard. Cleared once the click's queued tags are drained.
     void set_return_floor(size_t depth) { return_floor_ = depth; }
     size_t return_floor() const { return return_floor_; }
     void clear_return_floor() { return_floor_ = 0; }
@@ -700,14 +596,6 @@ private:
     bool queued_saw_call_ = false;
     bool queued_saw_jump_ = false;
     /// While non-zero, the queued-tag drain is held: a queued [call] handed
-    /// control to a callee and the rest of the queue belongs to the caller
-    /// (resolved against the caller's script/labels), so it must wait for
-    /// that frame to return. Value = call_stack depth right after the push;
-    /// 0 = no hold. Eustia/August boot is the canonical case:
-    ///   e:enqueueTag{"call", file="system/msg.iet"}
-    ///   e:enqueueTag{"jump", label="game_start"}
-    /// — draining the jump inside msg.iet used to abort with
-    /// "jump: label not found: game_start".
     size_t queue_hold_depth_ = 0;
     size_t return_floor_ = 0;
     int immediate_tag_depth_ = 0;

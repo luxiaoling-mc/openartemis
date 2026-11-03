@@ -8,12 +8,12 @@
 // The e-table implementation enqueues lyc2 + the native "emotestatic" tag;
 // the runtime decodes the PSB, renders the static pose at the requested
 // canvas size, stores the RGBA frame and binds the carrier layer to that
-// emote canvas (layer-model S5: LayerContent::EmoteCanvas;读取域键 =
+// emote canvas (layer-model S5: host_bound + 层持有的纹理；读取域键 =
 // EmoteContent::canvas_key(id),旧的 __emote_layer__ 保留命名空间已删除).
 // Gates:
 //   E-1 the runtime processed an emotestatic event (emote_layer_events > 0)
 //   E-2 a scene layer with the dotted emote id exists and is bound to the
-//       emote canvas (content == LayerContent::EmoteCanvas)
+//       emote canvas (layer.host_bound)
 //   E-3 the stored frame has plausible content: opaque pixels in a central
 //       band, coloured (non-black) pixels present, vertical span within the
 //       canvas (a failed decode / exploding layout would fail these)
@@ -37,7 +37,7 @@
 #endif
 
 #include "core/fs/physfs_fs.h"
-#include "core/runtime/runtime.h"
+#include "core/runtime/runtime_game.h"
 #include "core/runtime/runtime_save.h"
 #include "core/media/image.h"
 #include <array>
@@ -129,8 +129,8 @@ e:createEmoteLayer{ id='1.0.1.fg.aya.p.m.a.b.0',
         const std::vector<uint8_t>& frgba = st.player->rgba();
         const oa::render::Layer* l = rt.scene().find(id);
         check(l != nullptr, "E-2: scene layer exists");
-        check(l && l->content == oa::render::LayerContent::EmoteCanvas,
-              "E-2: layer bound to the emote canvas (LayerContent::EmoteCanvas)");
+        check(l && l->host_bound,
+              "E-2: layer bound to the emote canvas (host texture)");
 
         // E-3: content plausibility (design px are *fit* into the canvas)
         size_t opaque = 0, colored = 0, midColored = 0;

@@ -1,19 +1,7 @@
 #pragma once
-// ---------------------------------------------------------------------------
-// bc7decomp — BC7/BPTC block decoder (VENDORED third-party code)
-//
-//   Upstream: https://github.com/richgel999/bc7enc — bc7decomp.h /
-//             bc7decomp.cpp by Richard Geldreich, Jr. (3/31/2020),
-//             dual-licensed MIT / public domain (the public-domain
-//             dedication travels with bc7decomp.cpp, at the end of the file).
-//   Why here: 甜蜜女友3-style E-mote atlases are BC7/BPTC. This
-//             decoder has exactly ONE consumer in the engine —
-//             emote_file.cpp (atlas type "BC7") — so it lives beside it
-//             instead of third_party/. Nothing else may include it.
-//   Status:   upstream source below is unmodified except for this note and
-//             the provenance line in bc7decomp.cpp; keep it that way when
-//             bumping the copy.
-// ---------------------------------------------------------------------------
+// Vendored BC7/BPTC decoder (richgel999/bc7enc, MIT / public domain).
+// Sole consumer: emote_file.cpp (BC7 atlases); do not include elsewhere.
+// Keep upstream code unmodified when bumping the copy.
 #include <stdlib.h>
 #include <stdint.h>
 #include <algorithm>

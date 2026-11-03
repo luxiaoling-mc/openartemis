@@ -9,7 +9,7 @@
 #include <vector>
 
 #include "core/fs/fs.h"
-#include "core/runtime/runtime.h"
+#include "core/runtime/runtime_game.h"
 #include "core/render/layer.h"
 
 namespace {

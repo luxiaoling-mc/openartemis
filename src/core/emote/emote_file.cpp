@@ -36,10 +36,6 @@ template <typename Fn>
 void parallel_rows(size_t rows, size_t min_rows, Fn&& fn) {
     unsigned hw = std::thread::hardware_concurrency();
     unsigned threads = std::clamp(hw ? hw : 1u, 1u, 16u);
-    if (const char* v = std::getenv("OA_EMOTE_THREADS")) {
-        const int n = std::atoi(v);
-        if (n >= 1 && n <= 16) threads = unsigned(n);
-    }
     if (threads <= 1 || rows < min_rows) {
         fn(0, rows);
         return;

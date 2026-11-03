@@ -19,7 +19,7 @@
 #include <zlib.h>
 
 #include "core/fs/fs.h"
-#include "core/runtime/runtime.h"
+#include "core/runtime/runtime_game.h"
 #include "core/runtime/runtime_iet.h"
 #include "core/runtime/runtime_lua.h"
 #include "core/runtime/runtime_save.h"

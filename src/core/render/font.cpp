@@ -1,5 +1,7 @@
 #include "core/render/font.h"
+#include "core/render/render_host.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 
@@ -56,31 +58,11 @@ bool numeric_edge_amount(const oa::render::FontDesc& f, const char* key, double*
 } // namespace
 
 EdgeEncoding edge_encoding_from_env() {
-    // 进程内只解析一次：描边编码在绘制循环里逐字形取用，getenv + 字符串构造
-    // 不应进热路径（开关按"启动时设定"语义）。
-    static const EdgeEncoding cached = [] {
-        const char* v = std::getenv("OA_FONT_OUTLINE");
-        if (!v || !*v) return EdgeEncoding::Stroke;
-        std::string s = v;
-        std::transform(s.begin(), s.end(), s.begin(), ::tolower);
-        if (s == "dilate") return EdgeEncoding::Dilate;
-        // legacy（4 对角副本）由 draw_text_layer 内联分支处理，编码面仍回落
-        // Stroke（该分支不会调用本函数的结果）。
-        return EdgeEncoding::Stroke;
-    }();
-    return cached;
+    return EdgeEncoding::Stroke;
 }
 
-/// OA_FONT_OUTLINE=legacy → 旧 4 对角副本路径（仅 PRE 像素对照用）。
 bool legacy_edge_env() {
-    static const bool cached = [] {
-        const char* v = std::getenv("OA_FONT_OUTLINE");
-        if (!v || !*v) return false;
-        std::string s = v;
-        std::transform(s.begin(), s.end(), s.begin(), ::tolower);
-        return s == "legacy";
-    }();
-    return cached;
+    return false;
 }
 
 bool raster_edge_alpha(FT_Library lib, FT_Stroker stroker, FT_Face face,
@@ -202,24 +184,18 @@ bool raster_edge_alpha(FT_Library lib, FT_Stroker stroker, FT_Face face,
     return true;
 }
 
-FontSystem::FontSystem(const oa::fs::IFileSystem* fs, const oa::runtime::GameRuntime* rt)
-    : fs_(fs), rt_(rt)
+FontSystem::FontSystem(const oa::fs::IFileSystem* fs, oa::render::RenderHost* host,
+                       const oa::render::TextEngine* text)
+    : fs_(fs), host_(host), text_(text)
 {
     if (FT_Init_FreeType(&ft_lib) != 0) {
         std::fprintf(stderr, "[app] freetype init failed\n");
         ft_lib = nullptr;
         return;
     }
-    // 连续描边：FT_Stroker 复用同一 library；失败则描边走
-    // 圆盘膨胀退路（raster_edge_alpha 内分支），不影响填充面。
+    // Stroke uses the same FT library; fallback is disk dilation.
     if (FT_Stroker_New(ft_lib, &stroker_) != 0) stroker_ = nullptr;
-    // Default text face resolution: the engine default font
-    // (font/sourcehansans-medium.otf) is an FPM asset. Projects ship their
-    // own CJK font under font/ (NekoMiko: font/GenJyuuGothic-Bold.ttf) —
-    // without the fallback below the face stays null and no glyph is ever
-    // drawn (story text invisible in windows). Order: the engine default
-    // name, then a listing of the project's font/ directory, then a small
-    // explicit candidate list for backends that cannot list.
+    // Default face: engine font, then project font/ listing, then candidates.
     std::string chosen;
     auto try_load = [&](const std::string& logical) -> bool {
         auto fb = fs->read(logical);
@@ -281,7 +257,7 @@ FT_Face FontSystem::load_font_face(const std::string& logical)
     
     for (const std::string& cand :
         { logical, logical + ".otf", logical + ".ttf" }) {
-        std::string r = rt_->interpreter().resolve_magic_path(cand);
+        std::string r = host_ ? host_->resolve_magic_path(cand) : cand;
         if (auto b = fs_->read(r)) {
             bytes = b;
             resolved_name = r;
@@ -299,10 +275,6 @@ FT_Face FontSystem::load_font_face(const std::string& logical)
     }
     fe.face = face;
     font_faces[logical] = std::move(fe);
-    // Per-face-load debug line (OA_DEBUG_FONT=1); see text.cpp font_debug_enabled.
-    const char* dbg = std::getenv("OA_DEBUG_FONT");
-    if (dbg && *dbg == '1' && !dbg[1])
-        std::printf("[app] text face: %s <- %s\n", logical.c_str(), resolved_name.c_str());
     return font_faces[logical].face;
 }
 
@@ -576,7 +548,7 @@ uint64_t FontSystem::layout_key(const oa::render::MessageLayer& ml) const {
         oa_fnv_strmap(h, u.font.raw);
     }
     // Layout-wide config ([prohibit]/[wordparts]/[indent]).
-    const oa::render::LayoutConfig& cfg = rt_->text().layout_config();
+    const oa::render::LayoutConfig& cfg = text_->layout_config();
     oa_fnv_bytes(h, cfg.prohibit_head.data(), cfg.prohibit_head.size());
     oa_fnv_bytes(h, cfg.prohibit_foot.data(), cfg.prohibit_foot.size());
     oa_fnv_bytes(h, cfg.wordparts.data(), cfg.wordparts.size());
@@ -590,14 +562,11 @@ uint64_t FontSystem::layout_key(const oa::render::MessageLayer& ml) const {
 const oa::render::LaidPage& FontSystem::cached_page(
     const oa::render::MessageLayer& ml, oa::render::RenderBackend* backend) const {
     FontSystem* self = const_cast<FontSystem*>(this);
-    // OA_NO_TEXT_CACHE=1: A/B switch — re-lay out every call (pre-cache
-    // behaviour) so a run can measure what the cache buys.
-    static const bool no_cache = std::getenv("OA_NO_TEXT_CACHE") != nullptr;
     PageCacheEntry& entry = self->page_cache_[ml.id];
-    const uint64_t key = no_cache ? 0u : layout_key(ml);
+    const uint64_t key = layout_key(ml);
     if (entry.key != key) {
         entry.page = oa::render::layout_page(
-            ml, metrics_fn, rt_->text().layout_config(), self);
+            ml, metrics_fn, text_->layout_config(), self);
         entry.key = key;
         // Bounded: layers are few; a runaway (scene churn) resets instead of
         // growing without limit.
@@ -613,67 +582,20 @@ size_t FontSystem::draw_text_layer(oa::render::RenderBackend* backend,
                                    double opacity)
 {
     if (!backend) return 0;
-    // 字体是"画的时候才加载"的（face_for → load_font_face）。此前这里在
-    // 没有任何字体面时直接 return 0，而加载字体面的唯一入口就在下面 ——
-    // 形成死锁：只要本次运行还没有别的东西触发过字体加载，正文就永远画不出
-    // 一个字（testgame/test13：标题全是图片、没有一处文字预热字体，进了剧情
-    // 第一次画正文就撞在这里 —— 满屏一个字都没有；第二次启动：语言对话框被
-    // system.dat 跳过，同理没人预热）。
-    // 现在就地解析本层字体，失败才放弃。OA_TEXT_NO_LAZY_FACE=1 还原修复前的
-    // 行为（A/B 对照臂：同样是这幅画面，开着就该一个字都画不出来）。
-    static const bool no_lazy_face = std::getenv("OA_TEXT_NO_LAZY_FACE") != nullptr;
     if (!default_face && font_faces.empty()) {
-        if (no_lazy_face) return 0;
-        if (!face_for(ml.font)) {
-            if (std::getenv("OA_TEXTDBG"))
-                std::fprintf(stderr,
-                             "[draw] layer='%s' NO FACE: request='%s' (nothing to "
-                             "draw — default face absent, face load failed)\n",
-                             ml.id.c_str(), ml.font.face().c_str());
+        if (!face_for(ml.font))
             return 0;
-        }
-        if (std::getenv("OA_TEXTDBG"))
-            std::fprintf(stderr, "[draw] lazy face load for '%s' -> faces=%zu\n",
-                         ml.id.c_str(), font_faces.size());
     }
-    // OA_TEXT_STATS=1: layout vs glyph-draw split for this layer (diagnostic).
-    static const bool text_stats = std::getenv("OA_TEXT_STATS") != nullptr;
     const auto ts0 = std::chrono::steady_clock::now();
     const oa::render::LaidPage& page = cached_page(ml, backend);
     const auto ts1 = std::chrono::steady_clock::now();
     if (page.glyphs.empty()) {
-        if (std::getenv("OA_TEXTDBG"))
-            std::fprintf(stderr,
-                         "[draw] layer='%s' LAID EMPTY: units=%zu chars=%zu reveal=%zu "
-                         "size=%.1f face='%s'\n",
-                         ml.id.c_str(), ml.page.size(), ml.char_count, ml.reveal_index,
-                         ml.font.size(), ml.font.face().c_str());
         return 0;
     }
     size_t drawn = 0;
-    // 字形布局坐标 = 文本节点本地坐标（节点世界变换的 text_for 注入语义：
-    // glyph 落点 ly.left/top+排版，再整体乘节点世界变换）。
-    // layout_page 恒产出 ≥1 的行高（text_line_metrics .max(1.0)）。
+    // Glyph positions are node-local, then transformed by the node world.
     const double line_h = page.line_height > 0 ? page.line_height : 40.0;
-    // 通用行盒语义: FPM 字表 top 是"行盒
-    // 顶",行内内容的纵向起点 = 行盒顶 + spacetop —— spacetop 是 FPM
-    // text_line_metrics 行高公式里的内容上边距,可为负。此前引擎丢弃了该偏移,
-    // 负 spacetop 的帮助字表整体偏低(dock mwhelp=-8 → 提示文字沉在 dock 亮条
-    // 下半不可读)。这里按通用语义补回行内容顶,不再需要任何
-    // id/字号判据;spacetop=0 的字表(正文/backlog 等)数值不变 → 逐像素不变
-    // (像素窗口验证)。判据完全来自 FPM 布局字段本身,撤销了控件特异 hack。
-    //
-    // 行盒顶之上还留着注音带:行高公式 spacetop+rubysize+spacemiddle+body+
-    // spacebottom 把 rubysize+spacemiddle 记在上方(ruby 就画在
-    // -(rubysize+spacemiddle) 处,见 ruby_top_offset),正文/名字的 em 顶从
-    // 注音带之下开始。此前只加 spacetop,带注音的 iMel 字表(名字层
-    // rubysize=19)整体偏高约半个 ruby 行:Watamari 的人名贴在姓名板顶边
-    // ("名字没有上下居中")。无注音(rubysize=0)的字表数值不变,仍逐像素不变。
-    // 行内容顶 = 行盒顶 + spacetop。**不加**注音带（rubysize + spacemiddle）：
-    // 姓名板的美术（mw_MWxx 里的 ribbon）与脚本里的 top 是对齐的，加注音带
-    // 会把整行下移 ~9px —— 实测 ribbon 738..782、墨迹 750..782（中心偏下
-    // 约 11px），减掉后墨迹 741..773，中心 757 ≈ ribbon 中心 760。ruby 自身
-    // 仍按 -(rubysize + spacemiddle) 画在正文上方，不受影响。
+    // Line content top = box top + spacetop; the ruby band stays above it.
     const double line_content_top = ml.top + ml.font.spacetop();
     const bool plain = world.is_plain_translation();
     auto map = [&](double lx, double ly, double* wx, double* wy) {
@@ -684,8 +606,7 @@ size_t FontSystem::draw_text_layer(oa::render::RenderBackend* backend,
             world.transform_point(lx, ly, wx, wy);
         }
     };
-    // 画一个字形贴图：本地左上角 (lx,ly)、尺寸取贴图实际宽高；
-    // alpha = 请求 alpha × 链不透明度（近似 cmd.opacity *= opacity）。
+    // Draw one glyph texture at local (lx,ly), alpha × chain opacity.
     auto draw_glyph_tex = [&](oa::render::TextureRef tex, double lx, double ly,
         const oa::render::Rgba& col, double alpha) {
             float wf = 0, hf = 0;
@@ -709,57 +630,25 @@ size_t FontSystem::draw_text_layer(oa::render::RenderBackend* backend,
             const oa::render::FPoint down{ float(x2), float(y2) };
             backend->draw_texture_affine(tex, nullptr, origin, right, down);
         };
-    if (std::getenv("OA_TEXTDBG"))
-        std::fprintf(stderr,
-                     "[draw] layer='%s' laid=%zu reveal=%zu first_order=%zu "
-                     "first_face='%s'\n",
-                     ml.id.c_str(), page.glyphs.size(), ml.reveal_index,
-                     page.glyphs.empty() ? 0 : page.glyphs.front().order,
-                     page.glyphs.empty() || !page.glyphs.front().font
-                         ? "-"
-                         : page.glyphs.front().font->face().c_str());
     for (const oa::render::LaidGlyph& g : page.glyphs) {
         if (g.newline || !g.font) continue;
-        // reveal：只画已揭示字符
+        // Only revealed glyphs draw.
         if (g.order >= ml.reveal_index) continue;
         const double gsize = g.font->size();
         // 栅格/落点按比例语义（ppem=round(size·upem/H)，见 measure_glyph）。
         const GlyphMeasure gm = measure_glyph(*g.font, g.cp);
         const CachedGlyph cg = glyph_slot(backend, face_for(*g.font), gsize, g.cp);
         if (!cg.tex) continue;
-        // 本地落点：x = ml.left + 排版 x + 左 bearing；y = 行内容顶
-        // (line_content_top = 行盒顶 ml.top + spacetop) + 行内偏移 + ascent
-        // − 位图顶（offset_x=b.min.x、offset_y=sf.ascent+b.min.y，
-        // y-down 下 min.y ≡ −bitmap_top）。
+        // x = layout x + left bearing; y = content top + ascent − bitmap top.
         const double lx = ml.left + g.x + double(cg.bitmap_left);
         const double ly = line_content_top + double(g.line) * line_h +
             gm.ascent - double(cg.bitmap_top);
-        static const bool g_dbg = std::getenv("OA_TEXTDBG") != nullptr;
-        if (g_dbg && g.order == 0)
-            std::fprintf(stderr,
-                         "[draw] '%s' first glyph ly=%.1f (top=%.1f spacetop=%.1f "
-                         "line_h=%.1f ascent=%.1f bmp_top=%d line=%u)\n",
-                         ml.id.c_str(), ly, ml.top, ml.font.spacetop(), line_h,
-                         gm.ascent, cg.bitmap_top, g.line);
         const oa::render::Rgba col = text_color(*g.font);
         oa::render::Rgba shadow{ 0, 0, 0, 0 };
         oa::render::Rgba outline{ 0, 0, 0, 0 };
         style_colors(*g.font, &shadow, &outline);
-        // 描边/阴影开关语义（两代框架并存）：
-        //   - FPM 系（gt/NekoMiko …）[font] 行带 style="outline,shadow" 词;
-        //   - iMel 系（rr/N1/N2/btjy/slny/tg3 list_windows*.tbl lang.font.*：
-        //     adv01/name/select/config01… 及 boot.lua get_fontdata 原样下发）
-        //     不带 style 词,用数值键 outline=N/shadow=N(+ outlinecolor/
-        //     shadowcolor)。旧实现只认 style 词 → iMel 系永不描边：正文白字
-        //     无边框(实机“没有边框”),设置页预览文字白底白字(实机“预览文字
-        //     区域空白”)。
-        //   现象 J+：数值键恢复**量纲**语义
-        //     （outline=N → 描边宽度 N px、shadow=N → 偏移 N px）。曾把
-        //     键值降级为"开关 + 恒 1px hairline"，但实机判据是：描边本该存在，
-        //     "边框断裂"（4 个对角偏移副本在 N>1 时四周留缺口）才是被误判为
-        //     异常黑边的根本原因。**保留此前的保守项**：数值路径必须该行显式
-        //     给出可解析 outlinecolor，否则不描边（不回退默认黑）。
-        //     style 词路径语义不变（宽度取同一 outline 键/缺省 1px）。
+        // Two generations coexist: style words (FPM) or numeric outline/shadow
+        // keys (iMel). Numeric outline needs an explicit parseable colour.
         const bool style_outline = style_word_on(*g.font, "outline");
         const bool style_shadow = style_word_on(*g.font, "shadow");
         double ow_key = 0, sd_key = 0;
@@ -772,23 +661,19 @@ size_t FontSystem::draw_text_layer(oa::render::RenderBackend* backend,
         const bool num_shadow = numeric_edge_amount(*g.font, "shadow", &sd_key);
         const bool has_shadow = style_shadow || num_shadow;
         const bool has_outline = style_outline || num_outline;
-        // 描边宽度 px：数值键值（≥1）；缺失/不可解析 → 1px（style 词路径）。
+        // Stroke width: numeric value, else 1px (style path).
         const double os = ow_key >= 1.0 ? ow_key : 1.0;
-        // 阴影/描边/正文 pass：偏移在本地坐标加后再经世界映射（为世界坐标
-        // 偏移 +sd；平移路径下两者严格等价，仿射路径下相差旋转/缩放的 ~1px 级，
-        // 记录为近似）。
+        // Shadow/stroke/fill offsets are applied in local space.
         auto emit_pass = [&](double offx, double offy, const oa::render::Rgba& pc, double pa) {
             draw_glyph_tex(cg.tex, lx + offx, ly + offy, pc, pa);
         };
         if (has_shadow) {
-            // 数值键 = 偏移 px；纯 style 词路径保留既有 2px。
+            // Numeric key = offset px; style path keeps 2px.
             const double sd = num_shadow ? sd_key : 2.0;
             emit_pass(sd, sd, shadow, 96);
         }
         if (has_outline) {
-            // 连续描边：单层独立描边位图（FT_Stroker 外扩
-            // os px，自带 bearing），绘在填充层之下。旧"4 对角副本"仅在
-            // OA_FONT_OUTLINE=legacy（PRE 像素对照）时走。
+            // Continuous stroke bitmap; legacy 4-corner copies only via env.
             if (legacy_edge_env()) {
                 const double off[][2] = { {-1, -1}, {1, -1}, {-1, 1}, {1, 1} };
                 for (const auto& o : off)
@@ -797,7 +682,7 @@ size_t FontSystem::draw_text_layer(oa::render::RenderBackend* backend,
                 const CachedGlyph eg =
                     edge_slot(backend, face_for(*g.font), gsize, g.cp, os);
                 if (eg.tex) {
-                    // 与填充同一原点网格（bearing 相对笔端）⇒ 落点公式一致。
+                    // Same origin grid as the fill → same landing formula.
                     const double ex = ml.left + g.x + double(eg.bitmap_left);
                     const double ey = line_content_top + double(g.line) * line_h +
                         gm.ascent - double(eg.bitmap_top);
@@ -808,11 +693,7 @@ size_t FontSystem::draw_text_layer(oa::render::RenderBackend* backend,
         emit_pass(0, 0, col, 255);
         ++drawn;
     }
-    // ── 注音（ruby）：整段居中于基础区上方（ruby_top =
-    // ly.top + metrics.ruby_top + line·line_height，；ruby_top =
-    // −(ruby_height + spacemiddle)）；字形逐字按 ruby_positions
-    // ：x_i = base_x0 + ((base_x1−base_x0)−total)/2 +
-    // Σ(a_j+rubykerning)。ruby 字形与用主字体栅格化（rubyface 参数
+    // Ruby: centered above the base run; per-glyph x from ruby_positions.
     // 仅存不读；FPM rubyface≡主字体，差异面为 0）。
     double ruby_top_offset = 0;
     {
@@ -863,28 +744,6 @@ size_t FontSystem::draw_text_layer(oa::render::RenderBackend* backend,
             draw_glyph_tex(cg.tex, lx, ly, col, 255);
             x_cursor += gm.advance + ruby_kerning;
             ++drawn;
-        }
-    }
-    if (text_stats) {
-        const auto ts2 = std::chrono::steady_clock::now();
-        const double lay_us =
-            std::chrono::duration<double, std::micro>(ts1 - ts0).count();
-        const double draw_us =
-            std::chrono::duration<double, std::micro>(ts2 - ts1).count();
-        static uint64_t calls = 0, glyphs = 0;
-        static double lay_sum = 0, draw_sum = 0;
-        ++calls;
-        glyphs += page.glyphs.size();
-        lay_sum += lay_us;
-        draw_sum += draw_us;
-        if (calls % 120 == 0) {
-            std::printf("[text] calls=%llu glyphs=%llu layout=%.0fus/call "
-                        "draw=%.0fus/call last=%zu lay=%.0fus\n",
-                        (unsigned long long)calls, (unsigned long long)glyphs,
-                        lay_sum / 120.0, draw_sum / 120.0, page.glyphs.size(),
-                        lay_us);
-            lay_sum = 0;
-            draw_sum = 0;
         }
     }
     return drawn;

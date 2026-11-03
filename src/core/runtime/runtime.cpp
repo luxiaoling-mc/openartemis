@@ -2,11 +2,24 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
+#include <filesystem>
+#include <optional>
+#include <thread>
+#include <utility>
+#include <vector>
 
+#include "core/emote/emote_player.h"
+#include "core/fs/physfs_fs.h"
 #include "core/fs/project.h"
-#include "core/render/content_role.h" // bound_image_size 键公式收敛
+#include "core/render/renderer.h"
+#include "core/runtime/runtime.h" // App (host contract)
+#include "core/runtime/runtime_save.h"
+#include "core/version.h"
 
 namespace oa::runtime {
 
@@ -18,6 +31,8 @@ int g_storydbg = 0;
 int g_storydbg_arm = 0;
 constexpr int kKeyMouseRight = 2;
 constexpr int kKeyEnter = 13;
+// Short name for the renderer's frame-dirty tags (renderer.h Note).
+using RNote = oa::render::RenderEngine::Note;
 constexpr int kKeySpace = 32;
 
 // Script param -> int, `dflt` when the text is not a full integer (the one
@@ -105,8 +120,7 @@ bool sniff_image_dims(const std::vector<uint8_t>& b, double* w, double* h) {
 }
 } // namespace
 
-// ===========================================================================
-// 对外接口：GameRuntime 薄转发（"小接口，大文件"）
+// GameRuntime public forwarding.
 //     实现面（状态 + 逻辑）全在 runtime_internal.h 的 RuntimeState；本类只持有
 //     s_ 并把每个公开方法转给它的同名实现。公开签名与 runtime.h 逐字一致，
 //     因此 56 个调用方一行不改。
@@ -115,9 +129,95 @@ GameRuntime::RuntimeState::RuntimeState(GameRuntime* rt,
                                        std::shared_ptr<const oa::fs::IFileSystem> fs)
     // 初始化列表照搬原 GameRuntime 构造函数；顺序 = 声明顺序。
     : rt_(rt),
-      save_store_(std::make_shared<oa::runtime::NullSaveStore>()),
-      media_players_(std::make_unique<oa::media::MediaPlayers>()),
-      fs_(std::move(fs)) {}
+      fs_(std::move(fs)),
+      renderer_(fs_.get(), static_cast<oa::render::RenderHost*>(rt), false)
+{
+    save_.save_store_ = std::make_shared<oa::runtime::NullSaveStore>();
+    media_.media_players_ = std::make_unique<oa::media::MediaPlayers>();
+    set_hit_providers(oa::render::RenderEngine::hit_size,
+                      oa::render::RenderEngine::alpha_sampler, &renderer_);
+    set_pointer_warp_callback([this](int sx, int sy) {
+        renderer_.warp_mouse_to_stage(float(sx), float(sy));
+    });
+    set_frame_capture([this](uint32_t* w, uint32_t* h) {
+        return renderer_.capture_frame(w, h);
+    });
+}
+
+GameRuntime::RuntimeState::~RuntimeState()
+{
+    renderer_.release_all();
+    // Stop the video driver and cancel decode pipes BEFORE the audio sink and
+    // the decode pool are torn down: the driver thread calls the movie-audio
+    // hook and the pool workers, so releasing either first is a use-after-free.
+    media_.video_.stop_all_videos();
+    media_.video_.stop_driver();
+    media_.video_.set_audio_output(nullptr);
+    media_.video_.set_audio_flush(nullptr);
+    media_.media_players_->print_audio_diag("run");
+    media_.media_players_->release();
+}
+
+bool GameRuntime::RuntimeState::attach_window(void* native_window,
+                                              const std::string& backend_kind)
+{
+    if (!renderer_.create_renderer(native_window, backend_kind)) return false;
+    oa::emote::emote_set_default_external_pose(true);
+    media_.media_players_->init();
+    media_.video_.set_audio_output([mp = media_.media_players_.get()](const float* d, size_t n) {
+        mp->push_video_audio(d, n);
+    });
+    media_.video_.set_audio_flush([mp = media_.media_players_.get()]() {
+        mp->flush_video_audio();
+    });
+    // 视频源自己解码并 update 自己的纹理；纹理挂到层上（driver 线程入队，
+    // 主线程落场景，render 只负责画层）。
+    media_.video_.set_texture_factory(
+        [this](int w, int h) { return renderer_.create_host_texture(w, h); });
+    media_.video_.set_frame_push(
+        [this](const std::string& channel, const oa::media::VideoEngine::TextureRef& tex,
+               int, int) {
+            const std::string id = channel.empty()
+                                       ? std::string(oa::render::kOverlayNodeId)
+                                       : channel;
+            queue_host_texture(id, tex);
+        });
+    return true;
+}
+
+std::string GameRuntime::RuntimeState::resolve_magic_path(
+    const std::string& name) const
+{
+    return interpreter_ ? interpreter_->resolve_magic_path(name) : name;
+}
+
+std::optional<std::string> GameRuntime::RuntimeState::host_variable(
+    const std::string& key) const
+{
+    if (!interpreter_) return std::nullopt;
+    const auto v = interpreter_->variables().get(key);
+    if (!v) return std::nullopt;
+    return v->to_string();
+}
+
+std::optional<std::vector<uint8_t>> GameRuntime::RuntimeState::read_save_file(
+    const std::string& rel_path) const
+{
+    const std::string& sp = save_.savepath_;
+    if (sp.empty() || rel_path.empty()) return std::nullopt;
+    if (!(rel_path == sp ||
+          (sp.size() < rel_path.size() && rel_path.rfind(sp + "/", 0) == 0)))
+        return std::nullopt;
+    if (!save_.save_store_) return std::nullopt;
+    return save_.save_store_->read(rel_path);
+}
+
+void GameRuntime::RuntimeState::bind_text_metrics(
+    std::function<std::tuple<double, double, double>()> fn)
+{
+    if (!interpreter_ || !fn) return;
+    interpreter_->hooks().message_layer_metrics = std::move(fn);
+}
 
 GameRuntime::GameRuntime(std::shared_ptr<const oa::fs::IFileSystem> fs)
     : s_(std::make_unique<RuntimeState>(this, std::move(fs))) {}
@@ -128,14 +228,44 @@ GameRuntime::~GameRuntime() = default;
 
 void GameRuntime::open_project(std::string_view platform) { s_->open_project(platform); }
 void GameRuntime::boot_project() { s_->boot_project(); }
-void GameRuntime::restart_project() { s_->restart_project(); }
-void GameRuntime::dispatch_tween_done(const std::vector<oa::render::TweenDone>& done) { s_->dispatch_tween_done(done); }
 void GameRuntime::tick(uint64_t delta_ms, const FrameInput& input) { s_->tick(delta_ms, input); }
+void GameRuntime::tick(uint64_t delta_ms) { s_->tick_input(delta_ms); }
+void GameRuntime::key_event(int vk, bool down) { s_->key_event(vk, down); }
+void GameRuntime::mouse_move(float window_x, float window_y) { s_->mouse_move(window_x, window_y); }
+void GameRuntime::mouse_button(int vk, bool down) { s_->mouse_button(vk, down); }
+void GameRuntime::mouse_wheel(int direction) { s_->mouse_wheel(direction); }
 bool GameRuntime::exit_requested() const { return s_->exit_requested(); }
 std::vector<oa::runtime::Event> GameRuntime::drain_events() { return s_->drain_events(); }
 oa::runtime::Interpreter& GameRuntime::interpreter() { return s_->interpreter(); }
 const oa::runtime::Interpreter& GameRuntime::interpreter() const { return s_->interpreter(); }
 const std::shared_ptr<const oa::fs::IFileSystem>& GameRuntime::fs() const { return s_->fs(); }
+bool GameRuntime::attach_window(void* native_window, const std::string& renderer_kind) {
+    return s_->attach_window(native_window, renderer_kind);
+}
+std::string GameRuntime::resolve_magic_path(const std::string& name) const {
+    return s_->resolve_magic_path(name);
+}
+std::optional<std::string> GameRuntime::host_variable(const std::string& key) const {
+    return s_->host_variable(key);
+}
+std::optional<std::vector<uint8_t>> GameRuntime::read_save_file(
+    const std::string& rel_path) const {
+    return s_->read_save_file(rel_path);
+}
+void GameRuntime::bind_text_metrics(
+    std::function<std::tuple<double, double, double>()> fn) {
+    s_->bind_text_metrics(std::move(fn));
+}
+int GameRuntime::stage_width() const { return s_->stage_width(); }
+int GameRuntime::stage_height() const { return s_->stage_height(); }
+bool GameRuntime::vsync_active() const { return s_->vsync_active(); }
+bool GameRuntime::frame_presented() const { return s_->frame_presented(); }
+void GameRuntime::request_repaint() { s_->request_repaint(); }
+std::optional<std::vector<uint8_t>> GameRuntime::capture_frame(uint32_t* w,
+                                                              uint32_t* h) {
+    return s_->capture_frame(w, h);
+}
+oa::render::Compositor& GameRuntime::scene() { return s_->scene(); }
 const oa::render::Compositor& GameRuntime::scene() const { return s_->scene(); }
 size_t GameRuntime::scene_layer_events() const { return s_->scene_layer_events(); }
 size_t GameRuntime::scene_tween_events() const { return s_->scene_tween_events(); }
@@ -143,8 +273,8 @@ size_t GameRuntime::tween_completion_calls() const { return s_->tween_completion
 bool GameRuntime::waiting_stop() const { return s_->waiting_stop(); }
 const oa::runtime::WaitReason* GameRuntime::current_wait() const { return s_->current_wait(); }
 void GameRuntime::apply_override(int key, int status) { s_->apply_override(key, status); }
-TransitionStatus GameRuntime::transition() { return TransitionStatus(&s_->transition_); }
-TransitionStatus GameRuntime::transition() const { return TransitionStatus(&s_->transition_); }
+TransitionStatus GameRuntime::transition() { return TransitionStatus(&s_->transition()); }
+TransitionStatus GameRuntime::transition() const { return TransitionStatus(&s_->transition()); }
 
 // ---- [trans] 只读投影 ------------------------------------------------------
 // 转发到 render 内部语义机 oa::render::Transition 的同名只读查询（定义见
@@ -165,13 +295,13 @@ const std::string& TransitionStatus::rule() const {
 int TransitionStatus::vague() const { return state_ ? state_->vague() : 32; }
 uint64_t GameRuntime::now_ms() const { return s_->now_ms(); }
 void GameRuntime::transition_begin(const std::map<std::string, std::string>& params) { s_->transition_begin(params); }
+oa::render::Transition& GameRuntime::transition_state() { return s_->transition_state(); }
 void GameRuntime::set_transition_capture_callback(std::function<void()> cb) { s_->set_transition_capture_callback(std::move(cb)); }
 void GameRuntime::mark_transition_captured() { s_->mark_transition_captured(); }
 void GameRuntime::begin_all_delete(uint64_t time_ms) { s_->begin_all_delete(time_ms); }
 double GameRuntime::all_delete_fade() const { return s_->all_delete_fade(); }
 void GameRuntime::set_hit_providers(oa::render::Compositor::QuadSizeFn size, oa::render::Compositor::AlphaSamplerFn alpha, void* userdata) { s_->set_hit_providers(std::move(size), std::move(alpha), userdata); }
 void GameRuntime::set_pointer_observer(std::function<void(const PointerDispatch&)> cb) { s_->set_pointer_observer(std::move(cb)); }
-const std::set<std::string>& GameRuntime::hovered_layers() const { return s_->hovered_layers(); }
 bool GameRuntime::is_hovered(const std::string& id) const { return s_->is_hovered(id); }
 size_t GameRuntime::pointer_dispatch_count() const { return s_->pointer_dispatch_count(); }
 void GameRuntime::set_pointer_warp_callback(std::function<void(int, int)> cb) { s_->set_pointer_warp_callback(std::move(cb)); }
@@ -182,13 +312,10 @@ bool GameRuntime::automode_active() const { return s_->automode_active(); }
 bool GameRuntime::hide_active() const { return s_->hide_active(); }
 bool GameRuntime::control_skip_effective() const { return s_->control_skip_effective(); }
 bool GameRuntime::rclick_allowed() const { return s_->rclick_allowed(); }
-void GameRuntime::force_pointer_drag(const std::string& layer_id) { s_->force_pointer_drag(layer_id); }
 const oa::render::TextEngine& GameRuntime::text() const { return s_->text(); }
 oa::render::TextEngine& GameRuntime::text() { return s_->text(); }
-uint64_t GameRuntime::text_revision() const { return s_->text_revision(); }
 size_t GameRuntime::text_events() const { return s_->text_events(); }
 size_t GameRuntime::message_switch_events() const { return s_->message_switch_events(); }
-bool GameRuntime::apply_text_event(const oa::runtime::Event& e) { return s_->apply_text_event(e); }
 oa::media::AudioEngine& GameRuntime::audio() { return s_->audio(); }
 const oa::media::AudioEngine& GameRuntime::audio() const { return s_->audio(); }
 oa::media::VideoEngine& GameRuntime::video() { return s_->video(); }
@@ -201,10 +328,8 @@ size_t GameRuntime::media_events() const { return s_->media_events(); }
 size_t GameRuntime::media_handler_dispatches() const { return s_->media_handler_dispatches(); }
 void GameRuntime::enable_decode_pool(int threads) { s_->enable_decode_pool(threads); }
 void GameRuntime::set_save_store(std::shared_ptr<oa::runtime::SaveStore> store) { s_->set_save_store(std::move(store)); }
-const std::shared_ptr<oa::runtime::SaveStore>& GameRuntime::save_store() const { return s_->save_store(); }
 void GameRuntime::set_frame_capture(CaptureFn fn) { s_->set_frame_capture(std::move(fn)); }
 void GameRuntime::post_frame_capture() { s_->post_frame_capture(); }
-void GameRuntime::sysload() { s_->sysload(); }
 bool GameRuntime::syssave() { return s_->syssave(); }
 bool GameRuntime::save_game_to(const std::string& file) { return s_->save_game_to(file); }
 LoadResult GameRuntime::load_game(const std::string& file, int64_t trans_type) {
@@ -212,26 +337,14 @@ LoadResult GameRuntime::load_game(const std::string& file, int64_t trans_type) {
 }
 bool GameRuntime::load_game_from(const std::string& file, int64_t trans_type) { return s_->load_game_from(file, trans_type); }
 const std::string& GameRuntime::savepath() const { return s_->savepath(); }
-bool GameRuntime::save_file_exists(const std::string& file) const { return s_->save_file_exists(file); }
 void GameRuntime::apply_save_event(const oa::runtime::Event& e) { s_->apply_save_event(e); }
 bool GameRuntime::apply_media_event(const oa::runtime::Event& e) { return s_->apply_media_event(e); }
-void GameRuntime::advance_media_frame(uint64_t delta_ms) { s_->advance_media_frame(delta_ms); }
 void GameRuntime::sound_finished(oa::media::SoundCategory cat, const std::string& id) { s_->sound_finished(cat, id); }
-bool GameRuntime::media_se_wait_finished(const std::string& id, bool time_given, uint64_t time_ms) const { return s_->media_se_wait_finished(id, time_given, time_ms); }
-
 
 std::pair<double, double> GameRuntime::RuntimeState::bound_image_size(const oa::render::Layer& l) {
-    // Natural (texture) size of the image bound to `l`, header-sniffed once
-    // and cached. Mirror of the RenderEngine resolution face: the decoded
-    // cache key is the logical file name (path prefix + file) and the fs
-    // candidates are raw / +.png / +.jpg (renderer.cpp resolve_image).
-    // 键公式收敛为角色 texture_key
-    // (与渲染/命中/采样面同源)。
-    // 键升级为 TextureKey 且只探测 Asset 域 —— 宿主供帧层(视频/emote)的
-    // 资源名不是文件,恒 {0,0}(与旧实现"用保留命名空间去 fs 探测、恒失败"
-    // 的结果逐位一致,同时不再可能撞上同名的真实资源)。
+    // Cached header-sniffed natural size; Asset textures only.
     if (l.file.empty()) return {0, 0};
-    const oa::render::TextureKey key = oa::render::content_role_of(l).texture_key(l);
+    const oa::render::TextureKey key = oa::render::content_texture_key(l);
     if (key.empty() || !key.is_asset()) return {0, 0};
     const auto hit = image_size_cache_.find(key);
     if (hit != image_size_cache_.end()) return hit->second;
@@ -257,16 +370,16 @@ std::pair<double, double> GameRuntime::RuntimeState::bound_image_size(const oa::
 
 void GameRuntime::RuntimeState::enable_decode_pool(int threads) {
     if (threads == 0) {
-        if (decode_pool_) {
-            if (media_players_) media_players_->set_decode_pool(nullptr);
-            video_.set_decode_pool(nullptr);
-            decode_pool_.reset();
+        if (media_.decode_pool_) {
+            if (media_.media_players_) media_.media_players_->set_decode_pool(nullptr);
+            media_.video_.set_decode_pool(nullptr);
+            media_.decode_pool_.reset();
         }
         return;
     }
-    decode_pool_ = std::make_unique<oa::media::DecodePool>(threads);
-    if (media_players_) media_players_->set_decode_pool(decode_pool_.get());
-    video_.set_decode_pool(decode_pool_.get());
+    media_.decode_pool_ = std::make_unique<oa::media::DecodePool>(threads);
+    if (media_.media_players_) media_.media_players_->set_decode_pool(media_.decode_pool_.get());
+    media_.video_.set_decode_pool(media_.decode_pool_.get());
 }
 
 void GameRuntime::RuntimeState::open_project(std::string_view platform) {
@@ -281,6 +394,7 @@ void GameRuntime::RuntimeState::open_project(std::string_view platform) {
     cfg.env = rt_->project_.config.env;
 
     interpreter_ = std::make_unique<oa::runtime::Interpreter>(cfg);
+    renderer_.bind_runtime_hooks();
     // Native [alldelete] handler. Registered as an engine tag so the
     // Lua tag filter cannot swallow it (FPM registers tags.alldelete but its
     // Lua-side lydel bookkeeping races [exit]/[reset]; the engine contract is
@@ -312,8 +426,8 @@ void GameRuntime::RuntimeState::open_project(std::string_view platform) {
         };
     interpreter_->variables().platform = cfg.platform;
     // project-level seeding: savepath 与系统存档读取
-    savepath_ = sanitize_savepath(rt_->project_.config.savepath);
-    interpreter_->set_variable("s.savepath", oa::runtime::Value::make_string(savepath_));
+    save_.savepath_ = sanitize_savepath(rt_->project_.config.savepath);
+    interpreter_->set_variable("s.savepath", oa::runtime::Value::make_string(save_.savepath_));
     interpreter_->hooks().frame_number = [this] { return tick_count_; };
     interpreter_->hooks().file_loader = [this](const std::string& name)
         -> std::optional<std::vector<uint8_t>> {
@@ -325,28 +439,14 @@ void GameRuntime::RuntimeState::open_project(std::string_view platform) {
     interpreter_->hooks().layer_info = [this](const std::string& id)
         -> std::map<std::string, std::string> {
         std::map<std::string, std::string> out;
-        const oa::render::Layer* l = scene_.find(id);
+        const oa::render::Layer* l = scene().find(id);
         if (!l) return out;
         for (const auto& [k, v] : l->props) out[k] = v;
         out["left"] = format_prop_num(l->left);
         out["top"] = format_prop_num(l->top);
         out["x"] = format_prop_num(l->left);
         out["y"] = format_prop_num(l->top);
-        // Report the layer's EFFECTIVE width/height (hit-test size
-        // precedence: explicit width/height > clip w/h). FPM's csvbtn3
-        // "obj" layers (e.g. the tablet tb_mask overlay) are created as
-        // clipped images without explicit width/height; the reference engine
-        // reports their clip size here, and FPM geometry math depends on it
-        // (getTabletPos p.w -> tab_left/right bx = p.w - b; a 0 here made the
-        // touchbar containment toggles park the bar at x=b instead of
-        // ±(w-b)).
-        // The same precedence continues to the bound image's
-        // natural (texture) size. Newer framework revisions (甜蜜女友3)
-        // create the touchbar drag overlay as a plain full-stage image row
-        // (mw/tablet/tb_mask: no explicit w/h, no clip — its width is the
-        // png's 1920); with a 0 fallback the containment arithmetic degraded
-        // to bx = -b and the bar parked at ±b (almost fully visible) instead
-        // of ±(w-b), i.e. the touchbar could never fully collapse.
+        // Effective size: explicit width/height > clip > natural texture.
         std::pair<double, double> natural = {0, 0};
         if (l->width <= 0 && !l->has_clip) natural = bound_image_size(*l);
         out["width"] = format_prop_num(l->width > 0
@@ -373,7 +473,7 @@ void GameRuntime::RuntimeState::open_project(std::string_view platform) {
     // (MediaPlayers::set_loader also probes the ".ogg"/".wav" containers for
     // extension-less sound names — the Ethornell-derived projects hand the
     // sound tags a bare base name.)
-    media_players_->set_loader([this](const std::string& logical)
+    media_.media_players_->set_loader([this](const std::string& logical)
                                    -> std::optional<std::vector<uint8_t>> {
         if (!interpreter_) return std::nullopt;
         return fs_->read(interpreter_->resolve_magic_path(logical));
@@ -381,7 +481,7 @@ void GameRuntime::RuntimeState::open_project(std::string_view platform) {
     // The video decoder reads whole asset files through the same face.
     // A missing/undecodable file keeps the logical immediate-finish fallback
     // inside VideoEngine, so project flows never hang on unavailable video.
-    video_.set_loader([this](const std::string& logical)
+    media_.video_.set_loader([this](const std::string& logical)
                           -> std::optional<std::vector<uint8_t>> {
         if (!interpreter_) return std::nullopt;
         return fs_->read(interpreter_->resolve_magic_path(logical));
@@ -393,14 +493,14 @@ void GameRuntime::RuntimeState::open_project(std::string_view platform) {
     // file_update_time / get_sound_info.
     const auto read_resolved =
         [this](const std::string& resolved) -> std::optional<std::vector<uint8_t>> {
-        const bool under_save = !savepath_.empty() &&
-                                (resolved == savepath_ ||
-                                 (resolved.size() > savepath_.size() &&
-                                  resolved.rfind(savepath_ + "/", 0) == 0));
-        if (under_save && save_store_) {
+        const bool under_save = !save_.savepath_.empty() &&
+                                (resolved == save_.savepath_ ||
+                                 (resolved.size() > save_.savepath_.size() &&
+                                  resolved.rfind(save_.savepath_ + "/", 0) == 0));
+        if (under_save && save_.save_store_) {
             const std::string rel = qualify_save_file(resolved);
             if (!rel.empty()) {
-                if (auto b = save_store_->read(rel)) return b;
+                if (auto b = save_.save_store_->read(rel)) return b;
                 return std::nullopt; // save-area names do not fall back to PFS
             }
         }
@@ -410,36 +510,28 @@ void GameRuntime::RuntimeState::open_project(std::string_view platform) {
     interpreter_->hooks().resource_exists = [read_resolved](const std::string& resolved) {
         return read_resolved(resolved).has_value();
     };
-    // Framework family probe: FPM titles ship system/script.asb next to
-    // first.iet/ui.asb/save.asb. Their scriptMainloop/estag drivers depend on
-    // e:tag appending to the queue (the next step must not be applied before
-    // the [trans] capture) and on clock-driven parks being left alone.
-    //fpm_family_ = interpreter_->hooks().resource_exists
-    //                  ? interpreter_->hooks().resource_exists("system/script.asb")
-    //                  : false;
-    fpm_family_ = true;
-    interpreter_->hooks().immediate_tags = !fpm_family_;
+    interpreter_->hooks().immediate_tags = false;
     // FPM's estag calls are fall-through label chains that enqueue the whole
     // UI state; holding the queue behind them collapses the entrance into one
     // burst (see InterpreterHooks::queue_call_hold). Non-FPM keeps the hold.
-    interpreter_->hooks().queue_call_hold = !fpm_family_;
+    interpreter_->hooks().queue_call_hold = false;
     interpreter_->hooks().save_root = [this]() -> std::string {
-        if (auto dir = std::dynamic_pointer_cast<oa::runtime::DirSaveStore>(save_store_)) {
+        if (auto dir = std::dynamic_pointer_cast<oa::runtime::DirSaveStore>(save_.save_store_)) {
             return dir->root();
         }
         return std::string();
     };
     interpreter_->hooks().save_file_exists = [this](const std::string& file) -> bool {
         const std::string rel = qualify_save_file(file);
-        if (rel.empty() || !save_store_) return false;
-        return save_store_->exists(rel);
+        if (rel.empty() || !save_.save_store_) return false;
+        return save_.save_store_->exists(rel);
     };
     interpreter_->hooks().file_mtime =
         [this](const std::string& file)
         -> std::optional<std::array<int64_t, 6>> {
         const std::string rel = qualify_save_file(file);
-        if (rel.empty() || !save_store_) return std::nullopt;
-        return save_store_->modification_time(rel);
+        if (rel.empty() || !save_.save_store_) return std::nullopt;
+        return save_.save_store_->modification_time(rel);
     };
     interpreter_->hooks().sound_info = [this] { return sound_info_snapshot_for_hook(); };
     // e:var system=get_backlog_size/get_backlog_tags/get_message_tags
@@ -447,170 +539,157 @@ void GameRuntime::RuntimeState::open_project(std::string_view platform) {
     // side of this bridge was previously unwired; here the runtime provides
     // the real data.
     interpreter_->hooks().backlog_size = [this]() -> size_t {
-        return text_.backlog_size();
+        return text().backlog_size();
     };
     interpreter_->hooks().backlog_tags = [this](size_t page, bool allfont)
         -> std::optional<std::vector<std::string>> {
-        return text_.backlog_tags(page, allfont);
+        return text().backlog_tags(page, allfont);
     };
     interpreter_->hooks().message_tags = [this](const std::string& id, bool allfont)
         -> std::optional<std::vector<std::string>> {
-        return text_.message_tags(id, allfont);
+        return text().message_tags(id, allfont);
     };
-    // Waits materialize only when the callback pauses the interpreter; every
-    // event (waits included) is queued for the host renderer/audio bridges.
-    // [trans] with type != 0 pauses the script (Stop{reason:"trans"} wait);
-    // type 0 is an
-    // instant switch that flows through without pausing.
-    // Scene events (Layer*/lytween/tweenset) never reach the host stream
-    // — the runtime applies them to its Compositor right here at dispatch.
+    // Every interpreter event is routed by domain in one place; waits only
+    // reach the host stream (and pause) through that dispatcher.
     interpreter_->set_callback([this](const oa::runtime::Event& e) {
-        // [alldelete time=] (FPM go_title/go_exit/suspend rows): engine-
-        // native whole-scene fade-out + clear. Starts the fade here and parks
-        // the script until it completes (Stop{id:"alldelete"}); time==0
-        // clears instantly and keeps the script running. Without this tag the
-        // engine-owned message/text overlay nodes outlived the Lua-side scene
-        // clear and painted story text over the black transition page.
-        if (e.tag == "alldelete") {
-            uint64_t t = 0;
-            if (const auto it = e.params.find("time"); it != e.params.end()) {
-                try {
-                    t = (uint64_t)std::stoull(it->second);
-                } catch (...) {
-                    t = 0;
-                }
-            }
-            begin_all_delete(t);
-            if (t > 0) return oa::runtime::CallbackResult::Pause;
-            return oa::runtime::CallbackResult::Continue;
-        }
-        // e:createEmoteLayer static layer (lyc2 already
-        // materialized the carrier chain). Decode + render + bind happen
-        // here; the script never pauses for it.
-        if (e.tag == "emotestatic") {
-            apply_emote_static(e);
-            return oa::runtime::CallbackResult::Continue;
-        }
-        // Media tags (audio/video) are consumed first at dispatch time
-        // (dispatch order: apply_media_event before text/compositor).
-        // A fullscreen [video] (no id) still
-        // pauses the script — the wait machine maps that pause to a
-        // Stop{reason:"video"} wait.
-        if (apply_media_event(e)) {
-            if (e.tag == "video" && e.id.empty()) {
-                return oa::runtime::CallbackResult::Pause;
-            }
-            return oa::runtime::CallbackResult::Continue;
-        }
-        // Message-layer text domain consumes the text tags at dispatch
-        // time (apply_text_event); they never pause.
-        if (apply_text_event(e)) {
-            return oa::runtime::CallbackResult::Continue;
-        }
-        if (apply_scene_event(e)) {
-            // consumed by the scene; still never pauses the script (no scene
-            // event is a wait), but keep the Wait_/Trans handling below shared
-            // by falling through is not needed — scene events never pause.
-            return oa::runtime::CallbackResult::Continue;
-        }
-        pending_events_.push_back(e);
-        if (e.kind == oa::runtime::Event::Kind::Wait_) {
-            return oa::runtime::CallbackResult::Pause;
-        }
-        // [reset] hands the engine back to its boot script: the current
-        // script must STOP here. Continuing ran the rows after [reset] against
-        // the cleared variable store (Watamari's go-title macro: reset is
-        // followed by [return]; the caller then called
-        // "$scenario_path + 'special.txt'" with scenario_path cleared ->
-        // "0special.txt" and the app aborted).
-        if (e.kind == oa::runtime::Event::Kind::Reset) {
-            return oa::runtime::CallbackResult::Pause;
-        }
-        if (e.kind == oa::runtime::Event::Kind::Trans) {
-            int type = 1; // default (see the tags table)
-            if (const auto it = e.params.find("type"); it != e.params.end()) {
-                try {
-                    type = std::stoi(it->second);
-                } catch (...) {
-                    type = 1;
-                }
-            }
-            if (type != 0) return oa::runtime::CallbackResult::Pause;
-        }
-        return oa::runtime::CallbackResult::Continue;
+        return dispatch_interpreter_event(e);
     });
+}
+
+// --------------------------------------------------------------------------- Interpreter event dispatch — the fixed domain order is: engin...
+oa::runtime::CallbackResult GameRuntime::RuntimeState::dispatch_interpreter_event(
+    const oa::runtime::Event& e)
+{
+    oa::runtime::CallbackResult result = oa::runtime::CallbackResult::Continue;
+    if (dispatch_engine_event(e, &result)) return result;
+    if (dispatch_media_event(e, &result)) return result;
+    if (apply_text_event(e)) return oa::runtime::CallbackResult::Continue;
+    if (apply_scene_event(e)) return oa::runtime::CallbackResult::Continue;
+    if (apply_control_event(e)) return oa::runtime::CallbackResult::Continue;
+
+    pending_events_.push_back(e);
+    return host_event_result(e);
+}
+
+bool GameRuntime::RuntimeState::dispatch_engine_event(
+    const oa::runtime::Event& e, oa::runtime::CallbackResult* out)
+{
+    if (e.tag != "alldelete") return false;
+    // Whole-scene fade-out + clear; time==0 clears instantly and continues.
+    uint64_t t = 0;
+    if (const auto it = e.params.find("time"); it != e.params.end()) {
+        try {
+            t = (uint64_t)std::stoull(it->second);
+        } catch (...) {
+            t = 0;
+        }
+    }
+    begin_all_delete(t);
+    *out = t > 0 ? oa::runtime::CallbackResult::Pause
+                 : oa::runtime::CallbackResult::Continue;
+    return true;
+}
+
+bool GameRuntime::RuntimeState::dispatch_media_event(
+    const oa::runtime::Event& e, oa::runtime::CallbackResult* out)
+{
+    // e:createEmoteLayer static layer (lyc2 already materialized the carrier
+    // chain); decode + render + bind, never pauses.
+    if (e.tag == "emotestatic") {
+        apply_emote_static(e);
+        *out = oa::runtime::CallbackResult::Continue;
+        return true;
+    }
+    if (!apply_media_event(e)) return false;
+    // A fullscreen [video] (no id) parks the script (Stop{reason:"video"}).
+    *out = (e.tag == "video" && e.id.empty())
+               ? oa::runtime::CallbackResult::Pause
+               : oa::runtime::CallbackResult::Continue;
+    return true;
+}
+
+oa::runtime::CallbackResult GameRuntime::RuntimeState::host_event_result(
+    const oa::runtime::Event& e) const
+{
+    using K = oa::runtime::Event::Kind;
+    if (e.kind == K::Wait_) return oa::runtime::CallbackResult::Pause;
+    // [reset] hands the engine back to its boot script: continuing would run
+    // the rows after [reset] against the cleared variable store.
+    if (e.kind == K::Reset) return oa::runtime::CallbackResult::Pause;
+    if (e.kind == K::Trans) {
+        int type = 1;
+        if (const auto it = e.params.find("type"); it != e.params.end()) {
+            try {
+                type = std::stoi(it->second);
+            } catch (...) {
+                type = 1;
+            }
+        }
+        if (type != 0) return oa::runtime::CallbackResult::Pause;
+    }
+    return oa::runtime::CallbackResult::Continue;
 }
 
 void GameRuntime::RuntimeState::boot_project()
 {
-    // Read previous system saves (saveg.dat/system.dat) into the g./s.
-    // domains before boot — the Lua framework's dataloading reads them via
-    // e:var.
+    // Load system saves before boot (Lua dataloading reads g./s.).
     sysload();
     wire_lua_host();
     interpreter_->boot(rt_->project_.config.boot_script);
 }
 
 void GameRuntime::RuntimeState::reset_domains() {
-    // Domain clears for engine reset / go-title:
-    // media/audio/video, text and
-    // scene, transition, hover/drag/pointer state, the inline-event marker,
-    // the [lytween sync] latch and the parked wait. Engine control flags are
-    // returned to their pre-boot defaults — the boot script re-applies its
-    // keyconfig/hide/rclick/skip/automode tags anyway (FPM init.lua).
-    audio_.stop_all_sounds();
-    if (media_players_) media_players_->stop_all();
-    video_.stop_all_videos();
-    // 与读档清场对齐（同一份 [C] 清单两处实现）——全屏视频结束闩
-    // 若跨重置存活，会让新场景的任意 Stop 停驻被一次陈旧 EOF 释放。
-    video_finished_ = false;
-    text_.clear_scene();
-    scene_.clear_scene();
+    // Clear media/text/scene/transition/pointer/wait; boot re-applies config.
+    media_.audio_.stop_all_sounds();
+    if (media_.media_players_) media_.media_players_->stop_all();
+    media_.video_.stop_all_videos();
+    // Aligned with reset_ephemeral_on_load: stale video EOF must not leak.
+    media_.video_finished_ = false;
+    text().clear_scene();
+    scene().clear_scene();
     drop_pending_tween_cancels(); // deferred timer rounds die with nodes
-    emote_layers_.clear(); // static emote frames die with the scene
-    emote_view_cache_.clear(); // ... and so does a recorded view
-    transition_.clear();
-    hovered_.clear();
-    drag_layer_.clear();
+    media_.emote_layers_.clear(); // static emote frames die with the scene
+    media_.emote_view_cache_.clear(); // ... and so does a recorded view
+    transition().clear();
+    pointer_.hovered_.clear();
+    pointer_.drag_layer_.clear();
     pending_sync_tween_layer_.reset();
     inline_event_frame_.reset();
-    screenshot_.valid = false;
-    capture_pending_ = false;
-    alldelete_active_ = false;
-    alldelete_start_ms_ = 0;
-    alldelete_duration_ms_ = 0;
+    save_.screenshot_.valid = false;
+    save_.capture_pending_ = false;
+    renderer_.stop_all_delete();
     wait_.reset();
     wait_remaining_ms_ = 0;
     exit_requested_ = false;
-    skip_active_ = false;
-    exskip_active_ = false; // e:debugSkip state dies with the domains
-    skip_allowed_ = true;
-    skip_enabled_ = false;
-    automode_allowed_ = true;
-    automode_ = false;
-    auto_elapsed_ms_ = 0;
-    control_skip_pressed_ = false;
-    control_skip_blocked_ = false;
-    last_control_skip_effective_ = false;
-    rclick_allowed_ = false;
-    rclick_file_.clear();
-    hide_allowed_ = false;
-    hide_active_ = false;
-    hide_window_.clear();
-    hide_snapshot_.clear();
-    keymap_.clear();
-    script_status_ = 0;
-    active_wait_icon_.clear();
-    overrides_.clear();
-    prev_overrides_.clear();
-    keys_down_.clear();
-    down_edges_.clear();
-    up_edges_.clear();
-    decide_edge_ = false;
-    mouse_prev_x_ = 0;
-    mouse_prev_y_ = 0;
-    mouse_inited_ = false;
-    left_down_prev_ = false;
+    control_.skip_active_ = false;
+    control_.exskip_active_ = false; // e:debugSkip state dies with the domains
+    control_.skip_allowed_ = true;
+    control_.skip_enabled_ = false;
+    control_.automode_allowed_ = true;
+    control_.automode_ = false;
+    control_.auto_elapsed_ms_ = 0;
+    control_.control_skip_pressed_ = false;
+    control_.control_skip_blocked_ = false;
+    control_.last_control_skip_effective_ = false;
+    control_.rclick_allowed_ = false;
+    control_.rclick_file_.clear();
+    control_.hide_allowed_ = false;
+    control_.hide_active_ = false;
+    control_.hide_window_.clear();
+    control_.hide_snapshot_.clear();
+    control_.keymap_.clear();
+    control_.script_status_ = 0;
+    control_.active_wait_icon_.clear();
+    input_state_.overrides_.clear();
+    input_state_.prev_overrides_.clear();
+    input_state_.keys_down_.clear();
+    input_state_.down_edges_.clear();
+    input_state_.up_edges_.clear();
+    input_state_.decide_edge_ = false;
+    pointer_.mouse_prev_x_ = 0;
+    pointer_.mouse_prev_y_ = 0;
+    pointer_.mouse_inited_ = false;
+    pointer_.left_down_prev_ = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -623,39 +702,29 @@ void GameRuntime::RuntimeState::begin_all_delete(uint64_t time_ms) {
     // opacity ramp, then clears the scene and the text engine — the black
     // transition page. time==0 clears instantly. The script pauses
     // (Stop{id:"alldelete"}) while the fade runs (see resolve_wait).
-    alldelete_start_ms_ = now_ms_;
-    alldelete_duration_ms_ = time_ms;
-    alldelete_active_ = true;
+    renderer_.begin_all_delete(time_ms, now_ms_);
     if (time_ms == 0) finish_all_delete();
 }
 
 double GameRuntime::RuntimeState::all_delete_fade() const {
-    if (!alldelete_active_ || alldelete_duration_ms_ == 0) return 1.0;
-    const uint64_t elapsed =
-        now_ms_ >= alldelete_start_ms_ ? now_ms_ - alldelete_start_ms_ : 0;
-    const double p = elapsed >= alldelete_duration_ms_
-                         ? 1.0
-                         : double(elapsed) / double(alldelete_duration_ms_);
-    return 1.0 - p; // 1 -> 0
+    return renderer_.all_delete_fade(now_ms_);
 }
 
 void GameRuntime::RuntimeState::finish_all_delete() {
-    alldelete_active_ = false;
-    alldelete_start_ms_ = 0;
-    alldelete_duration_ms_ = 0;
+    renderer_.stop_all_delete();
     // Everything the [alldelete] flow wipes: scene layers (image + text
     // overlay nodes + handler registries + message bindings), the text
     // engine content, and the pointer state pointing into them.
-    scene_.clear_scene();
-    text_.clear_scene();
+    scene().clear_scene();
+    text().clear_scene();
     drop_pending_tween_cancels(); // deferred timer rounds die with nodes
-    hovered_.clear();
-    drag_layer_.clear();
+    pointer_.hovered_.clear();
+    pointer_.drag_layer_.clear();
     pending_sync_tween_layer_.reset();
-    screenshot_.valid = false;
-    capture_pending_ = false;
-    emote_layers_.clear(); // static emote frames die with the scene
-    emote_view_cache_.clear(); // ... and so does a recorded view
+    save_.screenshot_.valid = false;
+    save_.capture_pending_ = false;
+    media_.emote_layers_.clear(); // static emote frames die with the scene
+    media_.emote_view_cache_.clear(); // ... and so does a recorded view
 }
 
 void GameRuntime::RuntimeState::restart_project() {
@@ -674,53 +743,48 @@ void GameRuntime::RuntimeState::wire_lua_host() {
     auto& host = interpreter_->lua_bridge().host();
     auto* interp = interpreter_.get();
     host.now_ms = [this] { return now_ms_; };
-    host.get_script_status = [this] { return script_status_; };
-    host.set_script_status = [this](int s) { script_status_ = s; };
-    // e:debugSkip (FPM 次の選択肢に進む) starts the engine-side
-    // exskip fast-forward. index=99999 from FPM; no registered meaning yet
-    // (logged under OA_EXSKIPDBG).
+    host.get_script_status = [this] { return control_.script_status_; };
+    host.set_script_status = [this](int s) { control_.script_status_ = s; };
     host.debug_skip_start = [this](int64_t index) {
+        (void)index;
         start_debug_skip();
-        if (std::getenv("OA_EXSKIPDBG"))
-            std::fprintf(stderr, "[exskipdbg] e:debugSkip index=%lld\n",
-                         (long long)index);
     };
     host.is_down = [this](int key) {
-        if (const auto it = overrides_.find(key); it != overrides_.end()) {
+        if (const auto it = input_state_.overrides_.find(key); it != input_state_.overrides_.end()) {
             if (it->second & 4) return true;
         }
-        return keys_down_.count(key) > 0;
+        return input_state_.keys_down_.count(key) > 0;
     };
     host.is_down_edge = [this](int key) {
-        if (const auto it = overrides_.find(key); it != overrides_.end()) {
-            const int prev = prev_overrides_.count(key) ? prev_overrides_.at(key) : 0;
+        if (const auto it = input_state_.overrides_.find(key); it != input_state_.overrides_.end()) {
+            const int prev = input_state_.prev_overrides_.count(key) ? input_state_.prev_overrides_.at(key) : 0;
             if ((it->second & 8) && !(prev & 8)) return true;
         }
         // physical edges are delivered through down-edge set computed in tick
-        return down_edges_.count(key) > 0;
+        return input_state_.down_edges_.count(key) > 0;
     };
     host.is_up_edge = [this](int key) {
-        if (const auto it = overrides_.find(key); it != overrides_.end()) {
-            const int prev = prev_overrides_.count(key) ? prev_overrides_.at(key) : 0;
+        if (const auto it = input_state_.overrides_.find(key); it != input_state_.overrides_.end()) {
+            const int prev = input_state_.prev_overrides_.count(key) ? input_state_.prev_overrides_.at(key) : 0;
             if ((it->second & 16) && !(prev & 16)) return true;
         }
-        return up_edges_.count(key) > 0;
+        return input_state_.up_edges_.count(key) > 0;
     };
     host.is_push = [this](int key) {
-        if (const auto it = overrides_.find(key); it != overrides_.end()) {
+        if (const auto it = input_state_.overrides_.find(key); it != input_state_.overrides_.end()) {
             if (it->second & 2) return true;
         }
-        return keys_down_.count(key) > 0;
+        return input_state_.keys_down_.count(key) > 0;
     };
     host.is_decide = [this](int key) {
-        if (const auto it = overrides_.find(key); it != overrides_.end()) {
-            const int prev = prev_overrides_.count(key) ? prev_overrides_.at(key) : 0;
+        if (const auto it = input_state_.overrides_.find(key); it != input_state_.overrides_.end()) {
+            const int prev = input_state_.prev_overrides_.count(key) ? input_state_.prev_overrides_.at(key) : 0;
             if ((it->second & 32) && !(prev & 32)) return true;
         }
         return false;
     };
     host.get_mouse_point = [this] {
-        return std::pair(mouse_x_, mouse_y_);
+        return std::pair(input_state_.mouse_x_, input_state_.mouse_y_);
     };
     host.override_key = [this](int key, int status) {
         apply_override(key, status);
@@ -734,9 +798,9 @@ void GameRuntime::RuntimeState::apply_override(int key, int status) {
         return;
     }
     if (status == 0) {
-        overrides_.erase(key);
+        input_state_.overrides_.erase(key);
     } else {
-        overrides_[key] = status;
+        input_state_.overrides_[key] = status;
     }
 }
 
@@ -747,78 +811,61 @@ void GameRuntime::RuntimeState::tick(uint64_t delta_ms, const FrameInput& in) {
     // A captured transition may have reached its duration: auto-clear before
     // any wait resolution consults it (transition::clear_finished every
     // frame).
-    transition_.clear_finished(now_ms_);
+    transition().clear_finished(now_ms_);
     // Drop the inline-event marker once its frame left the stack.
     refresh_inline_event_frame();
-    // [alldelete]: the fade clock expires -> clear the scene + text.
-    if (alldelete_active_ && now_ms_ >= alldelete_start_ms_ + alldelete_duration_ms_)
-        finish_all_delete();
-    // [mouse] warp emulation ([mouse] config tag; apply_mouse_config). A warp
-    // request normally reaches the engine as fresh OS-motion feedback from the
-    // host's SDL warp. Hosts that cannot warp the OS cursor (hidden window /
-    // headless) never produce feedback: while no fresh raw pointer input
-    // arrives, advance the engine pointer to the requested target through the
-    // normal pointer chain instead, so hover/rollover state and
-    // e:getMousePoint follow the request (FPM dialog mouse_autocursor, the
-    // exit-confirm YES-button auto-cursor). The first raw input change hands
-    // the pointer back to the host and clears the pending warp.
+    // [alldelete]: the render fade clock expired -> clear the scene + text.
+    if (renderer_.all_delete_expired(now_ms_)) finish_all_delete();
+    // Cursor-warp emulation when the host cannot warp (hidden/headless).
     FrameInput eff = in;
     const bool raw_static =
-        eff.mouse_x == raw_mouse_x_ && eff.mouse_y == raw_mouse_y_;
-    raw_mouse_x_ = eff.mouse_x;
-    raw_mouse_y_ = eff.mouse_y;
-    if (pointer_warp_pending_) {
+        eff.mouse_x == pointer_.raw_mouse_x_ && eff.mouse_y == pointer_.raw_mouse_y_;
+    pointer_.raw_mouse_x_ = eff.mouse_x;
+    pointer_.raw_mouse_y_ = eff.mouse_y;
+    if (pointer_.pointer_warp_pending_) {
         if (raw_static && !eff.left_click_edge && !eff.right_click_edge &&
-            drag_layer_.empty()) {
-            eff.mouse_x = pointer_warp_x_;
-            eff.mouse_y = pointer_warp_y_;
+            pointer_.drag_layer_.empty()) {
+            eff.mouse_x = pointer_.pointer_warp_x_;
+            eff.mouse_y = pointer_.pointer_warp_y_;
         } else {
-            pointer_warp_pending_ = false;
+            pointer_.pointer_warp_pending_ = false;
         }
     }
-    mouse_x_ = eff.mouse_x;
-    mouse_y_ = eff.mouse_y;
+    input_state_.mouse_x_ = eff.mouse_x;
+    input_state_.mouse_y_ = eff.mouse_y;
 
     // update physical state
-    down_edges_.clear();
-    up_edges_.clear();
-    keys_down_ = in.keys_down;
-    for (const int k : in.key_down_edges) down_edges_.insert(k);
-    for (const int k : in.key_up_edges) up_edges_.insert(k);
-    if (in.left_click_edge) down_edges_.insert(kKeyMouseLeft);
-    if (!in.left_down) up_edges_.insert(kKeyMouseLeft);
-    if (std::getenv("OA_NM_SELDBG") && in.left_click_edge)
-        std::fprintf(stderr, "[seldbg] t=%llu left-edge\n",
-                     (unsigned long long)now_ms_);
-
+    input_state_.down_edges_.clear();
+    input_state_.up_edges_.clear();
+    input_state_.keys_down_ = in.keys_down;
+    for (const int k : in.key_down_edges) input_state_.down_edges_.insert(k);
+    for (const int k : in.key_up_edges) input_state_.up_edges_.insert(k);
+    if (in.left_click_edge) input_state_.down_edges_.insert(kKeyMouseLeft);
+    if (!in.left_down) input_state_.up_edges_.insert(kKeyMouseLeft);
     // decide edge: override bit 32 freshly set this frame (scripted decide).
     // The snapshot is taken BEFORE the vsync hook so overrides injected by
     // Lua's onEnterFrame (the FPM dummy-click pattern: setexclick ->
     // e:overrideKey status=32) produce their decide edge in the SAME advance
     // (Lua runs inside the host frame before wait resolution).
-    prev_overrides_ = overrides_;
+    input_state_.prev_overrides_ = input_state_.overrides_;
 
     // Lua per-frame hook first (it rewrites keys/decide edges, clears flags)
-    if (std::getenv("OA_NO_VSYNC"));
-    else interpreter_->fire_event("onEnterFrame");
+    interpreter_->fire_event("onEnterFrame");
     // decide 边沿 = 相对上一帧快照新出现的位 32（帧内/测试直接注入均
     // 生效）。配合每帧末清空覆盖（见 tick 尾部注释），FPM exclick 的
     // status=0+32 同帧注入在下一帧构成新边沿；滞留位不会再吞掉后续 decide。
-    decide_edge_ = false;
-    for (const auto& [key, bits] : overrides_) {
-        const int prev = prev_overrides_.count(key) ? prev_overrides_.at(key) : 0;
-        if ((bits & 32) && !(prev & 32)) decide_edge_ = true;
+    input_state_.decide_edge_ = false;
+    for (const auto& [key, bits] : input_state_.overrides_) {
+        const int prev = input_state_.prev_overrides_.count(key) ? input_state_.prev_overrides_.at(key) : 0;
+        if ((bits & 32) && !(prev & 32)) input_state_.decide_edge_ = true;
     }
 
     // Control-skip hold (role-14 keys) + effective-skip recompute —
-    // the wait machine consults skip_active_.
-    update_control_skip_hold(keys_down_);
-    skip_active_ = skip_active();
+    // the wait machine consults control_.skip_active_.
+    update_control_skip_hold(input_state_.keys_down_);
+    control_.skip_active_ = skip_active();
 
-    // Pointer/layer dispatch chain (rollover/rollout hover set, click,
-    // drag, global push). Runs before wait resolution; a left-down edge
-    // claimed by a layer/drag/global handler swallows the default click so
-    // waits/trans skip do not fire.
+    // Pointer chain runs before wait resolution; claimed clicks are swallowed.
     const PointerConsumption pc = process_pointer_input(eff);
 
     // clicked = physical left-down not consumed by layer/drag/push (and not
@@ -833,89 +880,28 @@ void GameRuntime::RuntimeState::tick(uint64_t delta_ms, const FrameInput& in) {
         clicked = !pc.input_swallowed && !pc.layer_handled && !pc.drag_handled &&
                   !push_absorbs;
     } else {
-        clicked = down_edges_.count(kKeyEnter) > 0 || down_edges_.count(kKeySpace) > 0;
+        clicked = input_state_.down_edges_.count(kKeyEnter) > 0 || input_state_.down_edges_.count(kKeySpace) > 0;
     }
     clicked = clicked || pc.role_advance;
     // NB: only fresh PRESSES count — the host injects a mouse-left up-edge on
     // every frame the button is not held, which would disable the guard always.
-    input_this_tick_ = clicked || decide_edge_ || !down_edges_.empty();
+    input_this_tick_ = clicked || input_state_.decide_edge_ || !input_state_.down_edges_.empty();
 
     // script status 4 = forced stop (no user input): park the story line but
     // keep onEnterFrame ticking (already fired) and scene tweens advancing.
-    if (script_status_ != 4) {
-        // While the e:debugSkip fast-forward is active the Lua
-        // flg.exskip half already suppresses the visuals, so the crossing
-        // parks must burn INSIDE one tick (bounded), not one per frame: at
-        // 60 fps a multi-chapter jump (thousands of [@]/estag parks) would
-        // otherwise hold the black uimask (uimask_on) for a minute-plus —
-        // the real-machine "screen goes black after 次の選択肢 confirm"
-        // report. The burst ends the moment the fast-forward state clears
-        // (the [stop 0="exskip"] boundary fires onDebugSkipOut inside
-        // resolve_wait) or a park survives resolution (Stop-class waits are
-        // never auto-released).
+    if (control_.script_status_ != 4) {
+        // Exskip: burn crossing parks in one bounded burst.
         const int kMaxExskipBurst = 4096;
         int burst = 0;
         for (;;) {
-            const bool was_ff = exskip_active_;
+            const bool was_ff = control_.exskip_active_;
             bool attempted_resolve = false;
             if (wait_) {
-                // Queued tags run while parked under every wait kind — the
-                // interpreter drains its queue in each wait state every frame,
-                // [stop]/[trans] parks included. FPM title
-                // interactions (btn_over lyprop/flip, the click estag/jump
-                // chain) queue tags exactly while the title [stop] park holds:
-                // without this
-                // drain a hover never highlights and a click never leaves the
-                // title.
-                //
-                // A CLICK wait armed BY A QUEUED TAG holds the
-                // rest of that queue instead of draining it. Lua's
-                // e:enqueueTag batch is an ordered continuation — the
-                // family's exkeyin (system/adv/keyconfig.lua:595, reached
-                // through tags.exkey) enqueues
-                //   [chgmsg dummy][@][/chgmsg][calllua exkeyin_exit label=..]
-                // where the trailing calllua belongs to the state AFTER the
-                // [@] click wait: it is what restores/clears flg.keycode and
-                // jumps to the label when the pressed key is a CANCEL key.
-                // Draining it one frame after the park ran exkeyin_exit
-                // immediately (flg.keycode=nil) and, with the family's
-                // setonpush_calllua keying its dummy click off flg.keycode
-                // (csv.advkey.list[flg.keycode][1]), every later click inside
-                // the extra CG viewer became a no-op — the "click does not
-                // switch the 差分" report.
-                //
-                // Scope is deliberately narrow: only click waits
-                // ([@]/[wt]/[wt0] = Generic*) that were armed from the queue
-                // hold it. Script-armed parks keep draining (FPM title
-                // hover/click under the [stop] park), and
-                // so do the queue-armed PACING parks the family relies on to
-                // run behind them: [wait time=N]/[wait input=1 time=N]
-                // (mouse_autocursor chains) and [stop]/[trans] bursts
-                // (holding those stalled the FPM title
-                // return).
+                // Queue-armed click parks hold the rest of the queue.
                 const bool queue_click_park =
                     interpreter_->last_wait_from_queue() &&
                     (wait_->kind == oa::runtime::WaitReason::Kind::Generic ||
                      wait_->kind == oa::runtime::WaitReason::Kind::Generic0);
-                if (std::getenv("OA_DRAINSKIP") && queue_click_park &&
-                    interpreter_->has_queued_tags()) {
-                    std::string q;
-                    for (const auto& ins : interpreter_->peek_tag_queue(4)) {
-                        q += " [" + ins.tag;
-                        for (const auto& [k, v] : ins.params)
-                            q += " " + k + "=" + v;
-                        q += "]";
-                    }
-                    std::fprintf(stderr,
-                                 "[drainskip] hold kind=%d queued=%zu at "
-                                 "%s:%zu%s\n",
-                                 (int)wait_->kind,
-                                 interpreter_->queued_tag_count(),
-                                 interpreter_->current_script()
-                                     ? interpreter_->current_script()->c_str()
-                                     : "?",
-                                 interpreter_->current_line(), q.c_str());
-                }
                 if (interpreter_->has_queued_tags() && !queue_click_park) {
                     drain_parked_queue();
                 }
@@ -934,41 +920,21 @@ void GameRuntime::RuntimeState::tick(uint64_t delta_ms, const FrameInput& in) {
                 run_until_wait();
             }
             // The exskip burst keeps consuming parks while the
-            // fast-forward is still active. A pass that resolved a wait (or
-            // ran the interpreter and parked at a fresh wait) continues; a
-            // park that SURVIVED a resolve attempt is sticky (Stop-class
-            // waits are never auto-released) and hands control back to the
-            // normal per-frame pacing.
-            if (!was_ff || !exskip_active_) break;
+            if (!was_ff || !control_.exskip_active_) break;
             if (++burst >= kMaxExskipBurst) break;
             if (attempted_resolve && wait_) break;
         }
     }
 
-    // 每帧末尾清空按键覆盖（InputSnapshot::clear_edges 的
-    // key_overrides.clear，每帧由运行时调用）。FPM 的
-    // exclick 走 e:overrideKey{status=0}+{key=124,status=32} 同帧注入；若覆盖
-    // 跨帧滞留，decide 位 32 永远置位，边沿检测（与上一帧快照比较）会把之后
-    // 所有点击的 decide 边沿吞掉——剧情第二下点击起全部失效（真机“点击不推
-    // 进”）。每帧清空后下一次注入重新构成边沿。
-    overrides_.clear();
-    // Save-domain events ([save]/[load]/[syssave]/[autosave]/[takess]/
-    // [savess]/[file]) are applied here, after the interpreter step/wait
-    // block and before the scene/text/media frame advance — the
-    // dispatch slot (advance_logic: interpreter → drain/dispatch →
-    // compositor/text/media).
-    dispatch_save_events();
-    // Engine control events ([reset]/[gotitle]/[exit]) — after the
-    // save domain so a flow's own [syssave] lands before [reset] reboots.
-    dispatch_control_events();
+    // Overrides are frame-local: a sticky decide bit 32 would swallow every
+    // later click edge.
+    input_state_.overrides_.clear();
+    // Host-stream drain (save then control) runs before the content advance.
+    dispatch_pending_events();
     maybe_autosave_for_wait();
 
-    // 逐字显示每帧推进（runtime → renderer.reveal_next）
-    // "内容在场面"的每帧推进收敛为唯一逐面
-    // 序列 advance_content_planes —— 相位保真(红线 R6):reveal →
-    // scene 轨(tween 值写/settle/anime 帧)→ emote(运行时自动时钟)→
-    // click-wait 图标 → 媒体帧末(video 状态/EOF→解绑/overlay file)。序列
-    // 严格保持 tick 原调用顺序与位置(原五行原位收口),任何重排即行为漂移。
+    // Content-plane order is phase-critical (R6): text reveal → scene tweens
+    // → emote clock → click-wait icon → media frame end. Do not reorder.
     advance_content_planes(delta_ms);
 }
 
@@ -985,23 +951,9 @@ void GameRuntime::RuntimeState::run_until_wait() {
     const oa::runtime::ExecutionResult r = interpreter_->run();
     if (r == oa::runtime::ExecutionResult::Wait) {
         const oa::runtime::Event* ev = interpreter_->last_wait_event();
-        // The script parked itself on a real wait: a [lytween sync=1] seen
-        // earlier in this run does not arm (the sync wait is only set
-        // when no wait reason was parked at dispatch time).
+        // A real wait wins over a [lytween sync=1] seen earlier in this run.
         pending_sync_tween_layer_.reset();
         if (ev && ev->kind == oa::runtime::Event::Kind::Wait_) {
-            if (std::getenv("OA_STORYDBG") && g_storydbg_arm < 40) {
-                ++g_storydbg_arm;
-                std::fprintf(stderr,
-                             "[story] arm tag='%s' kind=%d ms=%llu input=%d at %s:%zu\n",
-                             ev->tag.c_str(), (int)ev->reason.kind,
-                             (unsigned long long)ev->reason.milliseconds,
-                             ev->reason.input,
-                             interpreter_->current_script()
-                                 ? interpreter_->current_script()->c_str()
-                                 : "?",
-                             interpreter_->current_line());
-            }
             wait_ = ev->reason;
             wait_armed_this_tick_ = true;
             wait_remaining_ms_ = 0;
@@ -1029,9 +981,7 @@ void GameRuntime::RuntimeState::run_until_wait() {
             arm_stop_wait("alldelete");
         }
     } else if (r == oa::runtime::ExecutionResult::BudgetExhausted) {
-        // 轮询型主循环（game 自己的 script VM）：本帧的 tag 预算用完，
-        // 但脚本还在跑。**不**清 pending sync tween、**不**装 wait —— 下一帧
-        // 从当前位置继续；帧循环的输入/媒体推进照常发生。
+        // Polling VM: resume next frame; do not clear the sync latch or arm a wait.
     } else {
         // Completed without parking: if the run saw a [lytween sync=1] whose
         // layer tweens are still running, block frame progression until they
@@ -1045,32 +995,19 @@ void GameRuntime::RuntimeState::run_until_wait() {
 
 void GameRuntime::RuntimeState::drain_parked_queue() {
     if (!interpreter_) return;
-    // A park that is TOLD BY THE CLOCK — a [wait time=N] (Timed) or one of the
-    // engine-timed stops ([trans] / fullscreen [video] / [alldelete]) — must
-    // not be drained over: the framework (FPM's scriptMainloop / estag) has
-    // already pre-enqueued the next scenario rows, and any queued tag that
-    // parks the stream replaces the running park outright — its remaining
-    // time is lost, the [trans] is abandoned after one frame and the whole
-    // splash / story fast-forwards (test2: the 2500 ms brand-logo wait was
-    // killed 16 ms after it armed by the queued [call estag03] -> [trans],
-    // so the caution screen never got its 2.5 s).
-    // The batch stays in the queue and runs once the park releases.
-    // Interactive parks ([@] / [stop] / [exkey]) keep draining: that is how
-    // a title-screen hover/click reaches the queue.
+    // Clock-driven parks (Timed / [trans] / fullscreen [video] / [alldelete])
+    // hold the pre-enqueued batch: a queued park would replace the running
+    // park and lose its remaining time (test2: the 2500 ms logo wait).
+    // Interactive parks ([@]/[stop]/[exkey]) keep draining for title input.
     bool hold_drain = false;
-    if (fpm_family_ && wait_) {
-        // A fullscreen [video] park OWNS the click: the click IS the movie's
-        // skip input (resolve_wait Stop{id:"video"} -> queue_finish ->
-        // stop_overlay). Letting the queue drain on that tick executed the
-        // click's Lua e:tags first, and any queued [wait]/[trans] replaced the
-        // park outright — the script walked on while the overlay kept playing
-        // over the scene (test5: clicking the brand logo neither skipped the
-        // movie nor stopped it). So this park holds regardless of fresh input;
-        // its release path is the skip/EOF finish, not the queue.
+    if (wait_) {
+        // A fullscreen [video] park owns the click (the click is the skip
+        // input), so the queue holds until the skip/EOF finish.
+        // Draining first let queued [wait]/[trans] replace the movie park.
         const bool video_park =
             wait_->kind == oa::runtime::WaitReason::Kind::Stop && wait_->id == "video";
         if (video_park) {
-            const auto v = video_.state();
+            const auto v = media_.video_.state();
             hold_drain = v.overlay_video && v.overlay_video->playing;
         } else if (!input_this_tick_) {
             if (wait_->kind == oa::runtime::WaitReason::Kind::Timed) {
@@ -1085,9 +1022,9 @@ void GameRuntime::RuntimeState::drain_parked_queue() {
                 // keeps the old drain-through behaviour so the script can move
                 // on.
                 if (wait_->id == "trans") {
-                    hold_drain = transition_.is_in_progress(now_ms_);
+                    hold_drain = transition().is_in_progress(now_ms_);
                 } else if (wait_->id == "alldelete") {
-                    hold_drain = alldelete_active_;
+                    hold_drain = renderer_.all_delete_active();
                 }
             }
         }
@@ -1113,24 +1050,9 @@ void GameRuntime::RuntimeState::drain_parked_queue() {
                            line_before != interpreter_->current_line() ||
                            stack_before != interpreter_->call_stack().size();
         if (r == oa::runtime::ExecutionResult::Wait) {
-            if (std::getenv("OA_DRAINSKIP"))
-                std::fprintf(stderr, "[drainskip] paused remain=%zu at %s:%zu\n",
-                             interpreter_->queued_tag_count(),
-                             interpreter_->current_script()
-                                 ? interpreter_->current_script()->c_str()
-                                 : "?",
-                             interpreter_->current_line());
             paused = true;
             const oa::runtime::Event* ev = interpreter_->last_wait_event();
             if (ev && ev->kind == oa::runtime::Event::Kind::Wait_) {
-                if (std::getenv("OA_STORYDBG") && g_storydbg_arm < 40) {
-                    ++g_storydbg_arm;
-                    std::fprintf(stderr,
-                                 "[story] arm(queued) tag='%s' kind=%d ms=%llu input=%d\n",
-                                 ev->tag.c_str(), (int)ev->reason.kind,
-                                 (unsigned long long)ev->reason.milliseconds,
-                                 ev->reason.input);
-                }
                 wait_ = ev->reason;
                 wait_armed_this_tick_ = true;
                 wait_remaining_ms_ = 0;
@@ -1169,78 +1091,48 @@ void GameRuntime::RuntimeState::drain_parked_queue() {
     in_parked_drain_ = false;
 }
 
+void GameRuntime::RuntimeState::dispatch_pending_events() {
+    // Fixed frame-level order: a flow's own [syssave] must land before the
+    // [reset] that reboots it.
+    dispatch_save_events();
+    dispatch_control_events();
+}
+
+void GameRuntime::RuntimeState::reboot_boot_keep_vm(const char* reason) {
+    // [reset]/[gotitle]: clear every domain and re-run the boot head with the
+    // Lua VM kept. No label is hardcoded — the data's own boot chain decides
+    // where to go (FPM keeps `systemreset` in the VM for that decision).
+    std::fprintf(stderr, "[runtime] %s (VM kept; boot re-run)\n", reason);
+    reset_domains();
+    pending_events_.clear();
+    try {
+        interpreter_->boot(rt_->project_.config.boot_script);
+    } catch (const std::exception& ex) {
+        std::fprintf(stderr, "[runtime] %s boot re-run failed (%s); "
+                             "full restart fallback\n", reason, ex.what());
+        restart_project();
+    }
+}
+
 void GameRuntime::RuntimeState::dispatch_control_events() {
     if (pending_events_.empty()) return;
     std::deque<oa::runtime::Event> keep;
     for (const auto& e : pending_events_) {
         if (e.kind == oa::runtime::Event::Kind::Exit) {
-            // [exit] (FPM system/ui.asb *go_exit — the "结束游戏" flow):
-            // raise the host quit request. It is raised both in the
-            // interpreter callback and at dispatch; openartemis consumes it
-            // here so hosts
-            // only poll exit_requested.
+            // Host quit request; hosts only poll exit_requested.
             std::fprintf(stderr, "[runtime] exit requested\n");
             exit_requested_ = true;
-            exskip_active_ = false; // quit paths never leave it set
+            control_.exskip_active_ = false; // quit paths never leave it set
             continue;
         }
+        // [reset] is the FPM go-title flow; raw [gotitle] only fires for data
+        // without the Lua tag handler. Both use the same VM-kept reboot.
         if (e.kind == oa::runtime::Event::Kind::Reset) {
-            // [reset] (FPM system/ui.asb *go_title — the "返回标题" flow runs
-            // [stop 0=exskip][alldelete][delImageStack][saving][syssave]
-            // [reset]). User ruling (2026-09, 方案一, VM 保留): the engine
-            // clears every domain and RE-RUNS THE BOOT SCRIPT HEAD with the
-            // interpreter (Lua VM) KEPT. The
-            // engine hardcodes NO label: the FPM boot chain (first.iet *top
-            // -> init.lua system_starting decision) decides where to go — the
-            // `systemreset` Lua flag (set by the go_title chain) survives in
-            // the kept VM and the decision's logo-skip branch routes to
-            // first.iet *title (and consumes the flag). Landing prototypes
-            // that jumped straight to the *title label (or re-ran boot with
-            // the flag unconsumed) looped: the new-game chain re-entered the
-            // boot context with `systemreset` still set and re-emitted
-            // [reset] endlessly. Because the interpreter is
-            // NOT rebuilt, the host-installed interpreter hooks (render/font
-            // metrics) and boot-time font tables survive — post-title-return
-            // uihelp centering vars keep measuring normally. [lua] blocks do
-            // not re-run (the
-            // script and its executed-block cache are kept) and boot()
-            // re-positions the stream at the script head, re-invoking the
-            // already-defined Lua init functions.
-            std::fprintf(stderr, "[runtime] engine reset (VM kept; boot re-run)\n");
-            reset_domains();
-            pending_events_.clear();
-            try {
-                interpreter_->boot(rt_->project_.config.boot_script);
-            } catch (const std::exception& ex) {
-                std::fprintf(stderr, "[runtime] reset boot re-run failed (%s); "
-                                     "full restart fallback\n",
-                             ex.what());
-                restart_project();
-                return;
-            }
+            reboot_boot_keep_vm("engine reset");
             return;
         }
         if (e.kind == oa::runtime::Event::Kind::GoTitle) {
-            // Raw [gotitle] instruction (builtin fallback). FPM facts: the
-            // game's own [gotitle] tags (script.asb *fileend error path) are
-            // consumed by the Lua tag filter (tags.gotitle, system.lua:225 —
-            // sets systemreset=true and calls ui.asb *go_title -> [reset]),
-            // so this event only fires for data WITHOUT that Lua handler.
-            // Per the reset ruling the engine assumes NO label: clear the
-            // domains and re-run the boot head with the VM kept — the data's
-            // own boot chain decides where to go (same shape as [reset]).
-            std::fprintf(stderr, "[runtime] gotitle (VM kept; boot re-run)\n");
-            reset_domains();
-            pending_events_.clear();
-            try {
-                interpreter_->boot(rt_->project_.config.boot_script);
-            } catch (const std::exception& ex) {
-                std::fprintf(stderr, "[runtime] gotitle boot re-run failed (%s); "
-                                     "full restart fallback\n",
-                             ex.what());
-                restart_project();
-                return;
-            }
+            reboot_boot_keep_vm("gotitle");
             return;
         }
         keep.push_back(e);
@@ -1256,16 +1148,16 @@ void GameRuntime::RuntimeState::dispatch_control_events() {
 
 void GameRuntime::RuntimeState::ensure_active_message_node() {
     if (!interpreter_) return;
-    const std::string active = text_.active_layer_id();
+    const std::string active = text().active_layer_id();
     if (active.empty()) return;
-    const oa::render::MessageLayer* al = text_.layer(active);
+    const oa::render::MessageLayer* al = text().layer(active);
     if (!al) return;
     const bool is_layered = al->layered;
     // 槽位显式化 —— layered=1 走宿主树节点;layered=0 走引擎消息槽
     // (创建序,id 不随消息 id 变)。create/ensure 语义收在 Compositor 内。
-    const std::string scene_id = scene_.ensure_message_scene_node(active, is_layered);
-    scene_.set_message_layer_binding(active, scene_id);
-    scene_.revive_message_layer(active);
+    const std::string scene_id = scene().ensure_message_scene_node(active, is_layered);
+    scene().set_message_layer_binding(active, scene_id);
+    scene().revive_message_layer(active);
 }
 
 bool GameRuntime::RuntimeState::apply_text_event(const oa::runtime::Event& e) {
@@ -1276,17 +1168,8 @@ bool GameRuntime::RuntimeState::apply_text_event(const oa::runtime::Event& e) {
     };
     switch (e.kind) {
         case K::ScenarioLine: {
-            ++text_events_;
-            if (std::getenv("OA_TEXTTRACE")) {
-                const auto* tl = text_.layer(text_.active_layer_id());
-                std::fprintf(stderr,
-                             "[text] f=%llu push active='%s' n=%zu page_chars=%zu "
-                             "content='%.40s'\n",
-                             (unsigned long long)tick_count_,
-                             text_.active_layer_id().c_str(), e.content.size(),
-                             tl ? tl->char_count : 0, e.content.c_str());
-            }
-            text_.push_text(e.content);
+            renderer_.note(RNote::Text);
+            text().push_text(e.content);
             // every drawable message layer owns a scene node — content
             // pushed before any chgmsg (default/active layer) materializes it
             // lazily, so glyphs have exactly one paint point (their node's
@@ -1298,18 +1181,18 @@ bool GameRuntime::RuntimeState::apply_text_event(const oa::runtime::Event& e) {
             // [rt]：omitblankline=1（缺省 true）时末行为空行则不另起
             const std::string ob = par("omitblankline");
             const bool omit = ob.empty() || parse_i32(ob, 1) != 0;
-            text_.line_break(omit);
+            text().line_break(omit);
             return true;
         }
         case K::PageBreak: {
             std::optional<int> bl;
             const std::string bp = par("backlog");
             if (!bp.empty()) bl = parse_i32(bp, 0);
-            text_.page_break(bl);
+            text().page_break(bl);
             return true;
         }
         case K::MessageLayerSwitch: {
-            ++message_switch_events_;
+            renderer_.note(RNote::MessageSwitch);
             // 参数 id/stack/layered（id 缺省 → 引擎生成匿名 id）
             const std::string id = par("id");
             std::optional<std::string> mid;
@@ -1319,48 +1202,36 @@ bool GameRuntime::RuntimeState::apply_text_event(const oa::runtime::Event& e) {
             std::optional<int> layered;
             const std::string ly = par("layered");
             if (!ly.empty()) layered = parse_i32(ly, -1);
-            text_.switch_layer(mid, stack, layered);
-            if (std::getenv("OA_TEXTTRACE"))
-                std::fprintf(stderr, "[text] chgmsg id='%s' stack=%d -> active='%s'\n",
-                             id.c_str(), stack ? 1 : 0, text_.active_layer_id().c_str());
+            text().switch_layer(mid, stack, layered);
             // 绑定：活动消息层 id → 场景目标 + 默认消息层
-            const std::string active = text_.active_layer_id();
-            const oa::render::MessageLayer* al = text_.layer(active);
+            const std::string active = text().active_layer_id();
+            const oa::render::MessageLayer* al = text().layer(active);
             const bool is_layered = al && al->layered;
             // 槽位显式化 —— layered=0 独立消息分配引擎消息槽(创建序),
             // layered=1 走宿主树节点(ensure_path 物化,父链位姿语义不变:
             // glyph 落点=ml.left/top+排版偏移,经节点世界变换合成)。
-            const std::string scene_id = scene_.ensure_message_scene_node(active, is_layered);
-            scene_.set_message_layer_binding(active, scene_id);
-            scene_.revive_message_layer(active);
-            scene_.set_default_message_layer(active);
-            // Published engine state: the iMel frameworks read
-            // `$s.current_message_layer` to decide whether a message layer is
-            // still open on the way out of a block macro (chara_v.iet's
-            // */chgmsg_name closes the name window with [/chgmsg] only when the
-            // active layer is still 'name'). Leaving it unset made every such
-            // guard read 0, so the name window stayed open and the story body
-            // printed into it from the next scene on.
+            const std::string scene_id = scene().ensure_message_scene_node(active, is_layered);
+            scene().set_message_layer_binding(active, scene_id);
+            scene().revive_message_layer(active);
+            scene().set_default_message_layer(active);
+            // Publish s.current_message_layer for framework guards.
             if (interpreter_)
                 interpreter_->set_variable("s.current_message_layer",
                                            oa::runtime::Value::make_string(active));
             return true;
         }
         case K::MessageLayerPop: {
-            text_.pop_layer();
-            if (std::getenv("OA_TEXTTRACE"))
-                std::fprintf(stderr, "[text] /chgmsg -> active='%s'\n",
-                             text_.active_layer_id().c_str());
-            const std::string active = text_.active_layer_id();
-            const oa::render::MessageLayer* al = text_.layer(active);
+            text().pop_layer();
+            const std::string active = text().active_layer_id();
+            const oa::render::MessageLayer* al = text().layer(active);
             if (al) {
                 const bool is_layered = al->layered;
                 const std::string scene_id =
-                    scene_.ensure_message_scene_node(active, is_layered);
-                scene_.set_message_layer_binding(active, scene_id);
-                scene_.revive_message_layer(active);
+                    scene().ensure_message_scene_node(active, is_layered);
+                scene().set_message_layer_binding(active, scene_id);
+                scene().revive_message_layer(active);
             }
-            scene_.set_default_message_layer(active);
+            scene().set_default_message_layer(active);
             if (interpreter_)
                 interpreter_->set_variable("s.current_message_layer",
                                            oa::runtime::Value::make_string(active));
@@ -1370,64 +1241,64 @@ bool GameRuntime::RuntimeState::apply_text_event(const oa::runtime::Event& e) {
             // font 族 / ruby / scein-sceout / 排版配置标签（ +
             // tags/ 文本面）
             if (e.tag == "font") {
-                text_.apply_font(e.params);
+                text().apply_font(e.params);
                 return true;
             }
             if (e.tag == "font_close" || e.tag == "/font") {
-                text_.font_close();
+                text().font_close();
                 return true;
             }
             if (e.tag == "fontinit") {
-                text_.font_init();
+                text().font_init();
                 return true;
             }
             if (e.tag == "fontdefault") {
-                text_.font_default(e.params);
+                text().font_default(e.params);
                 return true;
             }
             if (e.tag == "ruby") {
-                text_.ruby_start(par("text"));
+                text().ruby_start(par("text"));
                 return true;
             }
             if (e.tag == "/ruby") {
-                text_.ruby_end();
+                text().ruby_end();
                 return true;
             }
             if (e.tag == "scein") {
-                text_.set_text_hidden(false);
+                text().set_text_hidden(false);
                 return true;
             }
             if (e.tag == "sceout") {
-                text_.set_text_hidden(true);
+                text().set_text_hidden(true);
                 return true;
             }
             if (e.tag == "prohibit") {
-                text_.set_prohibit(par("head"), par("foot"));
+                text().set_prohibit(par("head"), par("foot"));
                 return true;
             }
             if (e.tag == "wordparts") {
-                text_.set_wordparts(par("parts"));
+                text().set_wordparts(par("parts"));
                 return true;
             }
             if (e.tag == "indent") {
-                text_.set_indent(par("pair"));
+                text().set_indent(par("pair"));
                 return true;
             }
             if (e.tag == "scetween") {
-                text_.apply_scetween(e.params);
+                text().apply_scetween(e.params);
                 return true;
             }
             if (e.tag == "glyph") {
-                text_.set_glyph_config(e.params);
+                text().set_glyph_config(e.params);
                 return true;
             }
             if (e.tag == "backlog") {
-                text_.apply_backlog_config(e.params, par("clear") == "1");
+                text().apply_backlog_config(e.params, par("clear") == "1");
                 return true;
             }
             if (e.tag == "writebacklog") {
                 const std::string m = par("mode");
-                text_.set_backlog_write_mode(!m.empty() && parse_i32(m, 0) != 0);
+                text().set_backlog_write_mode(!m.empty() && parse_i32(m, 0) != 0);
                 return true;
             }
             // rt2/tximg/txkey/txnc/link… 仍 no-op（后续域/队列）
@@ -1501,65 +1372,45 @@ bool GameRuntime::RuntimeState::apply_scene_event(const oa::runtime::Event& e) {
     if (e.kind == K::LayerCreate) {
         std::map<std::string, std::string> props = e.params;
         if (e.tag == "lyc2") apply_lyc2_csv(&props);
-        scene_.create(e.id, props);
-        ++scene_layer_events_;
+        scene().create(e.id, props);
+        renderer_.note(RNote::Layer);
         return true;
     }
     if (e.kind == K::LayerDelete) {
-        scene_.remove(e.id);
-        ++scene_layer_events_;
+        scene().remove(e.id);
+        renderer_.note(RNote::Layer);
         // a deleted layer (or subtree) releases its emote
         // player (fgdel/lydel2 flows) — players whose id equals the deleted
         // id or sits below it are dropped (textures die with the scene too).
-        for (auto it = emote_layers_.begin(); it != emote_layers_.end();) {
+        for (auto it = media_.emote_layers_.begin(); it != media_.emote_layers_.end();) {
             const std::string& id = it->first;
             if (id == e.id || (id.size() > e.id.size() + 1 &&
                                id.compare(0, e.id.size(), e.id) == 0 &&
                                id[e.id.size()] == '.')) {
                 if (it->second.player) {
-                    emote_view_cache_[id] = it->second.player->view_state();
-                    // Park the player instead of dropping it: the same scene
-                    // beat usually rebuilds the layer right away ([bg] ->
-                    // fgdelall -> [fg]) and the reference keeps the
-                    // expression across that rebuild. Bounded so a long
-                    // session cannot grow it without limit.
-                    if (parked_emote_.size() >= 8) parked_emote_.erase(parked_emote_.begin());
-                    if (std::getenv("OA_EMOTE_DEBUG"))
-                        std::fprintf(stderr, "[emote] park id='%s' file='%s' "
-                                             "eye=%.1f brow=%.1f state=%d\n",
-                                     id.c_str(), it->second.file.c_str(),
-                                     it->second.player ? it->second.player->get_variable("face_eye_open") : -999.0,
-                                     it->second.player ? it->second.player->get_variable("face_eyebrow") : -999.0,
-                                     it->second.player ? int(it->second.player->has_playback_state()) : -1);
-                    // Keyed by the PSB (the character), not the layer id: a
-                    // scene block bumps the scene id (1.0.4 -> 1.0.3) while
-                    // the character file stays the same, and that is exactly
-                    // the rebuild that must keep the expression.
-                    parked_emote_[it->second.file] = std::move(it->second);
+                    media_.emote_view_cache_[id] = it->second.player->view_state();
+                    // Park the player for the immediate same-beat rebuild.
+                    if (media_.parked_emote_.size() >= 8) media_.parked_emote_.erase(media_.parked_emote_.begin());
+                    // Key by PSB file: scene-id rebuilds keep the expression.
+                    media_.parked_emote_[it->second.file] = std::move(it->second);
                 }
-                it = emote_layers_.erase(it);
+                it = media_.emote_layers_.erase(it);
             } else {
                 ++it;
             }
         }
-        // The deleted subtree releases its layer-video
-        // channels the same way. A layer video whose scene carrier is gone
-        // has nothing to draw; letting the channel run would keep decoding
-        // and mask-compositing frames forever (snll's title petal channel
-        // kept pumping into the story after the title ui teardown, and the
-        // recall-montage strip kept looping after its cgdel — both cost a
-        // full-screen decode + mask bake per delivered frame).
-        video_.stop_layer_subtree(e.id);
+        // A deleted subtree releases its layer-video channels.
+        media_.video_.stop_layer_subtree(e.id);
         return true;
     }
     if (e.kind == K::LayerSetProps) {
         // routed: id == "!" hits the root props, never creates a "!" node.
         if (e.id == "!") {
-            scene_.set_root_props(e.params);
+            scene().set_root_props(e.params);
         } else {
-            scene_.set_props(e.id, e.params);
+            scene().set_props(e.id, e.params);
         }
-        ++scene_layer_events_;
+        renderer_.note(RNote::Layer);
         return true;
     }
     if (e.kind == K::LayerEventCmd) {
@@ -1569,29 +1420,14 @@ bool GameRuntime::RuntimeState::apply_scene_event(const oa::runtime::Event& e) {
             // layer-event handler registrations are applied to the scene
             // registry at dispatch time (FPM type-less handler
             // expansion). Host stream never sees them.
-            scene_.apply_lyevent(e.id, e.params);
-            ++scene_layer_events_;
+            scene().apply_lyevent(e.id, e.params);
+            renderer_.note(RNote::Layer);
             return true;
         }
         if (e.tag == "lytween") {
-            if (std::getenv("OA_DEBUG_LYTW")) {
-                std::string p;
-                for (const auto& [k, v] : e.params)
-                    if (k == "id" || k == "param" || k == "from" ||
-                        k == "to" || k == "time" || k == "ease" ||
-                        k == "delay" || k == "sync" || k == "delete" ||
-                        k == "handler" || k == "yoyo" || k == "loop")
-                        p += k + "=" + v + " ";
-                std::printf("[ltw] + id=%s %s\n", e.id.c_str(), p.c_str());
-            }
-            scene_.apply_lytween(e.params, now_ms_);
-            ++scene_tween_events_;
-            // [lytween sync=1]: remember the target so the runtime can park the
-            // script once this run finishes without its own wait
-            // (Event::LayerTween { sync: true } -> Stop{reason:"tween:<id>"}).
-            // Only the first request of a run
-            // arms; sync requests drained while parked never arm (the parked
-            // wait already exists).
+            scene().apply_lytween(e.params, now_ms_);
+            renderer_.note(RNote::Tween);
+            // [lytween sync=1]: first target of a run arms a tween park.
             if (!in_parked_drain_) {
                 int sync = 0;
                 const auto s = e.params.find("sync");
@@ -1612,50 +1448,44 @@ bool GameRuntime::RuntimeState::apply_scene_event(const oa::runtime::Event& e) {
             return true;
         }
         if (e.tag == "lytweendel") {
-            if (std::getenv("OA_DEBUG_LYTW"))
-                std::printf("[ltw] - del id=%s\n", e.id.c_str());
-            // cancel deliveries deferred to the frame-end scene
-            // advance (flush_pending_tween_cancels) — a cancelled
-            // script-timer round fires its completion only while its layer
-            // survived the rest of the frame's script work. Config page
-            // switches call config_delsample() (lytweendel) before the
-            // csvbtn3 [lydel2]+rebuild of the SAME script batch; delivering
-            // here would reprint the sample preview onto the next page
-            // (snll/NekoMiko sample bleed across every config page).
-            std::vector<oa::render::TweenDone> done = scene_.apply_lytweendel(e.id);
+            // Defer cancelled completions to the frame-end flush.
+            std::vector<oa::render::TweenDone> done = scene().apply_lytweendel(e.id);
             if (!done.empty()) {
                 PendingTweenCancel pc;
                 pc.id = e.id;
-                pc.node = scene_.find(e.id);
+                pc.node = scene().find(e.id);
                 pc.done = std::move(done);
                 pending_tween_cancels_.push_back(std::move(pc));
             }
-            ++scene_tween_events_;
+            renderer_.note(RNote::Tween);
             return true;
         }
         if (e.tag == "anime") {
             // [anime] frame animation: init/add/end reduced to the
             // AnimeState on the Compositor.
-            scene_.apply_anime(e.params, now_ms_);
-            ++scene_tween_events_;
+            scene().apply_anime(e.params, now_ms_);
+            renderer_.note(RNote::Tween);
             return true;
         }
         if (e.tag == "tweenset") {
-            scene_.tweenset_start();
-            ++scene_tween_events_;
+            scene().tweenset_start();
+            renderer_.note(RNote::Tween);
             return true;
         }
         if (e.tag == "/tweenset") {
-            scene_.tweenset_end(now_ms_);
-            ++scene_tween_events_;
+            scene().tweenset_end(now_ms_);
+            renderer_.note(RNote::Tween);
             return true;
         }
         return false;
     }
+    return false;
+}
+
+// Control/config domain: legacy rows → input registry → config → [lydrag].
+bool GameRuntime::RuntimeState::apply_control_event(const oa::runtime::Event& e) {
+    using K = oa::runtime::Event::Kind;
     if (e.kind == K::ConfigEvent) {
-        // global input registry ([setonpush] family)
-        // and the legacy layer-event aliases
-        // ([setonclick] etc = lyevent mode init/reset).
         static const std::map<std::string, std::string> kLayerSet = {
             {"setonclick", "click"},       {"setondrag", "drag"},
             {"setondragin", "dragin"},     {"setondragout", "dragout"},
@@ -1665,13 +1495,13 @@ bool GameRuntime::RuntimeState::apply_scene_event(const oa::runtime::Event& e) {
             {"delondragin", "dragin"},     {"delondragout", "dragout"},
             {"delonrollover", "rollover"}, {"delonrollout", "rollout"}};
         if (const auto it = kLayerSet.find(e.tag); it != kLayerSet.end()) {
-            scene_.apply_legacy_layer_event(e.id, it->second, false, e.params);
-            ++scene_layer_events_;
+            scene().apply_legacy_layer_event(e.id, it->second, false, e.params);
+            renderer_.note(RNote::Layer);
             return true;
         }
         if (const auto it = kLayerDel.find(e.tag); it != kLayerDel.end()) {
-            scene_.apply_legacy_layer_event(e.id, it->second, true, e.params);
-            ++scene_layer_events_;
+            scene().apply_legacy_layer_event(e.id, it->second, true, e.params);
+            renderer_.note(RNote::Layer);
             return true;
         }
         static const std::map<std::string, std::string> kInputSet = {
@@ -1698,7 +1528,7 @@ bool GameRuntime::RuntimeState::apply_scene_event(const oa::runtime::Event& e) {
             if (e.tag == "setonwindowbutton" && !raw.count("key")) {
                 if (const auto b = raw.find("button"); b != raw.end()) raw["key"] = b->second;
             }
-            scene_.set_input_handler(it->second, raw);
+            scene().set_input_handler(it->second, raw);
             return true;
         }
         if (const auto it = kInputDel.find(e.tag); it != kInputDel.end()) {
@@ -1709,7 +1539,7 @@ bool GameRuntime::RuntimeState::apply_scene_event(const oa::runtime::Event& e) {
                 const auto b = e.params.find("button");
                 if (b != e.params.end()) key = b->second;
             }
-            scene_.del_input_handler(it->second, key);
+            scene().del_input_handler(it->second, key);
             return true;
         }
         // control domain: [keyconfig]/[rclick]/[hide]/[skip]/[automode]/
@@ -1730,16 +1560,10 @@ bool GameRuntime::RuntimeState::apply_scene_event(const oa::runtime::Event& e) {
 
 void GameRuntime::RuntimeState::dispatch_tween_done(
     const std::vector<oa::render::TweenDone>& done) {
-    // handler completions: [lytween handler="calllua" function=...] are
-    // enqueued as engine tags:
-    // the handler tag runs with its extra params (calllua resolves the Lua
-    // function), and a file/label pair is enqueued as jump (call=false).
-    // The tags execute on the next script run / parked drain. The same
-    // path delivers completions of handler-tweens cancelled by [lytweendel]
-    // (see Compositor::apply_lytweendel) so script-timer rounds end cleanly.
+    // Enqueue tween completion handlers as engine tags (handler + jump).
     for (const oa::render::TweenDone& d : done) {
         if (!d.handler.empty() || !d.handler_file.empty() || !d.handler_label.empty()) {
-            ++tween_completion_calls_;
+            renderer_.note(RNote::TweenComplete);
         }
         if (!d.handler.empty()) {
             interpreter_->enqueue_tag(d.handler, d.extra);
@@ -1754,18 +1578,13 @@ void GameRuntime::RuntimeState::dispatch_tween_done(
 }
 
 void GameRuntime::RuntimeState::flush_pending_tween_cancels() {
-    // deferred [lytweendel] handler completions (see the
-    // lytweendel dispatch and PendingTweenCancel). Deliver only while the
-    // tween's layer survived this frame's script work — the config
-    // page-switch rebuild ([lydel2 500] inside csvbtn3) removes the sample
-    // timer node (500.sample / 500.z.zz) right after config_delsample()
-    // cancelled its round, so the round must end WITHOUT reprinting the
-    // sample text onto the next page. Same-frame same-page cancels (FPM
-    // r10e slider drag) keep the layer and deliver exactly as before.
+    // Deferred [lytweendel] completions: deliver only while the layer
+    // survived this frame (same-frame cancels deliver; rebuilt/deleted
+    // layers end the round silently).
     if (pending_tween_cancels_.empty()) return;
     std::vector<oa::render::TweenDone> out;
     for (auto& pc : pending_tween_cancels_) {
-        const oa::render::Layer* now = scene_.find(pc.id);
+        const oa::render::Layer* now = scene().find(pc.id);
         if (now && now == pc.node) {
             for (auto& d : pc.done) out.push_back(std::move(d));
         }
@@ -1780,69 +1599,38 @@ void GameRuntime::RuntimeState::drop_pending_tween_cancels() {
     pending_tween_cancels_.clear();
 }
 
-// "内容在场面"的每帧推进唯一逐面
-// 更新入口。每面 = 现状时钟的既有实现方法(原位收口,方法体零改动);顺序与
-// tick 相位文档(红线 R6)逐行对应,见各步注释。
-// 不在此面的每帧更新:宿主上传泵(emote 画布/video 帧,main.cpp
-// tick 后渲染前)、组烘焙(绘制时按需)、视频解码线程自驱时钟 —— 见文档。
+// Runtime-side frame advance (host upload pumps / group bakes stay outside).
+// R6 order: text reveal → scene tweens/anime → emote clock → click-wait icon
+// → media frame end. Reordering changes animation phase.
 void GameRuntime::RuntimeState::advance_content_planes(uint64_t delta_ms) {
-    // 面 1 — 文本 reveal 时钟(text_.reveal_next;逐字 reveal_index)。
-    text_.reveal_next(delta_ms);
-
-    // 面 2 — 场景属性动画轨(advance_scene_frame = flush 上帧 tween 完成投递
-    // → Compositor::advance_tweens:tween 值写/settle/delete_on_finish 级联 +
-    // [anime] 帧推进直写;帧内已含活动帧写收口,见 layer.cpp)。
+    text().reveal_next(delta_ms);
     advance_scene_frame();
-
-    // 面 3 — emote 姿态时钟的运行时自动臂(advance_emote_players:每 tick
-    // advance_ms;host_clock 层跳过自动推进只同步 revision —— 双时钟另一臂
-    // em:progress 由游戏驱动,事件时点,不在本序列)。
-    advance_emote_players(delta_ms);
-
-    // 面 4 — [glyph] click-wait 图标(reveal 完成 → 显示边沿落在同帧)。
+    advance_emote_players(delta_ms); // host_clock layers only sync revisions
     advance_click_wait();
-
-    // 面 5 — 媒体帧末(audio 淡出时钟/decode 泵/video 状态推进 → EOF
-    // finish_video 解绑 → overlay set/clear file;帧末收尾,等待解析对上帧
-    // 状态)。
     advance_media_frame(delta_ms);
 }
 
 void GameRuntime::RuntimeState::advance_scene_frame() {
-    // handler-tween completions are delivered only while
-    // the tween's layer survived the frames in between. flush first (the
-    // previous frame's staged cancels/naturals), then stage this frame's
-    // natural finishes for the next flush.
+    // Deliver staged completions only while the tween's layer survived the
+    // frames in between; then stage this frame's natural finishes for the
+    // next flush (a config page rebuild must not reprint the old preview).
     flush_pending_tween_cancels();
-    std::vector<oa::render::TweenDone> done = scene_.advance_tweens(now_ms_);
+    std::vector<oa::render::TweenDone> done = scene().advance_tweens(now_ms_);
     if (!done.empty()) {
-        // natural finishes of handler tweens are staged exactly
-        // like [lytweendel] cancels instead of being dispatched immediately.
-        // A round that ended naturally must not fire its completion
-        // (config_sampletext -> reprint + rearm of the sample preview) into
-        // a screen where the timer layer is already gone — the config page
-        // switch rebuild deletes 500.sample / 500.z.zz inside csvbtn3, and a
-        // completion drained after that would repaint the preview text onto
-        // the new page and re-arm a fresh round there (snll config "切页时
-        // 预览文字显示"). Same rule, same guarantee as the cancel path:
-        // alive layer (normal page-2 rounds, FPM r10e drag) delivers one
-        // frame later; dead/rebuilt layer ends the round silently.
         for (oa::render::TweenDone& d : done) {
             PendingTweenCancel pc;
             pc.id = d.id;
-            pc.node = scene_.find(d.id);
+            pc.node = scene().find(d.id);
             pc.done.push_back(std::move(d));
             pending_tween_cancels_.push_back(std::move(pc));
         }
     }
-    // [lytween sync=1] wait release: the script stays parked until the target
-    // layer's tweens are gone (or the layer is deleted); release clears the
-    // wait without advancing the interpreter line — the script never parked on
-    // the lytween instruction.
+    // [lytween sync=1] release: clears the wait without advancing the line
+    // (the script never parked on the instruction itself).
     if (wait_ && wait_->kind == oa::runtime::WaitReason::Kind::Stop &&
         wait_->id.rfind("tween:", 0) == 0) {
         const std::string layer = wait_->id.substr(6);
-        if (scene_.layer_tweens_finished(layer)) {
+        if (scene().layer_tweens_finished(layer)) {
             wait_.reset();
             wait_remaining_ms_ = 0;
         }
@@ -1883,14 +1671,16 @@ void GameRuntime::RuntimeState::transition_begin(const std::map<std::string, std
     } catch (...) {
         input = 1;
     }
-    transition_.start(type, time, std::move(rule), vague, input, now_ms_);
-    if (transition_.needs_capture()) {
+    transition().start(type, time, std::move(rule), vague, input, now_ms_);
+    renderer_.request_repaint();
+    if (transition().needs_capture()) {
         if (transition_capture_cb_) {
-            transition_capture_cb_(); // host snapshots the old frame
+            transition_capture_cb_(); // test host snapshots the old frame
         } else {
-            // headless host: treat the capture as completed immediately so the
-            // transition still runs its full duration on the clock.
-            transition_.mark_captured(now_ms_);
+            // Renderer owns the transition capture; without a backend the
+            // capture is treated as complete (headless duration still runs).
+            renderer_.capture_transition_source();
+            transition().mark_captured(now_ms_);
         }
     }
 }
@@ -1899,35 +1689,17 @@ bool GameRuntime::RuntimeState::waiting_stop() const {
     return wait_ && wait_->kind == oa::runtime::WaitReason::Kind::Stop;
 }
 
-// ---------------------------------------------------------------------------
-// FPM e:debugSkip exskip fast-forward (次の選択肢に進む / 高速
-// スキップ). The Lua system half runs under flg.exskip (mainloop whitelist,
-// estag{"exskip_stop"} boundaries, onDebugSkipOut=exskip_end); the engine
-// half is only:
-//   - exskip_active_: every non-Stop wait releases instantly while active
-//     (the story fast-forwards page by page with zero input);
-//   - [stop 0="exskip"] while active: the fast-forward ends HERE — the state
-//     is cleared, Lua flg.exskip is marked 2 (the guard exskip_end requires;
-//     the real engine's Lua tags.stop hook does this at the row, openartemis
-//     executes these rows natively) and the registered onDebugSkipOut handler
-//     (FPM init.lua: exskip_end) runs — it cleans up and quickjumps back to
-//     the last backlog point, whose queued jump repositions the interpreter
-//     (the boundary row itself then passes; without active exskip the row is
-//     a pass-through, exactly the pre-existing rule).
-// ---------------------------------------------------------------------------
+// Debug-skip fast-forward: non-Stop waits release instantly; the
+// [stop 0="exskip"] row ends the fast-forward. Details: docs/RUNTIME_NOTES.md.
 void GameRuntime::RuntimeState::start_debug_skip() {
-    if (exskip_active_) return;
-    exskip_active_ = true;
-    if (std::getenv("OA_EXSKIPDBG"))
-        std::fprintf(stderr, "[exskipdbg] fast-forward start\n");
+    if (control_.exskip_active_) return;
+    control_.exskip_active_ = true;
 }
 
 void GameRuntime::RuntimeState::end_debug_skip() {
-    if (!exskip_active_) return;
-    exskip_active_ = false;
+    if (!control_.exskip_active_) return;
+    control_.exskip_active_ = false;
     reveal_all_text(); // no half-revealed page left behind at the boundary
-    if (std::getenv("OA_EXSKIPDBG"))
-        std::fprintf(stderr, "[exskipdbg] boundary [stop 0=exskip] -> onDebugSkipOut\n");
     if (interpreter_) {
         try {
             // Mirror the real engine's Lua tags.stop hook side effect (sets
@@ -1943,56 +1715,25 @@ void GameRuntime::RuntimeState::end_debug_skip() {
     }
 }
 
-/// OA_STORYDBG=1: log WHY a story wait was released (first 80 lines). The
-/// "story runs by itself" reports need the exact release source — physical
-/// click, scripted decide edge, skip mode, exskip fast-forward, or the clock.
-void storydbg(const oa::runtime::WaitReason& w, const char* why, bool clicked,
-              bool decide, bool skip, bool exskip) {
-    if (!std::getenv("OA_STORYDBG") || g_storydbg >= 20) return;
-    ++g_storydbg;
-    std::fprintf(stderr, "[story] release %s id='%s' by %s (click=%d decide=%d skip=%d exskip=%d)\n",
-                 w.kind == oa::runtime::WaitReason::Kind::Timed ? "timed" : "generic",
-                 w.id.c_str(), why, clicked ? 1 : 0, decide ? 1 : 0, skip ? 1 : 0,
-                 exskip ? 1 : 0);
-}
-
 bool GameRuntime::RuntimeState::resolve_wait(uint64_t delta_ms, const FrameInput& in, bool clicked) {
     if (!wait_) return true;
     (void)in;
-    // A wait armed by this very tick never resolves in the same tick: Artemis
-    // consumes at least one frame even for [wait time=0] (macro.iet: "wait
-    // time = 0 でも 1ms 消費するため"). Resolving in-tick made every zero-time
-    // yield a no-op and let the script run several "frames" of logic inside
-    // one frame.
+    // A wait armed this tick resolves next tick (Artemis yields ≥1 frame).
     const bool armed_now = wait_armed_this_tick_;
     wait_armed_this_tick_ = false;
-    // FPM e:debugSkip fast-forward — every non-Stop wait
-    // releases instantly while the engine exskip state is active (the Lua
-    // flg.exskip half already suppresses text/sound/emote rows, so waits are
-    // the only thing left to release). Stop-class parks are reserved for the
-    // boundary rule below. Independent of skip_allowed_/skip_enabled_: this
-    // is not the [skip allow]+[exec skip] state machine and fires no
-    // skipin/skipout events (FPM debugSkip has none).
-    if (exskip_active_ && wait_->kind != oa::runtime::WaitReason::Kind::Stop) {
+    // Exskip releases every non-Stop wait instantly.
+    if (control_.exskip_active_ && wait_->kind != oa::runtime::WaitReason::Kind::Stop) {
         return true;
     }
     switch (wait_->kind) {
         case oa::runtime::WaitReason::Kind::Timed: {
             if (armed_now) return false;
             const bool clickable = wait_->input == 1;
-            // input=2 ([wait2]): click-skip is NOT allowed; only skip mode
-            // passes early. It used to be treated as "always pass", which
-            // turned every [wait2 3000] in the scenario into a zero wait and
-            // made the whole story auto-advance at frame rate.
-            // A scripted decide edge (e:overrideKey status=32, the FPM
-            // "dummy click") counts like a physical click for input waits.
-            if ((clickable && (clicked || decide_edge_)) || skip_active_) {
-                storydbg(*wait_, clickable ? "click/decide-or-skip" : "skip",
-                         clicked, decide_edge_, skip_active_, exskip_active_);
+            // input=2: only skip mode passes early; decide edge counts as click.
+            if ((clickable && (clicked || input_state_.decide_edge_)) || control_.skip_active_) {
                 return true;
             }
             if (wait_remaining_ms_ <= delta_ms) {
-                storydbg(*wait_, "clock", clicked, decide_edge_, skip_active_, exskip_active_);
                 return true;
             }
             wait_remaining_ms_ -= delta_ms;
@@ -2002,127 +1743,74 @@ bool GameRuntime::RuntimeState::resolve_wait(uint64_t delta_ms, const FrameInput
             // [stop]: physical clicks do NOT release; only scripted decide
             // edges (overrideKey status=32) or media/transition completions.
             // A fullscreen-video completion resumes ANY Stop-class park.
-            if (video_finished_) {
-                video_finished_ = false;
+            if (media_.video_finished_) {
+                media_.video_finished_ = false;
                 return true;
             }
-            // [stop 0="exskip"]: FPM debugSkip (次の選択肢/高速スキップ)
-            // boundary row (ui.asb *exskip_stop / *go_title, script.asb
-            // *movie_play first rows):
-            //   - exskip NOT active: pass-through — the pre-existing rule
-            //     (title/movie flows never hold the script);
-            //   - exskip active: the fast-forward ends here — end_debug_skip()
-            //     clears the state, marks Lua flg.exskip=2 and fires
-            //     onDebugSkipOut (exskip_end cleans up + quickjump-replays the
-            //     last backlog point); then this row passes so the boundary
-            //     flow (and the queued replay jump) continue normally.
+            // [stop 0="exskip"]: pass-through; ends the fast-forward if active.
             if (wait_->id == "exskip") {
-                if (exskip_active_) end_debug_skip();
+                if (control_.exskip_active_) end_debug_skip();
                 return true;
             }
             // [alldelete]: the script resumes once the whole-scene
             // fade-out + clear finished (finish_all_delete runs inside tick
             // when the fade clock expires).
-            if (wait_->id == "alldelete") return !alldelete_active_;
-            // fullscreen [video] auto-park (Stop{reason:"video"})
-            // on a SKIPPABLE channel (video skip != 0): a physical left click
-            // or the right mouse button ends the movie immediately. The skip
-            // queues the same finish EOF would (VideoEngine::queue_finish);
-            // advance_media_frame dispatches it at the end of this tick, so
-            // the Lua video-finish handlers and the video_finished_ wait
-            // release run on the identical path as natural EOF (next tick).
-            // Non-skippable videos (skip=0) are untouched; the click is a
-            // per-frame edge, so it cannot double-advance the wait that
-            // follows the movie.
+            if (wait_->id == "alldelete") return !renderer_.all_delete_active();
+            // Skippable fullscreen video: click/right-click queues EOF.
             if (wait_->id == "video") {
-                const auto vsnap = video_.state();
+                const auto vsnap = media_.video_.state();
                 const auto& fsv = vsnap.overlay_video;
                 const bool phys_skip =
-                    down_edges_.count(kKeyMouseLeft) ||
-                    down_edges_.count(kKeyMouseRight);
+                    input_state_.down_edges_.count(kKeyMouseLeft) ||
+                    input_state_.down_edges_.count(kKeyMouseRight);
                 if (fsv && fsv->skippable && fsv->playing &&
                     (phys_skip || clicked)) {
-                    video_.queue_finish(std::string());
+                    media_.video_.queue_finish(std::string());
                     return false;
                 }
-                // 视频停驻的硬防线:只要 overlay 还在播放(含解码起步/
-                // 首帧未到),任何非 finish 路径都不得放行 —— EOF/跳过
-                // 的 finish 会先停掉 overlay(playing=false),之后才由
-                // video_finished_ 释放。避免 OP 类影片(经 Lua 入队的
-                // [video])在 1 帧后被提前释放、剧情在影片播放中继续。
+                // While the overlay is still playing, never release the park.
                 if (fsv && fsv->playing) return false;
             }
-            // Stop{reason:"trans"}: a physical click may skip the transition
-            // when [trans input=] allows (0 deny / 1 allow / 2 skip-mode
-            // only); the wait itself releases once the transition reports
-            // finished.
+            // [trans]: input rules may skip; release when the transition ends.
             if (wait_->id == "trans") {
-                if (clicked || skip_active_) transition_.skip_by_input(skip_active_);
-                if (decide_edge_) return true;
-                return !transition_.is_in_progress(now_ms_);
+                if (clicked || control_.skip_active_) transition().skip_by_input(control_.skip_active_);
+                if (input_state_.decide_edge_) return true;
+                return !transition().is_in_progress(now_ms_);
             }
-            if (decide_edge_) return true;
+            if (input_state_.decide_edge_) return true;
             return false;
         }
         case oa::runtime::WaitReason::Kind::Generic:
         case oa::runtime::WaitReason::Kind::Generic0: {
-            // decide edges advance input waits too — except a plain [wt]
-            // (splash/logo "click to continue"): the boot-time setexclick
-            // dummy click must not skip it.
+            // decide edges advance input waits, except plain [wt].
             const bool input_advance =
-                clicked || (decide_edge_ && wait_->id != "wt");
+                clicked || (input_state_.decide_edge_ && wait_->id != "wt");
             // 点击等待且文本仍在逐字揭示 → 先整页揭示，不推进
             // （reveal_text_now 并 return false）
-            if (input_advance && !text_.is_reveal_complete()) {
-                if (std::getenv("OA_WAITDBG")) {
-                    std::fprintf(stderr, "[waitdbg] generic reveal-blocked at %s:%zu\n",
-                                 interpreter_->current_script()
-                                     ? interpreter_->current_script()->c_str()
-                                     : "?",
-                                 interpreter_->current_line());
-                    for (const auto& [lid, l] : text_.layers()) {
-                        std::fprintf(stderr,
-                                     "[waitdbg]   layer '%s' chars=%zu idx=%zu pend=%d "
-                                     "hidden=%d scetween=%zu\n",
-                                     lid.c_str(), l.char_count, l.reveal_index,
-                                     (int)l.reveal_pending, (int)l.text_hidden,
-                                     l.scetween.size());
-                    }
-                }
-                text_.reveal_all();
+            if (input_advance && !text().is_reveal_complete()) {
+                text().reveal_all();
                 return false;
             }
             if (input_advance) {
-                storydbg(*wait_, clicked ? "click" : "decide", clicked, decide_edge_,
-                         skip_active_, exskip_active_);
                 return true;
             }
             // skip (command/control) releases generic waits after a full reveal.
-            if (skip_active_) {
-                if (!text_.is_reveal_complete()) {
-                    text_.reveal_all();
+            if (control_.skip_active_) {
+                if (!text().is_reveal_complete()) {
+                    text().reveal_all();
                     return false;
                 }
-                storydbg(*wait_, "skip_active", clicked, decide_edge_, skip_active_,
-                         exskip_active_);
                 return true;
             }
-            if (automode_) {
-                // pacing interval comes from the script var
-                // s.automodewait (FPM clickAutomode writes it at every click
-                // park: automode_vowait for a voiced line under conf.autostop,
-                // getASpeed() otherwise); 900 ms fallback when unset. The
-                // voice gate holds the release while any [automode syncse]
-                // channel still plays, so a voiced page turns exactly when
-                // its voice ends (never mid-voice), and a voice shorter than
-                // the interval still gets its minimum display time.
-                auto_elapsed_ms_ += delta_ms;
-                if (auto_elapsed_ms_ < automode_wait_ms()) return false;
+            if (control_.automode_) {
+                // s.automodewait pacing; a live syncse voice holds the flip.
+                control_.auto_elapsed_ms_ += delta_ms;
+                if (control_.auto_elapsed_ms_ < automode_wait_ms()) return false;
                 if (automode_sync_blocked()) return false;
-                auto_elapsed_ms_ = 0;
+                control_.auto_elapsed_ms_ = 0;
                 return true;
             } else {
-                auto_elapsed_ms_ = 0;
+                control_.auto_elapsed_ms_ = 0;
             }
             return false;
         }
@@ -2134,44 +1822,44 @@ bool GameRuntime::RuntimeState::resolve_wait(uint64_t delta_ms, const FrameInput
                 } catch (...) {
                     continue;
                 }
-                if (down_edges_.count(code)) return true;
+                if (input_state_.down_edges_.count(code)) return true;
             }
-            if (clicked || decide_edge_) return true;
+            if (clicked || input_state_.decide_edge_) return true;
             return false;
         }
         case oa::runtime::WaitReason::Kind::Se: {
             // [wait se=ID (time=N)]: releases on skip or when the tracked
             // sound ended.
-            if (skip_active_) return true;
+            if (control_.skip_active_) return true;
             return media_se_wait_finished(wait_->id, wait_->time_given, wait_->milliseconds);
         }
         case oa::runtime::WaitReason::Kind::VideoLayer: {
             // [wait video=layerID]: releases on skip or when the layer video
             // stopped.
-            if (skip_active_) return true;
+            if (control_.skip_active_) return true;
             // explicit video waits on a skippable channel also
             // honor physical input (left click / right button) — queue the
             // layer finish, released through the same stop path next tick.
             const bool phys_skip =
-                down_edges_.count(kKeyMouseLeft) ||
-                down_edges_.count(kKeyMouseRight);
+                input_state_.down_edges_.count(kKeyMouseLeft) ||
+                input_state_.down_edges_.count(kKeyMouseRight);
             if (clicked || phys_skip) {
-                const auto vsnap = video_.state();
+                const auto vsnap = media_.video_.state();
                 const auto vit = vsnap.video_layers.find(wait_->id);
                 if (vit != vsnap.video_layers.end() && vit->second.skippable &&
                     vit->second.playing) {
-                    video_.queue_finish(wait_->id);
+                    media_.video_.queue_finish(wait_->id);
                     return false;
                 }
             }
-            return !video_.is_layer_playing(wait_->id);
+            return !media_.video_.is_layer_playing(wait_->id);
         }
         case oa::runtime::WaitReason::Kind::ScenarioTween: {
             // [wait scenario=1|2]: mode 2 (hide) is instantaneous; mode 1
             // (show) waits for the per-glyph reveal.
-            if (skip_active_) return true;
+            if (control_.skip_active_) return true;
             if (wait_->mode != 1) return true;
-            return text_.is_reveal_complete();
+            return text().is_reveal_complete();
         }
     }
     return false;
@@ -2186,78 +1874,53 @@ void GameRuntime::RuntimeState::advance_wait() {
     const bool page_wait_release =
         wait_ && (wait_->kind == oa::runtime::WaitReason::Kind::Generic ||
                   wait_->kind == oa::runtime::WaitReason::Kind::Generic0);
-    if (std::getenv("OA_WAITDBG")) {
-        const oa::runtime::WaitReason::Kind k = wait_ ? wait_->kind
-                                                      : (oa::runtime::WaitReason::Kind)255;
-        std::fprintf(stderr,
-                     "[waitdbg] resolve kind=%d -> advance pos=%s:%zu queue=%d\n",
-                     (int)k, interpreter_->current_script()
-                                 ? interpreter_->current_script()->c_str()
-                                 : "?",
-                     interpreter_->current_line(),
-                     (int)interpreter_->has_queued_tags());
-    }
     wait_.reset();
     wait_remaining_ms_ = 0;
-    if (page_wait_release) text_.anchor_active_to_content();
+    if (page_wait_release) text().anchor_active_to_content();
     // If a Stop wait resolves while Lua queued a jump, the position change
     // happens inside the next run; next_line only moves past inline wait
     // instructions (queue-sourced waits no-op inside the interpreter).
     interpreter_->next_line();
 }
 
-// [glyph] click-wait icon per-frame driving.
-// advance_click_wait/页末等待（[wt]/[wt0] 都是 Generic/
-// Generic0），一律按行末处理（page_end=false，用 [glyph] 的 layer）。位置由
-// TextEngine::click_wait_placement 计算（几何近似）；homing
-// 时把 left/top 写回图标层，否则只切可见性。未配置图标图层 → placement 为
-// nullopt → 不动作；advance_click_wait 为空时退出路径也不写场景。
+// [glyph] click-wait icon: show/move while a click wait is fully revealed.
 void GameRuntime::RuntimeState::advance_click_wait() {
     const bool click_wait =
         wait_ && (wait_->kind == oa::runtime::WaitReason::Kind::Generic ||
                   wait_->kind == oa::runtime::WaitReason::Kind::Generic0);
-    const bool show = click_wait && text_.is_reveal_complete();
+    const bool show = click_wait && text().is_reveal_complete();
     if (!show) {
-        if (!active_wait_icon_.empty()) {
-            // set_props 的语义是"缺失即物化"
-            // (layer.cpp: `lyprop on a missing id materializes the node`)。
-            // 读档清场已经清了 active_wait_icon_，这里再判一次存在性：图标层
-            // 被别的路径删掉时，隐藏请求绝不允许凭空造出幽灵层。
-            if (scene_.find(active_wait_icon_)) {
-                scene_.set_props(active_wait_icon_, {{"visible", "0"}});
+        if (!control_.active_wait_icon_.empty()) {
+            // find guard: set_props would materialize a missing icon layer.
+            if (scene().find(control_.active_wait_icon_)) {
+                scene().set_props(control_.active_wait_icon_, {{"visible", "0"}});
             }
-            active_wait_icon_.clear();
+            control_.active_wait_icon_.clear();
         }
         return;
     }
-    const auto placement = text_.click_wait_placement(false);
+    const auto placement = text().click_wait_placement(false);
     if (!placement) return;
-    const bool homing = text_.glyph_icon().homing;
-    const oa::render::Layer* l = scene_.find(placement->layer_id);
-    const bool already = active_wait_icon_ == placement->layer_id && l && l->visible &&
+    const bool homing = text().glyph_icon().homing;
+    const oa::render::Layer* l = scene().find(placement->layer_id);
+    const bool already = control_.active_wait_icon_ == placement->layer_id && l && l->visible &&
                          (!homing ||
                           (l->left == placement->left && l->top == placement->top));
     if (already) return;
-    if (!active_wait_icon_.empty() && active_wait_icon_ != placement->layer_id &&
-        scene_.find(active_wait_icon_)) {
-        scene_.set_props(active_wait_icon_, {{"visible", "0"}});
+    if (!control_.active_wait_icon_.empty() && control_.active_wait_icon_ != placement->layer_id &&
+        scene().find(control_.active_wait_icon_)) {
+        scene().set_props(control_.active_wait_icon_, {{"visible", "0"}});
     }
     std::map<std::string, std::string> p{{"visible", "1"}};
     if (homing) {
         p["left"] = format_prop_num(placement->left);
         p["top"] = format_prop_num(placement->top);
     }
-    scene_.set_props(placement->layer_id, p);
-    active_wait_icon_ = placement->layer_id;
+    scene().set_props(placement->layer_id, p);
+    control_.active_wait_icon_ = placement->layer_id;
 }
 
-// ---------------------------------------------------------------------------
-// Pointer dispatch chain. Semantics mirror the
-// reference engine's process_pointer_handlers with the
-// openartemis host model: hit geometry/alpha come from injected providers and
-// Lua dispatch is a synchronous call_function (calllua-equivalent), the same
-// ABI the host app uses for btn_over/btn_click.
-// ---------------------------------------------------------------------------
+// Pointer chain: hit test → hover diff → click/drag/push (docs/RUNTIME_NOTES.md).
 
 namespace {
 bool is_mouse_button_key(int key) { return key >= 1 && key <= 3; }
@@ -2276,154 +1939,85 @@ GameRuntime::RuntimeState::PointerConsumption GameRuntime::RuntimeState::process
     const double mx = double(in.mouse_x);
     const double my = double(in.mouse_y);
     const bool left_down_edge = in.left_click_edge;
-    const bool left_up_edge = left_down_prev_ && !in.left_down;
-    left_down_prev_ = in.left_down;
+    const bool left_up_edge = pointer_.left_down_prev_ && !in.left_down;
+    pointer_.left_down_prev_ = in.left_down;
     const bool pointer_moved =
-        !mouse_inited_ || in.mouse_x != mouse_prev_x_ || in.mouse_y != mouse_prev_y_;
-    mouse_inited_ = true;
-    mouse_prev_x_ = in.mouse_x;
-    mouse_prev_y_ = in.mouse_y;
+        !pointer_.mouse_inited_ || in.mouse_x != pointer_.mouse_prev_x_ || in.mouse_y != pointer_.mouse_prev_y_;
+    pointer_.mouse_inited_ = true;
+    pointer_.mouse_prev_x_ = in.mouse_x;
+    pointer_.mouse_prev_y_ = in.mouse_y;
 
     // hide mode: a left click first recovers the message window and is
     // swallowed for the rest of the frame (hide click recovery, no
     // click/advance chain).
-    if (hide_active_ && left_down_edge) {
+    if (control_.hide_active_ && left_down_edge) {
         exit_hide_mode();
         pc.input_swallowed = true;
         return pc;
     }
 
     // --- hit test (geometry + clickablethreshold alpha) --------------------
-    const auto hits = scene_.hit_test_all(mx, my, hit_size_, compositor_userdata_,alpha_sampler_);
+    const auto hits = scene().hit_test_all(mx, my, pointer_.hit_size_, pointer_.compositor_userdata_,pointer_.alpha_sampler_);
     // layers that can receive events at all = hit-test interaction gate
     // (applied here at dispatch)
     std::vector<std::string> interactive;
     for (const std::string& id : hits)
-        if (scene_.has_any_enabled_handler(id)) interactive.push_back(id);
-    if (std::getenv("OA_POINTERDBG") && (pointer_moved || left_down_edge)) {
-        std::string hl;
-        for (const std::string& id : hits) hl += id + " ";
-        std::fprintf(stderr, "[ptr] (%d,%d) moved=%d click=%d hits=%zu [%s] inter=%zu\n",
-                     in.mouse_x, in.mouse_y, pointer_moved ? 1 : 0,
-                     left_down_edge ? 1 : 0, hits.size(), hl.c_str(), interactive.size());
-        if (left_down_edge) {
-            for (const oa::render::Layer* l : scene_.draw_order()) {
-                if (l->event_handlers.empty()) continue;
-                size_t enabled_handlers = 0;
-                std::string handler_kinds;
-                for (const auto& [etype, h] : l->event_handlers) {
-                    if (h.enabled) ++enabled_handlers;
-                    handler_kinds += (h.enabled ? "+" : "-") + etype + ":" + h.handler + ",";
-                }
-                std::fprintf(stderr,
-                             "[ptr]   layer %s left=%.0f top=%.0f w=%.0f h=%.0f clip=%d "
-                             "visible=%.0f eff=%d handlers=%zu/%s\n",
-                             l->id.c_str(), l->left, l->top, l->width, l->height,
-                             l->has_clip ? 1 : 0, l->visible ? 1.0 : 0.0,
-                             scene_.is_effectively_visible(l->id) ? 1 : 0,
-                             enabled_handlers, handler_kinds.c_str());
-            }
-        }
-    }
+        if (scene().has_any_enabled_handler(id)) interactive.push_back(id);
 
     // event_dispatch_layers: top + penetration, reversed.
     auto dispatch_list = [&](const std::vector<std::string>& base,
                              const std::string& event_type) -> std::vector<std::string> {
         std::vector<std::string> out;
         for (size_t i = 0; i < base.size(); ++i) {
-            const auto* h = scene_.find_event_handler(base[i], event_type);
+            const auto* h = scene().find_event_handler(base[i], event_type);
             if (h && h->enabled && (i == 0 || h->penetration)) out.push_back(base[i]);
         }
         std::reverse(out.begin(), out.end());
         return out;
     };
 
-    // --- rollover/rollout hover set diff -----------------------------------
-    // hover membership is RECT-BASED, not occlusion-based. A
-    // hovered layer keeps its over state (no rollout) while the pointer stays
-    // inside its rect and the layer stays visible — a higher layer appearing
-    // under the pointer (e.g. the floating dock's buttons sliding up into the
-    // dockarea strip, ui/config mwdock) must not fire the lower layer's
-    // rollout, or the FPM dock-area state machine oscillates open/close (the
-    // "unpinned dock retracts on hover" defect). Rollout fires only when the
-    // pointer leaves the rect, or the layer hides/vanishes. New overs still
-    // dispatch topmost-first (plus penetration); retained members are not
-    // re-overed when the occluder leaves.
-    //
-    // the whole over/out diff runs only on POINTER MOTION
-    // (FPM dispatches hover events from pointer motion). On still-pointer
-    // frames nothing fires — a layer vanishing under a still pointer (e.g.
-    // NekoMiko's select exit deletes the choice rows while the queued exit
-    // chain exittrans -> select_clicknext is in flight) must not run game
-    // out-handlers: the rollout would run select_out, clearing scr.select.id,
-    // and the queued clicknext then indexes v[nil] -> select.lua:484 crash.
-    // Vanished members are still dropped from hovered_ so the set stays
-    // honest; their events fire later if the pointer moves off them.
-    std::set<std::string> prev_hovered = hovered_;
+    // Hover is rect-based; the diff runs only on pointer motion.
+    // Details: docs/RUNTIME_NOTES.md.
+    std::set<std::string> prev_hovered = pointer_.hovered_;
     if (pointer_moved) {
     std::set<std::string> hit_ids(hits.begin(), hits.end());
     const auto hover_list = dispatch_list(interactive, "rollover");
     std::set<std::string> new_hovered(hover_list.begin(), hover_list.end());
-    std::set<std::string> next = hovered_;
+    std::set<std::string> next = pointer_.hovered_;
     // (a) rollouts: hovered layers that left the pointer rect / disappeared
     std::vector<std::string> old_only;
-    for (const std::string& id : hovered_) {
+    for (const std::string& id : pointer_.hovered_) {
         if (new_hovered.count(id)) continue;
-        const oa::render::Layer* l = scene_.find(id);
+        const oa::render::Layer* l = scene().find(id);
         const bool still_visible =
-            l && l->visible && scene_.is_effectively_visible(id);
+            l && l->visible && scene().is_effectively_visible(id);
         if (hit_ids.count(id) && still_visible) continue; // retained
         old_only.push_back(id);
         next.erase(id);
     }
     std::sort(old_only.begin(), old_only.end());
     for (const std::string& old : old_only) {
-        const auto* row = scene_.find_event_handler(old, "rollout");
+        const auto* row = scene().find_event_handler(old, "rollout");
         if (row) dispatch_layer_row(old, *row, "rollout", {},
                                     PointerDispatch::Kind::HoverOut);
     }
     // (b) overs: topmost-first layers not hovered yet
     for (const std::string& id : hover_list) { // bottom -> top
-        if (hovered_.count(id)) continue;
-        const auto* row = scene_.find_event_handler(id, "rollover");
+        if (pointer_.hovered_.count(id)) continue;
+        const auto* row = scene().find_event_handler(id, "rollover");
         if (!row) continue;
         dispatch_layer_row(id, *row, "rollover", {}, PointerDispatch::Kind::HoverIn);
         next.insert(id);
     }
-    prev_hovered = hovered_;
-    hovered_ = std::move(next);
-    // ---- debug probe: hit-order / hover oscillation ----
-    if (std::getenv("OA_DEBUG_HOVQ")) {
-        bool dock_zone = false;
-        for (const std::string& id : hit_ids)
-            if (id == "1.80.mw.-1" || id.find("1.80.mw.bt.dc.1.11") == 0) {
-                dock_zone = true;
-                break;
-            }
-        if (dock_zone) {
-            int si = -1, bi = -1;
-            for (size_t i = 0; i < hits.size(); ++i) {
-                if (hits[i] == "1.80.mw.-1") si = int(i);
-                if (hits[i].find("1.80.mw.bt.dc.1.11") == 0) bi = int(i);
-            }
-            std::string hl, hh, hovn;
-            for (const auto& s : hover_list) { if (!hl.empty()) hl += ","; hl += s; }
-            for (const auto& s : prev_hovered) { if (!hh.empty()) hh += ","; hh += s; }
-            for (const auto& s : hovered_) { if (!hovn.empty()) hovn += ","; hovn += s; }
-            std::printf("[ph] ms=%llu nhits=%zu strip_idx=%d btn_idx=%d front=%s "
-                        "hl=[%s] prev=[%s] next=[%s] x=%d y=%d\n",
-                        (unsigned long long)now_ms(), hits.size(), si, bi,
-                        (hits.empty() ? std::string("(none)") : hits.front()).c_str(),
-                        hl.c_str(), hh.c_str(), hovn.c_str(), in.mouse_x, in.mouse_y);
-        }
-    }
+    prev_hovered = pointer_.hovered_;
+    pointer_.hovered_ = std::move(next);
     } else {
         // still pointer: no script events; silently forget vanished layers
         // (their rollout fires on a later move if the script still cares).
         bool changed = false;
-        for (auto it = hovered_.begin(); it != hovered_.end();) {
-            if (!scene_.find(*it)) {
-                it = hovered_.erase(it);
+        for (auto it = pointer_.hovered_.begin(); it != pointer_.hovered_.end();) {
+            if (!scene().find(*it)) {
+                it = pointer_.hovered_.erase(it);
                 changed = true;
             } else {
                 ++it;
@@ -2434,39 +2028,32 @@ GameRuntime::RuntimeState::PointerConsumption GameRuntime::RuntimeState::process
     // --- click + drag start  ------------------------------
     if (left_down_edge) {
         const std::string top_hover = interactive.empty() ? std::string() : interactive.front();
-        if (!top_hover.empty() && scene_.is_layer_draggable(top_hover) &&
-            key_has_drag_handler(scene_, top_hover)) {
+        if (!top_hover.empty() && scene().is_layer_draggable(top_hover) &&
+            key_has_drag_handler(scene(), top_hover)) {
             pc.drag_handled = drag_begin(top_hover, false);
         }
         if (!pc.drag_handled) {
             for (const std::string& id : dispatch_list(interactive, "click")) {
-                const auto* row = scene_.find_event_handler(id, "click");
+                const auto* row = scene().find_event_handler(id, "click");
                 if (!row) continue;
-                if (std::getenv("OA_NM_SELDBG")) {
-                    const auto it = row->params.find("function");
-                    std::fprintf(stderr, "[seldbg] t=%llu layer-click id=%s fn=%s\n",
-                                 (unsigned long long)now_ms_, id.c_str(),
-                                 it == row->params.end() ? "-"
-                                                         : it->second.c_str());
-                }
                 pc.layer_handled |= dispatch_layer_row(
                     id, *row, "click", {{"click", "1"}}, PointerDispatch::Kind::Click);
             }
         }
     }
-    if (in.left_down && pointer_moved && !drag_layer_.empty()) {
+    if (in.left_down && pointer_moved && !pointer_.drag_layer_.empty()) {
         drag_update(mx, my);
         pc.drag_handled = true;
     }
     if (left_up_edge) {
-        if (!drag_layer_.empty()) {
+        if (!pointer_.drag_layer_.empty()) {
             drag_end();
             pc.drag_handled = true;
         }
     }
 
     // --- global push handlers for every key-down edge  ----
-    std::vector<int> key_edges(down_edges_.begin(), down_edges_.end());
+    std::vector<int> key_edges(input_state_.down_edges_.begin(), input_state_.down_edges_.end());
     std::sort(key_edges.begin(), key_edges.end());
     for (const int key : key_edges) {
         bool cancel_park = false;
@@ -2475,15 +2062,7 @@ GameRuntime::RuntimeState::PointerConsumption GameRuntime::RuntimeState::process
         // the same key reach the push row.
         if (key == kKeyMouseRight || key == 27) {
             if (trigger_rclick()) continue;
-            // The framework's [exkey] ("extended key input wait") is built on
-            // a QUEUE-armed click wait: exkeyin enqueues
-            //   [keyconfig role=0 keys=124][chgmsg dummy][@][/chgmsg]
-            //   [calllua exkeyin_exit label=...]
-            // where key 124 = "any input". A cancel-key press (right button /
-            // ESC) must satisfy that wait, otherwise the CG viewer parked on
-            // [@] forever ("right-click freezes, menu buttons dead"). Normal
-            // script-armed [@] waits are unaffected (last_wait_from_queue is
-            // false there).
+            // Cancel key satisfies a queue-armed [exkey] click park.
             cancel_park = wait_ &&
                           (wait_->kind == oa::runtime::WaitReason::Kind::Generic ||
                            wait_->kind == oa::runtime::WaitReason::Kind::Generic0) &&
@@ -2494,39 +2073,28 @@ GameRuntime::RuntimeState::PointerConsumption GameRuntime::RuntimeState::process
         // click substitute (pc.role_advance feeds the clicked formula).
         if (handle_role_key_edge(key)) pc.role_advance = true;
         const std::string key_string = std::to_string(key);
-        const auto* row = scene_.get_input_handler("push", key_string);
+        const auto* row = scene().get_input_handler("push", key_string);
         if (!row) {
             // No push row (project registers no key handler for this key):
             // the cancel press still has to release the exkey park.
             if (cancel_park) pc.role_advance = true;
             continue;
         }
-        if (std::getenv("OA_NM_SELDBG") && key == kKeyMouseLeft) {
-            const auto it = row->params.find("function");
-            std::fprintf(stderr, "[seldbg] t=%llu push key1 fn=%s\n",
-                         (unsigned long long)now_ms_,
-                         it == row->params.end() ? "-" : it->second.c_str());
-        }
         const std::string event_type = is_mouse_button_key(key) ? "click" : "key";
         const bool handled = dispatch_input_row(
             "setonpush", *row,
             {{"key", key_string}, {"type", event_type}}, PointerDispatch::Kind::Push);
         if (key == kKeyMouseLeft && handled) pc.left_push_handled = true;
-        // The cancel press must ALSO run the script's own push row (the
-        // framework's setonpush_calllua records flg.keycode = key, so the
-        // queued [calllua exkeyin_exit label=...] can see it in
-        // csv.advkey.list.CANCEL and jump to the exit label). Releasing the
-        // wait WITHOUT the row made right-click behave like a left click —
-        // it advanced the CG viewer's 差分 counter instead of closing the
-        // viewer ("右键退出鉴赏没有反应").
+        // Cancel press also runs the push row so flg.keycode is recorded.
         if (cancel_park) pc.role_advance = true;
     }
     return pc;
 }
 
 void GameRuntime::RuntimeState::notify_pointer(const PointerDispatch& d) {
-    ++pointer_dispatch_count_;
-    if (pointer_observer_) pointer_observer_(d);
+    ++pointer_.pointer_dispatch_count_;
+    renderer_.request_repaint();
+    if (pointer_.pointer_observer_) pointer_.pointer_observer_(d);
 }
 
 bool GameRuntime::RuntimeState::dispatch_layer_row(
@@ -2547,21 +2115,7 @@ bool GameRuntime::RuntimeState::dispatch_layer_row(
     const auto fn_it = params.find("function");
     bool handled = true;
     bool fn_queued = false; // this row's fn enqueued >=1 engine tag
-    if (std::getenv("OA_POINTERDBG")) {
-        const auto n = params.find("name");
-        std::fprintf(stderr, "[ptr] row id=%s handler=%s fn=%s name=%s file=%s label=%s\n",
-                     id.c_str(), row.handler.c_str(),
-                     fn_it == params.end() ? "-" : fn_it->second.c_str(),
-                     n == params.end() ? "-" : n->second.c_str(), row.file.c_str(),
-                     row.label.c_str());
-    }
-    // handler="var" rows (the iMel framework's buttons): the row itself is a
-    // [var name=... data=...] assignment — button.iet registers its click as
-    //   lyevent type=click handler=var name=t.button_data data=<packed event>
-    //   file=system/button.iet label=pushed call=1
-    // and the *pushed macro then dispatches the packed file/label/call. Without
-    // this branch every click on a macro-built button (language choice, title
-    // menu, config rows) was a no-op.
+    // handler="var": apply the row's [var name data] assignment (iMel buttons).
     if (row.handler == "var") {
         const auto name_it = params.find("name");
         if (name_it != params.end() && !name_it->second.empty()) {
@@ -2595,11 +2149,7 @@ bool GameRuntime::RuntimeState::dispatch_layer_row(
         fn_queued = interpreter_->queued_tag_count() > q0;
         notify_pointer(d);
     }
-    // a row with file/label queues a navigation tag after the handler
-    // runs:
-    // `call` pushes a return frame so the target's [return] lands back at the
-    // origin ("inline" execution round trip); plain `jump` navigates
-    // permanently. Runs on the next tag drain.
+    // Queue navigation after the handler; call pushes a return frame.
     if (!row.file.empty() || !row.label.empty()) {
         // Protect the caller chain for this click's tag drain (see
         // Interpreter::set_return_floor).
@@ -2610,22 +2160,9 @@ bool GameRuntime::RuntimeState::dispatch_layer_row(
         interpreter_->enqueue_tag(row.call ? "call" : "jump", std::move(nav));
         handled = true;
     }
-    // a pure Lua handler (no file/label navigation) may queue a helper
-    // flow (fn.push/estag) that ends with a trailing [return]; arm the
-    // inline-event marker so that return pops the marker instead of a real
-    // parked frame. Attribution is strict:
-    // arm only when THIS row's fn actually enqueued tags (queued_tag_count
-    // delta) — tags queued by earlier rows of the same input frame (hover
-    // chains, other push handlers) must not arm a marker that would then be
-    // claimed by their navigation (stale-marker pattern).
+    // Arm the inline marker only when THIS row enqueued tags.
     if (fn_it != params.end() && !fn_it->second.empty() && row.file.empty() &&
         row.label.empty() && fn_queued) {
-        if (std::getenv("OA_SELTRACE")) {
-            std::fprintf(stderr,
-                         "[seltrace] ROW-FN layer=%s fn=%s kind=%d queued "
-                         "->begin_marker\n",
-                         id.c_str(), fn_it->second.c_str(), (int)kind);
-        }
         begin_inline_event_frame();
     }
     return handled;
@@ -2671,14 +2208,6 @@ bool GameRuntime::RuntimeState::dispatch_input_row(
     }
     if (fn_it != params.end() && !fn_it->second.empty() && row.file.empty() &&
         row.label.empty() && fn_queued) {
-        if (std::getenv("OA_SELTRACE")) {
-            std::fprintf(stderr,
-                         "[seltrace] INPUT-FN filter=%s fn=%s key=%s kind=%d "
-                         "queued ->begin_marker\n",
-                         filter_name.c_str(), fn_it->second.c_str(),
-                         params.count("key") ? params["key"].c_str() : "-",
-                         (int)kind);
-        }
         begin_inline_event_frame();
     }
     return handled;
@@ -2701,22 +2230,6 @@ bool GameRuntime::RuntimeState::inline_event_marker_active() const {
 void GameRuntime::RuntimeState::refresh_inline_event_frame() {
     if (!inline_event_frame_) return;
     if (!inline_event_marker_active()) {
-        // OA_SELTRACE: the synthetic marker frame left
-        // the interpreter stack — something popped it (a UI popfunc [return]
-        // rewound the stream to the recorded park). Print the drop with the
-        // remaining stack so the consuming return is attributable.
-        if (std::getenv("OA_SELTRACE")) {
-            const InlineEventFrame rec = *inline_event_frame_;
-            std::string cst;
-            const auto& cs = interpreter_->call_stack();
-            for (const auto& fr : cs)
-                cst += fr.script + ":" + std::to_string(fr.return_line) + " ";
-            std::fprintf(stderr,
-                         "[seltrace] MARKER-STALE marker=%s:%zu claimed=%d "
-                         "stackN=%zu stack[%s]\n",
-                         rec.script.c_str(), rec.line, rec.claimed_by_jump ? 1 : 0,
-                         cs.size(), cst.c_str());
-        }
         inline_event_frame_.reset();
     }
 }
@@ -2724,30 +2237,9 @@ void GameRuntime::RuntimeState::refresh_inline_event_frame() {
 void GameRuntime::RuntimeState::begin_inline_event_frame() {
     if (!interpreter_) return;
     refresh_inline_event_frame();
-    // Exactly one marker may be live at any time:
-    // an active marker either still protects its armed park (nested
-    // dispatches at the same park reuse it) or protects an in-flight helper
-    // flow (claimed by a jump, real frames above). A second synthetic frame
-    // would stack markers unboundedly, so never arm on top of one. Stale
-    // records are dropped before this point by refresh (marker frame left the
-    // stack) and by settle (reclaim rules); whatever
-    // remains is genuinely live and must not be duplicated.
+    // Single marker: never arm on top of a live one.
     if (inline_event_frame_) {
-        // stale-marker reclaim. A
-        // marker armed at the game's select-[stop] park (system/script.asb
-        // line 0) and later CLAIMED by the select-exit chain's jump survives
-        // the story's navigation away from that park (select_exit ->
-        // gotoScript next chapter never [return]s to the park): it stays on
-        // the interpreter stack as a zombie frame pointing at a CONSUMED
-        // park. The next UI session's popfunc01 [return] then pops that
-        // zombie and rewinds the stream to the dead select park
-        // (select.lua:482 crash: exittrans guard skips, unguarded clicknext
-        // runs with scr.select=nil). A later inline handler at a DIFFERENT
-        // park with nothing in flight above the marker (no helper frames, no
-        // queued tags) proves the old park was abandoned — drop the zombie
-        // frame and arm the new marker at the current park instead, making
-        // the UI-session [return] land on the live park exactly as in a
-        // select-free journey.
+        // Reclaim a zombie select-park marker before arming a new one.
         bool dropped = false;
         if (inline_event_frame_->claimed_by_jump) {
             const InlineEventFrame rec = *inline_event_frame_;
@@ -2771,8 +2263,7 @@ void GameRuntime::RuntimeState::begin_inline_event_frame() {
                 cs.size() == rec.stack.size() + 1;
             if (rec_is_select_park && !at_same_park && anchor_park &&
                 nothing_above) {
-                // defensive: confirm the frame at the recorded index is the
-                // marker before erasing (refresh already validated it)
+                // Confirm the recorded frame is still the marker.
                 if (cs.size() > rec.stack.size() &&
                     cs[rec.stack.size()].script == rec.script &&
                     cs[rec.stack.size()].return_line == rec.line) {
@@ -2781,53 +2272,15 @@ void GameRuntime::RuntimeState::begin_inline_event_frame() {
                     inline_event_frame_.reset();
                     interpreter_->set_call_stack(std::move(cs2));
                     dropped = true;
-                    if (std::getenv("OA_SELTRACE")) {
-                        std::string cst;
-                        const auto& cs3 = interpreter_->call_stack();
-                        for (const auto& fr : cs3)
-                            cst += fr.script + ":" +
-                                   std::to_string(fr.return_line) + " ";
-                        std::fprintf(stderr,
-                                     "[seltrace] MARKER-DROP zombie=%s:%zu "
-                                     "newpark=%s:%zu stackN=%zu stack[%s]\n",
-                                     rec.script.c_str(), rec.line,
-                                     cur ? cur->c_str() : "?",
-                                     interpreter_->current_line(), cs3.size(),
-                                     cst.c_str());
-                    }
                 }
             }
         }
         if (!dropped) {
-            // OA_SELTRACE: one marker is already live
-            // — a second inline handler at the same park reuses it.
-            if (std::getenv("OA_SELTRACE")) {
-                const InlineEventFrame rec = *inline_event_frame_;
-                std::string cst;
-                const auto& cs = interpreter_->call_stack();
-                for (const auto& fr : cs)
-                    cst += fr.script + ":" + std::to_string(fr.return_line) + " ";
-                const std::string* cur = interpreter_->current_script();
-                std::fprintf(stderr,
-                             "[seltrace] MARKER-SKIP live=%s:%zu claimed=%d "
-                             "want=%s:%zu stackN=%zu stack[%s]\n",
-                             rec.script.c_str(), rec.line,
-                             rec.claimed_by_jump ? 1 : 0,
-                             cur ? cur->c_str() : "?",
-                             interpreter_->current_line(), cs.size(), cst.c_str());
-            }
             return;
         }
         // zombie dropped: fall through and arm the marker at the current park
     }
-    // Arm only at user-input anchor parks. The helper flows that need marker
-    // protection (FPM fn.push/estag UI windows, title/btn navigation) run
-    // from [stop]/Generic/Generic0 click parks. Transient timed-wait parks
-    // ([wt]-style rows of an in-flight estag chain, media/transition rows)
-    // already carry real call frames of their own chain; a synthetic frame
-    // there shifts the chain's return balance and the framework's row
-    // advance skips the batch [return] (real-fpm media_fpm_probe movie
-    // crash). Timed input=2 (skip) parks are still anchors.
+    // Arm only at input anchor parks (Stop/Generic/Generic0/Timed input=2).
     if (wait_) {
         switch (wait_->kind) {
             case oa::runtime::WaitReason::Kind::Stop:
@@ -2847,56 +2300,14 @@ void GameRuntime::RuntimeState::begin_inline_event_frame() {
     std::vector<oa::runtime::CallFrame> stack = interpreter_->call_stack();
     std::vector<oa::runtime::CallFrame> with_marker = stack;
     with_marker.push_back(oa::runtime::CallFrame{*script, line});
-    // OA_SELTRACE: the synthetic marker frame push —
-    // invisible to the interpreter flush/inline probes (set_call_stack
-    // rewrite). A marker {system/script.asb:0} is the 482 resurrection
-    // frame candidate (popped later by the save-UI popfunc01 [return]).
-    if (std::getenv("OA_SELTRACE")) {
-        std::string cst;
-        for (const auto& fr : stack)
-            cst += fr.script + ":" + std::to_string(fr.return_line) + " ";
-        std::string wdesc = "nowait";
-        if (wait_) {
-            switch (wait_->kind) {
-                case oa::runtime::WaitReason::Kind::Stop: wdesc = "stop:" + wait_->id; break;
-                case oa::runtime::WaitReason::Kind::Generic: wdesc = "generic"; break;
-                case oa::runtime::WaitReason::Kind::Generic0: wdesc = "generic0"; break;
-                case oa::runtime::WaitReason::Kind::Timed: wdesc = "timed"; break;
-                default: wdesc = "other"; break;
-            }
-        }
-        std::fprintf(stderr,
-                     "[seltrace] MARKER-ARM marker=%s:%zu wait=%s stackN=%zu "
-                     "stack[%s]\n",
-                     script->c_str(), line, wdesc.c_str(), stack.size(),
-                     cst.c_str());
-    }
-    // Rewrite ONLY the call stack (push the synthetic marker frame): the
-    // recorded script/line IS the current position, so restore_position's
-    // position write is a no-op while its two flag resets are not.
-    // restore_position clears last_wait_from_queue_, and when the marker is
-    // armed while the interpreter is parked on a QUEUE-sourced wait that loses
-    // the "this wait came from the queue" bookkeeping. When the wait then
-    // resolves, next_line() advances the script line instead of standing
-    // still, the parked chain skips one row, its trailing [return] unwinds
-    // past its caller and the page's [stop] is never armed: the UI page stays
-    // on screen while the boot/game walks on beneath it and no click can
-    // reach its buttons any more. set_call_stack is the documented
-    // stack-only mutation the settle/teardown paths already use.
+    // Stack-only mutation: restore_position would clear queue-wait flags.
     interpreter_->set_call_stack(with_marker);
     inline_event_frame_ = InlineEventFrame{*script, line, std::move(stack), false};
 }
 
 void GameRuntime::RuntimeState::settle_inline_event_frame(bool paused, bool has_queued, bool saw_call,
                                             bool saw_jump) {
-    // settle = full marker lifecycle. Stack mutations happen ONLY under the
-    // same precise
-    // conditions as the arm path and only after marker_active confirms the
-    // marker
-    // frame still sits at its recorded index — arbitrary restore/erase/drop
-    // here corrupted queued media/estag flows (real-fpm media_fpm_probe movie
-    // replay crash) because they removed frames a live return chain
-    // still depended on; the conditions below never do that.
+    // Settle mutates only when the marker is still at its recorded index.
     if (!interpreter_ || !inline_event_frame_) return;
     if (!inline_event_marker_active()) {
         // The marker frame left the stack: the helper's own trailing
@@ -2907,67 +2318,20 @@ void GameRuntime::RuntimeState::settle_inline_event_frame(bool paused, bool has_
     }
     const InlineEventFrame rec = *inline_event_frame_;
     if (saw_call && !rec.claimed_by_jump) {
-        // A queued [call] from this helper established a REAL return frame
-        // above the synthetic marker: that frame now protects the parked
-        // position, the marker is redundant. Remove only the marker and
-        // leave the call frame intact. The interpreter
-        // position is unchanged (it may be parked mid-flow inside the
-        // callee); rewrite the stack only — restore_position would also
-        // clear last_wait_from_queue_/arrived_by_jump_, corrupting the
-        // parked wait's resolution (see the teardown note below).
+        // A real [call] frame protects the park; drop only the marker.
         std::vector<oa::runtime::CallFrame> cs = interpreter_->call_stack();
         cs.erase(cs.begin() + rec.stack.size()); // index validated above
         inline_event_frame_.reset();
         interpreter_->set_call_stack(std::move(cs));
         return;
     }
-    // Lua UI helpers commonly enqueue a jump to system/script.asb
-    // (fn.push/popfuncNN, estag chains): the marker is then the helper's ONLY
-    // way back to the park — claim it so later drains (hover lyprop, nested
-    // waits) keep it alive across the helper's own waits.
+    // A jump makes the marker the helper's only way back; claim it.
     if (saw_jump) inline_event_frame_->claimed_by_jump = true;
     if (inline_event_frame_->claimed_by_jump || paused || has_queued) {
-        // OA_SELTRACE: the marker is retained (claimed
-        // by a helper jump / paused / tags behind). A marker retained while
-        // the Lua story navigates away (select_exit -> chapter gotoScript)
-        // stays on the interpreter stack as a stale {park} frame until a UI
-        // popfunc [return] pops it — the 482 resurrection chain.
-        if (std::getenv("OA_SELTRACE")) {
-            const InlineEventFrame _rec = *inline_event_frame_;
-            std::string cst;
-            const auto& cs = interpreter_->call_stack();
-            for (const auto& fr : cs)
-                cst += fr.script + ":" + std::to_string(fr.return_line) + " ";
-            std::fprintf(stderr,
-                         "[seltrace] MARKER-KEEP marker=%s:%zu claimed=%d "
-                         "paused=%d queued=%d stackN=%zu stack[%s]\n",
-                         _rec.script.c_str(), _rec.line,
-                         inline_event_frame_->claimed_by_jump ? 1 : 0,
-                         paused ? 1 : 0, has_queued ? 1 : 0, cs.size(), cst.c_str());
-        }
         return;
     }
-    // The drain consumed the helper's tags without any pause or navigation
-    // and nothing is queued behind: nothing will ever pop the marker (the
-    // parked position did not move and no helper flow is running on it).
-    // Tear it down and restore the pre-arm stack. The
-    // drain was stationary, so the parked position already equals the
-    // recorded park — set_call_stack (stack only) is the exact mutation:
-    // restore_position would additionally reset the interpreter's
-    // last_wait_from_queue_ (a parked queue-wait's next_line then skips
-    // the wait row instead of resuming it) and arrived_by_jump_.
+    // Nothing can pop the marker: tear it down and restore the pre-arm stack.
     inline_event_frame_.reset();
-    if (std::getenv("OA_SELTRACE")) {
-        std::string cst;
-        const auto& cs = interpreter_->call_stack();
-        for (const auto& fr : cs)
-            cst += fr.script + ":" + std::to_string(fr.return_line) + " ";
-        std::fprintf(stderr,
-                     "[seltrace] MARKER-TEARDOWN marker=%s:%zu stackN=%zu "
-                     "stack[%s] ->restoreN=%zu\n",
-                     rec.script.c_str(), rec.line, cs.size(), cst.c_str(),
-                     rec.stack.size());
-    }
     interpreter_->set_call_stack(rec.stack);
 }
 
@@ -2978,14 +2342,14 @@ void GameRuntime::RuntimeState::force_pointer_drag(const std::string& layer_id) 
 
 bool GameRuntime::RuntimeState::drag_begin(const std::string& layer_id, bool forced) {
     (void)forced; // forced = [lydrag]: already checked by the caller
-    const auto offset = scene_.layer_offset(layer_id);
+    const auto offset = scene().layer_offset(layer_id);
     if (!offset) return false;
-    drag_layer_ = layer_id;
-    drag_start_mouse_x_ = double(mouse_x_);
-    drag_start_mouse_y_ = double(mouse_y_);
-    drag_origin_left_ = offset->first;
-    drag_origin_top_ = offset->second;
-    const auto* row = scene_.find_event_handler(layer_id, "dragin");
+    pointer_.drag_layer_ = layer_id;
+    pointer_.drag_start_mouse_x_ = double(input_state_.mouse_x_);
+    pointer_.drag_start_mouse_y_ = double(input_state_.mouse_y_);
+    pointer_.drag_origin_left_ = offset->first;
+    pointer_.drag_origin_top_ = offset->second;
+    const auto* row = scene().find_event_handler(layer_id, "dragin");
     if (row)
         dispatch_layer_row(layer_id, *row, "dragin",
                            {{"drag", "1"}, {"id", layer_id}}, PointerDispatch::Kind::DragIn);
@@ -2993,52 +2357,34 @@ bool GameRuntime::RuntimeState::drag_begin(const std::string& layer_id, bool for
 }
 
 void GameRuntime::RuntimeState::drag_update(double mx, double my) {
-    if (drag_layer_.empty()) return;
-    const double dx = mx - drag_start_mouse_x_;
-    const double dy = my - drag_start_mouse_y_;
+    if (pointer_.drag_layer_.empty()) return;
+    const double dx = mx - pointer_.drag_start_mouse_x_;
+    const double dy = my - pointer_.drag_start_mouse_y_;
     double left = 0, top = 0;
-    if (!scene_.drag_layer_to(drag_layer_, drag_origin_left_, drag_origin_top_, dx, dy, &left,
+    if (!scene().drag_layer_to(pointer_.drag_layer_, pointer_.drag_origin_left_, pointer_.drag_origin_top_, dx, dy, &left,
                               &top)) {
-        drag_layer_.clear();
+        pointer_.drag_layer_.clear();
         return;
     }
-    const auto* row = scene_.find_event_handler(drag_layer_, "drag");
+    const auto* row = scene().find_event_handler(pointer_.drag_layer_, "drag");
     if (row)
-        dispatch_layer_row(drag_layer_, *row, "drag",
-                           {{"drag", "1"}, {"id", drag_layer_}},
+        dispatch_layer_row(pointer_.drag_layer_, *row, "drag",
+                           {{"drag", "1"}, {"id", pointer_.drag_layer_}},
                            PointerDispatch::Kind::DragMove);
 }
 
 void GameRuntime::RuntimeState::drag_end() {
-    if (drag_layer_.empty()) return;
-    const auto* row = scene_.find_event_handler(drag_layer_, "dragout");
+    if (pointer_.drag_layer_.empty()) return;
+    const auto* row = scene().find_event_handler(pointer_.drag_layer_, "dragout");
     if (row)
-        dispatch_layer_row(drag_layer_, *row, "dragout",
-                           {{"drag", "0"}, {"id", drag_layer_}},
+        dispatch_layer_row(pointer_.drag_layer_, *row, "dragout",
+                           {{"drag", "0"}, {"id", pointer_.drag_layer_}},
                            PointerDispatch::Kind::DragOut);
-    drag_layer_.clear();
+    pointer_.drag_layer_.clear();
 }
 
-// ===========================================================================
-// Control domain（原 runtime_control.cpp 并入本 TU；"小接口，大文件"）
-//    ——输入/模式状态机：keyconfig 角色表、[rclick]/[hide]/
-//    [skip]/[automode]/[exec]/[mouse] 配置标签、命令 skip 与 automode 状态机、
-//    控制键 skip、隐藏模式。
-// Condensed input/process state machine over the surfaces the FPM
-// actually drives:
-//   - keyconfig role table (0 = advance, 3/4 = hide in/out,
-//     5/6 = backlog, 9-11 = automode, 12/13 = skip, 14 = control-skip,
-//     15/16 = avoid placeholder) with default assignments;
-//   - command skip ([skip allow] + [exec command=skip]) and automode
-//     ([automode allow] + [exec command=automode]) state machines that fire
-//     the registered mode input handlers (commandskipin/out, automodein/out);
-//   - control-skip: role-14 key held (Ctrl default / csv.advkey.ctrl in FPM)
-//     engages an effective skip while held; transitions fire controlskipin/out;
-//   - [rclick allow/file] config + engine right-click chain for keys 2/27
-//     (hide-mode recovery first, then the rclick script as a call/jump);
-//   - [hide allow/window] config + hide mode (window layers hidden, a left
-//     click recovers and swallows the click, hidein/hideout events).
-// ===========================================================================
+// Control domain: keyconfig roles, skip/automode, control-skip, rclick, hide.
+// Details: docs/RUNTIME_NOTES.md.
 namespace {
 
 // keyconfig role numbers (docs/tag/system/keyconfig.md / ROLE_*).
@@ -3081,23 +2427,19 @@ void GameRuntime::RuntimeState::apply_keyconfig(const std::map<std::string, std:
         }
         keys.erase(-1);
     }
-    keymap_[role] = std::move(keys);
+    control_.keymap_[role] = std::move(keys);
 }
 
 bool GameRuntime::RuntimeState::has_role(int role, int key) const {
-    const auto it = keymap_.find(role);
-    return it != keymap_.end() && it->second.count(key) > 0;
+    const auto it = control_.keymap_.find(role);
+    return it != control_.keymap_.end() && it->second.count(key) > 0;
 }
 
 bool GameRuntime::RuntimeState::key_is_toggle(int key, int other_role) const {
-    return keymap_.count(other_role) > 0 && keymap_.at(other_role).count(key) > 0;
+    return control_.keymap_.count(other_role) > 0 && control_.keymap_.at(other_role).count(key) > 0;
 }
 
-/// keyconfig role edge processing. Returns whether the key acted as a
-/// role-0 advance.
-/// Roles are populated only by [keyconfig] tags (FPM configures every role
-/// it uses at boot); no default assignment is assumed so the
-/// previous behavior is preserved until a script opts in.
+/// Role edge; true when the key acted as role-0 advance.
 bool GameRuntime::RuntimeState::handle_role_key_edge(int key) {
     if (has_role(kRoleAdvance, key)) return true;
     if (has_role(kRoleHideIn, key)) {
@@ -3137,32 +2479,20 @@ bool GameRuntime::RuntimeState::handle_role_key_edge(int key) {
 // ---------------------------------------------------------------------------
 void GameRuntime::RuntimeState::apply_rclick_config(const std::map<std::string, std::string>& params) {
     const auto allow_it = params.find("allow");
-    if (allow_it != params.end()) rclick_allowed_ = parse_i32(allow_it->second, 1) != 0;
+    if (allow_it != params.end()) control_.rclick_allowed_ = parse_i32(allow_it->second, 1) != 0;
     const auto file_it = params.find("file");
-    if (file_it != params.end() && !file_it->second.empty()) rclick_file_ = file_it->second;
+    if (file_it != params.end() && !file_it->second.empty()) control_.rclick_file_ = file_it->second;
 }
-// ---------------------------------------------------------------------------
-// [mouse left top] — pointer-warp request ([mouse] config tag). The FPM
-// confirm-dialog flow moves the REAL pointer onto the default (YES) button:
-// dialog.lua yesno_active -> adv.lua mouse_autocursor issues 10 eased [mouse]
-// tags, each landing one step closer to the button center, then btn_active2
-// focuses the button. The engine pointer is always FrameInput-driven (SDL
-// motion events); this only requests the host to warp the OS cursor
-// (SDL_WarpMouseInWindow). SDL then synthesizes real mouse-motion feedback,
-// so rollover/rollout/click dispatch keeps running on the normal chain.
-// Before this handler existed the [mouse] tag was a parse-only no-op and the
-// cursor stayed where the user last left it (exit-dialog mouse-autocursor
-// alignment — user feedback).
-// ---------------------------------------------------------------------------
+// [mouse left top] — request an OS cursor warp (host hook).
 void GameRuntime::RuntimeState::apply_mouse_config(const std::map<std::string, std::string>& params) {
     // A live drag owns the pointer: never warp mid-drag (defensive; the FPM
     // dialog path disables drags first via sliderdrag_stat(0)).
-    if (!drag_layer_.empty()) return;
+    if (!pointer_.drag_layer_.empty()) return;
     const auto left_it = params.find("left");
     const auto top_it = params.find("top");
     if (left_it == params.end() && top_it == params.end()) return;
-    int x = mouse_x_;
-    int y = mouse_y_;
+    int x = input_state_.mouse_x_;
+    int y = input_state_.mouse_y_;
     if (left_it != params.end()) x = parse_i32(left_it->second, x);
     if (top_it != params.end()) y = parse_i32(top_it->second, y);
     // Clamp into the stage (defensive: official callers only send button
@@ -3171,23 +2501,23 @@ void GameRuntime::RuntimeState::apply_mouse_config(const std::map<std::string, s
     const int sh = rt_->project_.config.stage_height;
     if (sw > 0) x = std::clamp(x, 0, sw - 1);
     if (sh > 0) y = std::clamp(y, 0, sh - 1);
-    pointer_warp_x_ = x;
-    pointer_warp_y_ = y;
-    pointer_warp_pending_ = true;
-    ++pointer_warp_requests_;
-    if (pointer_warp_cb_) pointer_warp_cb_(x, y);
+    pointer_.pointer_warp_x_ = x;
+    pointer_.pointer_warp_y_ = y;
+    pointer_.pointer_warp_pending_ = true;
+    ++pointer_.pointer_warp_requests_;
+    if (pointer_.pointer_warp_cb_) pointer_.pointer_warp_cb_(x, y);
 }
 
 bool GameRuntime::RuntimeState::trigger_rclick() {
     if (!interpreter_) return false;
     // hide mode: a right click first recovers the message window (no menu).
-    if (hide_active_) {
+    if (control_.hide_active_) {
         exit_hide_mode();
         return true;
     }
-    if (!rclick_allowed_) return false;
+    if (!control_.rclick_allowed_) return false;
     const std::string file =
-        rclick_file_.empty() ? std::string("rclick.iet") : rclick_file_;
+        control_.rclick_file_.empty() ? std::string("rclick.iet") : control_.rclick_file_;
     // Already inside the rclick script: jump to its "leave" label (its return
     // comes back to the pre-rclick position —  approximation).
     const std::string* cur = interpreter_->current_script();
@@ -3210,12 +2540,12 @@ void GameRuntime::RuntimeState::apply_hide_config(const std::map<std::string, st
     const auto allow_it = params.find("allow");
     if (allow_it != params.end()) {
         const bool allow = parse_i32(allow_it->second, 1) != 0;
-        if (!allow && hide_active_) exit_hide_mode();
-        hide_allowed_ = allow;
+        if (!allow && control_.hide_active_) exit_hide_mode();
+        control_.hide_allowed_ = allow;
     }
     const auto win_it = params.find("window");
     if (win_it != params.end()) {
-        hide_window_.clear();
+        control_.hide_window_.clear();
         std::string raw = win_it->second;
         size_t pos = 0;
         while (pos < raw.size()) {
@@ -3227,7 +2557,7 @@ void GameRuntime::RuntimeState::apply_hide_config(const std::map<std::string, st
             const auto b = tok.find_first_not_of(" \t\r\n");
             const auto en = tok.find_last_not_of(" \t\r\n");
             tok = (b == std::string::npos) ? "" : tok.substr(b, en - b + 1);
-            if (!tok.empty()) hide_window_.push_back(tok);
+            if (!tok.empty()) control_.hide_window_.push_back(tok);
             if (comma == std::string::npos) break;
             pos = comma + 1;
         }
@@ -3235,35 +2565,35 @@ void GameRuntime::RuntimeState::apply_hide_config(const std::map<std::string, st
 }
 
 void GameRuntime::RuntimeState::apply_hide_visibility(bool hidden) {
-    for (const std::string& wid : hide_window_) {
-        const oa::render::Layer* l = scene_.find(wid);
+    for (const std::string& wid : control_.hide_window_) {
+        const oa::render::Layer* l = scene().find(wid);
         if (!l) continue;
         const bool visible_now = l->visible != 0.0;
         if (hidden) {
-            if (!hide_snapshot_.count(wid)) hide_snapshot_[wid] = visible_now;
-            if (visible_now) scene_.set_props(wid, {{"visible", "0"}});
+            if (!control_.hide_snapshot_.count(wid)) control_.hide_snapshot_[wid] = visible_now;
+            if (visible_now) scene().set_props(wid, {{"visible", "0"}});
         } else {
-            const bool was_visible = hide_snapshot_.count(wid) ? hide_snapshot_[wid] : true;
-            hide_snapshot_.erase(wid);
-            if (was_visible && !visible_now) scene_.set_props(wid, {{"visible", "1"}});
+            const bool was_visible = control_.hide_snapshot_.count(wid) ? control_.hide_snapshot_[wid] : true;
+            control_.hide_snapshot_.erase(wid);
+            if (was_visible && !visible_now) scene().set_props(wid, {{"visible", "1"}});
         }
     }
 }
 
 void GameRuntime::RuntimeState::toggle_hide_mode() {
-    if (hide_active_) {
+    if (control_.hide_active_) {
         exit_hide_mode();
     } else {
-        if (!hide_allowed_) return;
-        hide_active_ = true;
+        if (!control_.hide_allowed_) return;
+        control_.hide_active_ = true;
         apply_hide_visibility(true);
         dispatch_mode_input("hidein");
     }
 }
 
 void GameRuntime::RuntimeState::exit_hide_mode() {
-    if (!hide_active_) return;
-    hide_active_ = false;
+    if (!control_.hide_active_) return;
+    control_.hide_active_ = false;
     apply_hide_visibility(false);
     dispatch_mode_input("hideout");
 }
@@ -3273,26 +2603,26 @@ void GameRuntime::RuntimeState::exit_hide_mode() {
 // (set_skip_mode/set_automode_mode, apply_skip_config/apply_automode_config)
 // ---------------------------------------------------------------------------
 void GameRuntime::RuntimeState::reveal_all_text() {
-    if (!text_.is_reveal_complete()) text_.reveal_all();
+    if (!text().is_reveal_complete()) text().reveal_all();
 }
 
 void GameRuntime::RuntimeState::dispatch_mode_input(const std::string& event_name) {
     // Mode handlers register under (event, "") via [setonautomodein] etc.
     // ( input_handlers; enqueue_mode_input_handler ).
-    const auto* row = scene_.get_input_handler(event_name, "");
+    const auto* row = scene().get_input_handler(event_name, "");
     if (!row) return;
     dispatch_input_row("seton" + event_name, *row, {{"type", event_name}},
                        PointerDispatch::Kind::Push);
 }
 
 void GameRuntime::RuntimeState::set_skip_mode(bool enabled) {
-    if (enabled && !skip_allowed_) return;
+    if (enabled && !control_.skip_allowed_) return;
     if (enabled && automode_active()) set_automode_mode(false);
     const bool was_active = skip_active();
-    skip_enabled_ = enabled;
+    control_.skip_enabled_ = enabled;
     const bool now_active = skip_active();
     if (was_active == now_active) return;
-    auto_elapsed_ms_ = 0;
+    control_.auto_elapsed_ms_ = 0;
     if (!now_active) {
         reveal_all_text(); // reveal on skip exit so new text is not stuck
     }
@@ -3300,16 +2630,16 @@ void GameRuntime::RuntimeState::set_skip_mode(bool enabled) {
 }
 
 void GameRuntime::RuntimeState::set_automode_mode(bool enabled) {
-    if (enabled && !automode_allowed_) return;
+    if (enabled && !control_.automode_allowed_) return;
     if (enabled && skip_active()) set_skip_mode(false);
     const bool was_active = automode_active();
-    automode_ = enabled;
+    control_.automode_ = enabled;
     if (was_active == automode_active()) return;
-    auto_elapsed_ms_ = 0;
+    control_.auto_elapsed_ms_ = 0;
     // leaving automode drops the voice-sync gate — the Lua side
     // (autoskip.lua) also clears it with [automode syncse=""], this makes the
     // native exec path symmetric so a later native re-entry starts ungated.
-    if (!automode_active()) automode_syncse_.clear();
+    if (!automode_active()) control_.automode_syncse_.clear();
     dispatch_mode_input(automode_active() ? "automodein" : "automodeout");
 }
 
@@ -3318,11 +2648,11 @@ void GameRuntime::RuntimeState::update_control_skip_hold(const std::set<int>& ke
     const bool held = std::any_of(keys_down.begin(), keys_down.end(),
                                   [this](int k) { return has_role(kRoleControlSkip, k); });
     const bool was_effective = control_skip_effective();
-    if (!held) control_skip_blocked_ = false;
-    control_skip_pressed_ = held;
+    if (!held) control_.control_skip_blocked_ = false;
+    control_.control_skip_pressed_ = held;
     const bool now_effective = control_skip_effective();
     if (was_effective == now_effective) return;
-    auto_elapsed_ms_ = 0;
+    control_.auto_elapsed_ms_ = 0;
     if (!now_effective) reveal_all_text();
     dispatch_mode_input(now_effective ? "controlskipin" : "controlskipout");
 }
@@ -3337,9 +2667,9 @@ void GameRuntime::RuntimeState::apply_skip_config(const std::map<std::string, st
         if (!allow) {
             if (skip_active()) set_skip_mode(false);
             // a held role-14 key is blocked until it is released
-            control_skip_blocked_ = control_skip_pressed_;
+            control_.control_skip_blocked_ = control_.control_skip_pressed_;
         }
-        skip_allowed_ = allow;
+        control_.skip_allowed_ = allow;
     }
     // unread stop-to-skip ([skip unread]) is not ported.
 }
@@ -3349,17 +2679,11 @@ void GameRuntime::RuntimeState::apply_automode_config(const std::map<std::string
     if (allow_it != params.end()) {
         const bool allow = parse_i32(allow_it->second, 1) != 0;
         if (!allow && automode_active()) set_automode_mode(false);
-        automode_allowed_ = allow;
+        control_.automode_allowed_ = allow;
     }
-    // syncse is the FPM-family voice-sync contract, NOT Lua-only
-    // bookkeeping. At every automode click park the Lua layer queues
-    // [automode syncse=<current voice ids>] (conf.autostop==1) and clears it
-    // (syncse="") on page release / automode stop; the engine gates the auto
-    // page flip on those channels (resolve_wait Generic/Generic0 +
-    // automode_sync_blocked). stopbyclick/stopbystop stay Lua-side (the Lua
-    // flow stops automode itself on input/stop rows).
+    // syncse: automode flip waits for these voice ids to stop.
     const auto sync_it = params.find("syncse");
-    if (sync_it != params.end()) automode_syncse_ = sync_it->second;
+    if (sync_it != params.end()) control_.automode_syncse_ = sync_it->second;
 }
 
 void GameRuntime::RuntimeState::apply_exec_command(const std::map<std::string, std::string>& params) {
@@ -3370,13 +2694,13 @@ void GameRuntime::RuntimeState::apply_exec_command(const std::map<std::string, s
     const bool has_mode = mode_it != params.end();
     const int mode = has_mode ? parse_i32(mode_it->second, 1) : 0;
     if (command == "skip") {
-        set_skip_mode(has_mode ? mode != 0 : !skip_enabled_);
+        set_skip_mode(has_mode ? mode != 0 : !control_.skip_enabled_);
     } else if (command == "automode") {
         set_automode_mode(has_mode ? mode != 0 : !automode_active());
     } else if (command == "rclick") {
         if (!trigger_rclick()) {
             // fall back to the push key=2 chain ( enqueue_exec_input)
-            const auto* row = scene_.get_input_handler("push", "2");
+            const auto* row = scene().get_input_handler("push", "2");
             if (row) dispatch_input_row("setonpush", *row,
                                         {{"key", "2"}, {"type", "click"}},
                                         PointerDispatch::Kind::Push);
@@ -3424,6 +2748,462 @@ bool GameRuntime::RuntimeState::apply_control_config(const oa::runtime::Event& e
         return true;
     }
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// Host input (SDL conversion already done in main.cpp)
+// ---------------------------------------------------------------------------
+namespace {
+
+void input_begin_frame(HostInput& in)
+{
+    in.frame.keys_down = in.kbd_down;
+    for (const int mk : in.mouse_held) in.frame.keys_down.insert(mk);
+    in.frame.left_down = in.left_down;
+    in.frame.left_click_edge = in.left_pressed;
+    in.left_pressed = false;
+    in.frame.keys_down.insert(in.frame.key_down_edges.begin(),
+                              in.frame.key_down_edges.end());
+
+    for (auto it = in.wheel_hold_frames.begin(); it != in.wheel_hold_frames.end();) {
+        const int vk = it->first;
+        if (it->second > 0) {
+            in.frame.keys_down.insert(vk);
+            --it->second;
+            if (it->second == 0) in.frame.key_up_edges.push_back(vk);
+            ++it;
+        } else {
+            it = in.wheel_hold_frames.erase(it);
+        }
+    }
+}
+
+void input_end_frame(HostInput& in)
+{
+    in.frame.key_down_edges.clear();
+    in.frame.key_up_edges.clear();
+}
+
+} // namespace
+
+void GameRuntime::RuntimeState::key_event(int vk, bool down)
+{
+    if (vk <= 0) return;
+    if (down) {
+        if (input_.kbd_down.insert(vk).second)
+            input_.frame.key_down_edges.push_back(vk);
+    } else if (input_.kbd_down.erase(vk) > 0) {
+        input_.frame.key_up_edges.push_back(vk);
+    }
+}
+
+void GameRuntime::RuntimeState::mouse_move(float window_x, float window_y)
+{
+    float x = window_x, y = window_y;
+    if (renderer_.get_renderer_coordinates(window_x, window_y, &x, &y)) {
+        input_.frame.mouse_x = int(x);
+        input_.frame.mouse_y = int(y);
+    } else {
+        input_.frame.mouse_x = int(window_x);
+        input_.frame.mouse_y = int(window_y);
+    }
+}
+
+void GameRuntime::RuntimeState::mouse_button(int vk, bool down)
+{
+    if (vk == 1) {
+        input_.left_down = down;
+        if (down) input_.left_pressed = true;
+    } else if (vk == 2 || vk == 3) {
+        if (down) {
+            if (input_.mouse_held.insert(vk).second)
+                input_.frame.key_down_edges.push_back(vk);
+        } else if (input_.mouse_held.erase(vk) > 0) {
+            input_.frame.key_up_edges.push_back(vk);
+        }
+    }
+}
+
+void GameRuntime::RuntimeState::mouse_wheel(int direction)
+{
+    if (direction == 0) return;
+    const int vk = direction > 0 ? 136 : 137;
+    input_.frame.key_down_edges.push_back(vk);
+    input_.wheel_hold_frames[vk] = 2;
+}
+
+void GameRuntime::RuntimeState::finish_frame()
+{
+    // Host path only: apply the events this tick queued, then render. Tests
+    // using tick(delta, FrameInput) drain manually and never reach this.
+    while (!pending_events_.empty()) {
+        const Event e = pending_events_.front();
+        pending_events_.pop_front();
+        renderer_.process_event(e);
+    }
+    if (renderer_.renderer_ok())
+        renderer_.render_frame(now_ms_, all_delete_fade());
+}
+
+void GameRuntime::RuntimeState::tick_input(uint64_t delta_ms)
+{
+    input_begin_frame(input_);
+    tick(delta_ms, input_.frame);
+    finish_frame();
+    input_end_frame(input_);
+}
+
+// ---------------------------------------------------------------------------
+// App
+// ---------------------------------------------------------------------------
+struct App::Impl {
+    using Clock = std::chrono::steady_clock;
+
+    AppConfig cfg;
+    std::shared_ptr<GameRuntime> rt;
+
+    bool shutdown_done = false;
+    Clock::time_point last_tick{};
+    uint64_t frames = 0;
+    bool quit = false;
+
+    bool boot();
+    AppResult tick();
+    void reset_clock();
+    void shutdown();
+    void dump_frame();
+    void dump_state();
+};
+
+namespace {
+
+const char* wait_kind_str(oa::runtime::WaitReason::Kind k)
+{
+    using K = oa::runtime::WaitReason::Kind;
+    switch (k) {
+        case K::Generic: return "generic";
+        case K::Generic0: return "wt0";
+        case K::Timed: return "timed";
+        case K::Stop: return "stop";
+        case K::Se: return "se";
+        case K::VideoLayer: return "video";
+        case K::ScenarioTween: return "scenario-tween";
+        case K::KeyWait: return "key";
+    }
+    return "?";
+}
+
+std::string wait_desc(const oa::runtime::WaitReason* w)
+{
+    if (!w) return "none";
+    std::string s = wait_kind_str(w->kind);
+    if (!w->id.empty()) s += "('" + w->id + "')";
+    return s;
+}
+
+bool write_ppm(const std::string& path, uint32_t w, uint32_t h,
+               const std::vector<uint8_t>& rgba)
+{
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) return false;
+    std::fprintf(f, "P6\n%u %u\n255\n", w, h);
+    for (uint32_t y = 0; y < h; ++y) {
+        for (uint32_t x = 0; x < w; ++x) {
+            const uint8_t* p = &rgba[(size_t(y) * w + x) * 4];
+            std::fputc(p[0], f);
+            std::fputc(p[1], f);
+            std::fputc(p[2], f);
+        }
+    }
+    std::fclose(f);
+    return true;
+}
+
+} // namespace
+
+void App::Impl::dump_frame()
+{
+    if (cfg.dump.empty() || !rt) return;
+    uint32_t w = 0, h = 0;
+    auto rgba = rt->capture_frame(&w, &h);
+    if (!rgba || w == 0 || h == 0) {
+        std::fprintf(stderr, "[app] dump failed: no frame (%s)\n",
+                     cfg.dump.c_str());
+        return;
+    }
+    if (write_ppm(cfg.dump, w, h, *rgba))
+        std::printf("[app] dump %s (%ux%u)\n", cfg.dump.c_str(), w, h);
+    else
+        std::fprintf(stderr, "[app] dump failed: cannot write %s\n",
+                     cfg.dump.c_str());
+}
+
+void App::Impl::dump_state()
+{
+    if (!rt) return;
+
+    if (const char* dump = std::getenv("OA_SCENEDUMP")) {
+        const std::string prefix(dump);
+        for (const oa::render::Layer* l : rt->scene().draw_order()) {
+            if (!prefix.empty() && l->id.rfind(prefix, 0) != 0) continue;
+            std::printf("[scene] %-16s left=%.0f top=%.0f w=%.0f h=%.0f "
+                        "vis=%.0f alpha=%.3f eff=%d file=%s\n",
+                        l->id.c_str(), l->left, l->top, l->width, l->height,
+                        l->visible ? 1.0 : 0.0, l->alpha,
+                        rt->scene().is_effectively_visible(l->id) ? 1 : 0,
+                        l->file.c_str());
+        }
+    }
+    if (std::getenv("OA_TXTDUMP")) {
+        for (const auto& [id, ml] : rt->text().layers()) {
+            std::string raw;
+            for (const auto& u : ml.page)
+                raw += u.kind == oa::render::PageUnit::Kind::Newline
+                           ? std::string("\\n")
+                           : u.data;
+            const oa::render::Layer* node = rt->scene().find(id);
+            std::fprintf(stderr,
+                         "[txt] %-24s chars=%zu reveal=%zu pend=%d hidden=%d "
+                         "positioned=%d page=%zu alpha=%.2f vis=%d eff=%d "
+                         "box=(%.0f,%.0f %.0fx%.0f) size=%.0f align=%s "
+                         "sample='%.40s'\n",
+                         id.c_str(), ml.char_count, size_t(ml.reveal_index),
+                         ml.reveal_pending ? 1 : 0, ml.text_hidden ? 1 : 0,
+                         ml.positioned ? 1 : 0, ml.page.size(),
+                         node ? node->alpha : -1.0,
+                         node ? (node->visible ? 1 : 0) : -1,
+                         node ? (rt->scene().is_effectively_visible(id) ? 1 : 0)
+                              : -1,
+                         ml.left, ml.top, ml.width, ml.height, ml.font.size(),
+                         ml.font.get_or("align", "-").c_str(), raw.c_str());
+        }
+    }
+    if (const char* vd = std::getenv("OA_VARDUMP")) {
+        const std::string prefix(vd);
+        const auto& vars = rt->interpreter().variables();
+        auto dump_map = [&](const auto& map) {
+            for (const auto& [k, v] : map) {
+                if (!prefix.empty() && k.rfind(prefix, 0) != 0) continue;
+                std::fprintf(stderr, "[var] %-28s = %s\n", k.c_str(),
+                             v.to_string().c_str());
+            }
+        };
+        dump_map(vars.local);
+        dump_map(vars.temp);
+        dump_map(vars.global);
+        dump_map(vars.system);
+    }
+
+    size_t handler_layers = 0;
+    for (const oa::render::Layer* l : rt->scene().draw_order())
+        if (!l->event_handlers.empty()) ++handler_layers;
+
+    std::printf("[app] headless end frames=%llu layers=%zu layer_ev=%zu "
+                "text_ev=%zu switch_ev=%zu msg_lines=%zu handlers=%zu "
+                "wait=%s media_ev=%zu audio_players=%zu bgm=%d se=%zu voice=%zu\n",
+                (unsigned long long)frames, rt->scene().size(),
+                rt->scene_layer_events(), rt->text_events(),
+                rt->message_switch_events(),
+                rt->text().visible_content_layers().size(), handler_layers,
+                wait_desc(rt->current_wait()).c_str(), rt->media_events(),
+                rt->media_players().active_players(),
+                rt->audio().is_bgm_playing() ? 1 : 0,
+                rt->audio().state().se_channels.size(),
+                rt->audio().state().voice_channels.size());
+    std::fflush(stdout);
+}
+
+bool App::Impl::boot()
+{
+    oa::log_build_info();
+
+    const std::string& path = cfg.project;
+    std::error_code ec;
+    const bool is_dir = std::filesystem::is_directory(path, ec);
+    std::shared_ptr<const oa::fs::IFileSystem> fs;
+    try {
+        fs = std::make_shared<oa::fs::PhysFileSystem>(path);
+        if (is_dir) {
+            std::printf("[app] folder project: %s\n", path.c_str());
+        } else if (std::strcmp(fs->kind(), "pfs") == 0) {
+            std::printf("[app] pfs project: %s\n", path.c_str());
+        } else {
+            const std::string side =
+                std::filesystem::path(path).parent_path().string();
+            std::printf("[app] pfs project: %s (sidecar dir layer: %s)\n",
+                        path.c_str(), side.c_str());
+        }
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "cannot open project source: %s\n", e.what());
+        return false;
+    }
+
+    rt = std::make_shared<GameRuntime>(fs);
+    rt->enable_decode_pool();
+
+    if (!cfg.save_root.empty()) {
+        auto store = std::make_shared<oa::runtime::DirSaveStore>(cfg.save_root);
+        std::error_code sec;
+        std::filesystem::create_directories(std::filesystem::path(cfg.save_root), sec);
+        rt->set_save_store(store);
+        std::printf("[app] save store root: %s\n",
+                    std::filesystem::absolute(cfg.save_root).string().c_str());
+    }
+
+    try {
+        rt->open_project(cfg.platform);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "project open failed: %s\n", e.what());
+        return false;
+    }
+    try {
+        rt->boot_project();
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "project boot failed: %s\n", e.what());
+        return false;
+    }
+    rt->audio().set_master_volume(cfg.mute ? 0.0f : 1.0f);
+    std::printf("[app] project booted\n");
+    return true;
+}
+
+AppResult App::Impl::tick()
+{
+    if (!rt) return AppResult::Error;
+
+    const Clock::time_point frame_start = Clock::now();
+    uint64_t delta = 0;
+    if (cfg.fixed_delta_ms > 0)
+        delta = uint64_t(cfg.fixed_delta_ms);
+    else if (cfg.headless)
+        delta = 16;
+    else
+        delta = std::chrono::duration_cast<std::chrono::milliseconds>(
+            frame_start - last_tick).count();
+    last_tick = frame_start;
+    try {
+        rt->tick(delta > 0 ? delta : 1);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[app] tick error: %s\n", e.what());
+        return AppResult::Error;
+    }
+    if (rt->exit_requested()) quit = true;
+
+    ++frames;
+    if (cfg.frames_target > 0 && frames >= cfg.frames_target) {
+        quit = true;
+        if (cfg.headless) dump_state();
+        dump_frame();
+    }
+    if (cfg.headless) return quit ? AppResult::Exit : AppResult::Continue;
+
+    const int cap = cfg.fps > 0
+                        ? cfg.fps
+                        : (rt->vsync_active() && rt->frame_presented()
+                               ? rt->project().config.fps
+                               : 0);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now() - frame_start).count();
+    if (cap > 0) {
+        const long want = 1000 / cap;
+        if (elapsed < want)
+            std::this_thread::sleep_for(std::chrono::milliseconds(want - elapsed));
+    } else {
+        std::this_thread::sleep_for(std::chrono::milliseconds(8));
+    }
+
+    return quit ? AppResult::Exit : AppResult::Continue;
+}
+
+void App::Impl::reset_clock()
+{
+    last_tick = Clock::now();
+}
+
+void App::Impl::shutdown()
+{
+    if (shutdown_done) return;
+    shutdown_done = true;
+    std::printf("[app] bye (frames=%llu)\n",
+                static_cast<unsigned long long>(frames));
+    std::fflush(stdout);
+    rt.reset();
+}
+
+App::App(AppConfig config) : impl_(std::make_unique<Impl>())
+{
+    impl_->cfg = std::move(config);
+    impl_->reset_clock();
+}
+
+App::~App()
+{
+    impl_->shutdown();
+}
+
+bool App::boot()
+{
+    return impl_->boot();
+}
+
+bool App::attach_window(void* native_window)
+{
+    if (!impl_->rt || !impl_->rt->attach_window(native_window, impl_->cfg.renderer))
+        return false;
+    impl_->reset_clock();
+    return true;
+}
+
+int App::stage_width() const
+{
+    return impl_->rt ? impl_->rt->stage_width() : 0;
+}
+
+int App::stage_height() const
+{
+    return impl_->rt ? impl_->rt->stage_height() : 0;
+}
+
+AppResult App::run_headless()
+{
+    AppResult r = AppResult::Continue;
+    while (r == AppResult::Continue) r = impl_->tick();
+    return r;
+}
+
+void App::reset_clock()
+{
+    impl_->reset_clock();
+}
+
+void App::request_repaint()
+{
+    if (impl_->rt) impl_->rt->request_repaint();
+}
+
+void App::key_event(int vk, bool down)
+{
+    if (impl_->rt) impl_->rt->key_event(vk, down);
+}
+
+void App::mouse_move(float window_x, float window_y)
+{
+    if (impl_->rt) impl_->rt->mouse_move(window_x, window_y);
+}
+
+void App::mouse_button(int vk, bool down)
+{
+    if (impl_->rt) impl_->rt->mouse_button(vk, down);
+}
+
+void App::mouse_wheel(int direction)
+{
+    if (impl_->rt) impl_->rt->mouse_wheel(direction);
+}
+
+AppResult App::tick()
+{
+    return impl_->tick();
 }
 
 } // namespace oa::runtime

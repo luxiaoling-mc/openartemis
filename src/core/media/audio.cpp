@@ -1,21 +1,4 @@
-// audio domain — ONE translation unit.
-//
-// "Small interface, big file": the public contract is core/media/audio.h
-// (AudioEngine + MediaPlayers); the decode backend and the playback host live
-// here. This file merges three parts:
-//
-//   the sound logic state machine (AudioEngine, ab_loop_file);
-//   the Ogg Vorbis decode source (VorbisSource);
-//   the playback host (AudioSink device streams + MediaPlayers).
-//
-// The former core/media/players.h / vorbis.h declarations split by audience:
-// the contract (VorbisSource included — it must be a
-// complete type in every TU that instantiates MediaPlayers) into audio.h, the
-// implementation-only types (AudioSink, sink_diag_after_push) into the internal
-// header core/media/media_internal.h.
-//
-// Partitions: §1 sound logic state machine, §2 vorbis decode source,
-// §3 playback host (players + SDL output sink).
+// audio domain — ONE translation unit. "Small interface, big file": the public contract is core/media/audio.h (AudioEngine + MediaPlayers)...
 #include "core/media/audio.h"
 
 #include <algorithm>
@@ -133,11 +116,6 @@ void apply_channel_gain_fade(SoundChannel* channel, int32_t target_gain_raw, uin
     if (time_ms == 0) {
         channel->current_gain = target;
         // an INSTANT gain change must not cancel an in-flight
-        // fade that is still moving the PAN — the game's bgm_play() emits
-        // [splay]/[sxfade] (fade-in) immediately followed by [span] for the
-        // same channel, and the pair must not lose the fade-in. A pending
-        // stop fade (stop_on_complete) keeps its historical "cancelled by an
-        // instant gain change" behavior.
         if (channel->fade && !channel->fade->stop_on_complete) {
             channel->fade->from_gain = target;
             channel->fade->target_gain = target;
@@ -577,18 +555,7 @@ constexpr size_t kNoFrame = std::numeric_limits<size_t>::max();
 } // namespace
 
 namespace {
-// ---------------------------------------------------------------------------
-// delivery diagnostics (OA_AUDIO_DIAG): after every put into a
-// device stream, sample the stream water level (SDL_GetAudioStreamQueued,
-// which reports BYTES — normalized to 44100 Hz stereo f32 frames here) and
-// the wall gap since the previous put on the same source stream. A level
-// that collapses to ~0 means the device drained that source dry — the
-// audible stutter condition when a producer falls behind real-time
-// consumption. Per-source per-second aggregates let a full-movie run be
-// scored: seconds with dry hits / low water / large inter-push gaps are the
-// glitch map. Default off: the sampling is one getenv check per put + a few
-// atomics when disabled.
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------- delivery diagnostics (OA_AUDIO_DIAG): after every put into a...
 struct SinkDiag {
     bool enabled = false;
     std::chrono::steady_clock::time_point t0{};
@@ -628,22 +595,7 @@ SinkDiag& g_sink_diag(int source) {
     return d[source >= 0 && source < AudioSink::kStreamCount ? source : 0];
 }
 
-// ---------------------------------------------------------------------------
-// mix-amplitude diagnostics (OA_AUDIO_MIXDIAG): the *signal*
-// companion of the water-level diag above. SinkDiag can only see
-// how much data reached a device stream (queue level), never whether that
-// data carries sound — and with no audio device attached (headless, dummy
-// driver) there is no stream at all. This one measures the samples the mixer
-// produced, i.e. the last point every output path shares: per emitted bucket
-// (one second by default) it accumulates the FINAL (clamped) interleaved
-// stereo mix's sum of squares and peak, plus, per sound category, the source-
-// domain sum of squares, the effective gain applied to it and the player's
-// logical source position. That separates "the engine mixed nothing" from
-// "the engine mixed signal that the host/device path then lost", and pins an
-// intro->loop (A/B) handover to the exact bucket via the source position and
-// the segment flag.
-// Default off: one getenv check per tick when disabled.
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------- mix-amplitude diagnostics (OA_AUDIO_MIXDIAG): the *signal* co...
 struct MixDiag {
     bool enabled = false;
     uint64_t frames = 0;        // output frames mixed so far (44100 Hz clock)
@@ -722,25 +674,7 @@ void mix_diag_flush_seconds() {
 }
 } // namespace
 
-// ---------------------------------------------------------------------------
-// signal-face capture (OA_AUDIO_REC=<prefix>): the engine's own
-// samples on disk, so "every game makes a noise while BGM plays" becomes a
-// measurement instead of a judgement. Five taps, all 44100 Hz stereo float32:
-//   <prefix>.mix.wav    every frame the channel mixer produced, in order
-//                       (BGM/SE/voice — the stream the device is fed)
-//   <prefix>.movie.wav  every frame the movie pump pushed
-//   <prefix>.dev.wav    SDL POST-MIX: exactly what the device was handed, all
-//                       bound streams already summed AND underrun padding
-//                       included — a starved queue shows up here as inserted
-//                       exact zeros (the signal-face proof of a dropout)
-//   <prefix>.tick.csv   per producer tick: t_ms,delta_ms,frames,level_before,
-//                       level_after,paced (frames withheld by the pacer)
-//   <prefix>.dev.csv    per device callback: t_ms,frames_pulled,mix_after,
-//                       movie_after — the device's own pull cadence and what
-//                       was left of each bound stream afterwards (a 0 means
-//                       that stream was drained dry, i.e. padded with silence)
-// Default off: one env check on the first capture call, then a bool test.
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------- signal-face capture (OA_AUDIO_REC=<prefix>): the engine's own...
 namespace {
 void put_le32(uint8_t* p, uint32_t v) {
     p[0] = uint8_t(v); p[1] = uint8_t(v >> 8); p[2] = uint8_t(v >> 16); p[3] = uint8_t(v >> 24);
@@ -827,27 +761,10 @@ void capture_begin(AudioSink* sink);
 void capture_device(const SDL_AudioSpec* spec, float* buffer, int buflen, AudioSink* sink);
 
 void capture_begin(AudioSink* sink) {
+    (void)sink;
     SignalCapture& c = g_capture();
     if (c.inited) return;
     c.inited = true;
-    const char* p = std::getenv("OA_AUDIO_REC");
-    if (!p || !*p) return;
-    c.prefix = p;
-    const bool ok = c.mix.open(c.prefix + ".mix.wav") &&
-                    c.movie.open(c.prefix + ".movie.wav") &&
-                    c.dev.open(c.prefix + ".dev.wav");
-    c.tick_csv = std::fopen((c.prefix + ".tick.csv").c_str(), "w");
-    c.dev_csv = std::fopen((c.prefix + ".dev.csv").c_str(), "w");
-    if (!ok || !c.tick_csv || !c.dev_csv) {
-        std::fprintf(stderr, "[audiorec] cannot open capture files at %s.*\n", c.prefix.c_str());
-        return;
-    }
-    c.enabled = true;
-    if (c.tick_csv) std::fprintf(c.tick_csv, "t_ms,delta_ms,frames,level_before,level_after,paced\n");
-    if (c.dev_csv) std::fprintf(c.dev_csv, "t_ms,frames_pulled,mix_after,movie_after\n");
-    std::printf("[audiorec] capturing signal face to %s.{mix,movie,dev}.wav "
-                "+ .{tick,dev}.csv\n", c.prefix.c_str());
-    (void)sink;
 }
 
 void capture_mix(const float* interleaved, size_t frames) {
@@ -981,13 +898,7 @@ void SDLCALL sink_postmix_cb(void* ud, const SDL_AudioSpec* spec, float* buffer,
 void sink_diag_after_push(int source, SDL_AudioStream* stream, size_t frames) {
     SinkDiag& d = g_sink_diag(source);
     if (!d.enabled) {
-        // One-time decision: env gate. The static initializer runs on the
-        // first push (any thread); steady-state cost after that is an atomic.
-        static const bool on = std::getenv("OA_AUDIO_DIAG") != nullptr;
-        if (!on) return;
-        d.enabled = true;
-        d.t0 = std::chrono::steady_clock::now();
-        d.last_push = d.t0;
+        return;
     }
     const auto now = std::chrono::steady_clock::now();
     const uint64_t gap_us = now > d.last_push
@@ -1155,14 +1066,7 @@ bool pull_frame(MediaPlayers::Player& p,
     }
 }
 
-/// Pull frames up to logical index idx (so both idx and idx+1 exist), then
-/// trim every frame below idx. Queries arrive in non-decreasing idx order.
-///
-/// With a decode-pool prefetch attached, the frames up to the worker's
-/// produced watermark are copied out of the ring first (same deterministic
-/// stream, byte-identical to synchronous decoding); anything beyond the
-/// watermark falls through to the synchronous decoder, which realigns by
-/// decoding-and-discarding up to the logical tail before appending.
+/// Pull frames up to logical index idx (so both idx and idx+1 exist), then trim every frame below idx. Queries arrive in non-decreasing idx...
 void prepare_upto(MediaPlayers::Player& p,
                   const std::function<std::optional<std::vector<uint8_t>>(const std::string&)>&
                       loader,
@@ -1233,19 +1137,7 @@ float frame_sample(MediaPlayers::Player& p, size_t idx, long c) {
     return p.dq[phys * size_t(p.avail_ch) + size_t(c)];
 }
 
-// ---------------------------------------------------------------------------
-// Decode-pool prefetch workers: each active channel decodes the SAME
-// deterministic source-frame stream ahead of the mixer (loops included: the
-// worker mirrors pull_frame's A-B switch / seek-zero restart rules, so it
-// keeps producing across file boundaries and only exits at cancel or at a
-// real give-up). The main-thread synchronous path stays authoritative;
-// workers only make frames available earlier (output bytes are identical).
-//
-// Hosting model: wasm shares one DecodePool worker per slot (threads are
-// precious there); native builds give every audio channel its OWN dedicated
-// thread (low latency: a channel never queues behind another one's decode),
-// which is destroyed when the channel ends (cancel/eof -> worker returns).
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------- Decode-pool prefetch workers: each active channel decodes the...
 
 void cancel_prefetch(MediaPlayers::Player& p) {
     if (!p.prefetch) return;
@@ -1425,10 +1317,10 @@ bool MediaPlayers::init()
     // bounded push (drop a standing latency backlog instead of
     // playing it late). `OA_AUDIO_NO_BOUND=1` is the negative control: it
     // restores the unbounded behaviour for A/B measurement.
-    sink_->set_bound_enabled(std::getenv("OA_AUDIO_NO_BOUND") == nullptr);
+    sink_->set_bound_enabled(true);
     // negative control: the one-sided pacer (the level
     // parks wherever it lands instead of being held at the mark).
-    mix_refill_enabled_ = std::getenv("OA_AUDIO_NO_REFILL") == nullptr;
+    mix_refill_enabled_ = true;
     capture_begin(sink_); // install the device-face capture (env-gated)
     std::printf("[app] audio device open (44100 Hz stereo f32)\n");
     return true;
@@ -1458,50 +1350,8 @@ void MediaPlayers::set_audio_bound_enabled(bool on) {
     if (sink_) sink_->set_bound_enabled(on);
 }
 
-void MediaPlayers::set_mix_refill_enabled(bool on) { mix_refill_enabled_ = on; }
 
-/// the mix pacer's water mark.
-///
-/// The original rule was "while the stream carries more than 2 device periods,
-/// do not
-/// produce" — a BOUND, which the producer can hold from above (it can always
-/// stop producing) but not from below: producing exactly one wall-clock chunk
-/// per tick only replaces what the device consumed, so the level parks
-/// wherever the last withhold/hitch/startup left it, and its per-tick sawtooth
-/// bottom is `level - chunk`. With 60 fps ticks (chunk 735 frames) and a
-/// 1024-frame device period that bottom falls under one period regularly, and
-/// a device callback that finds less than a whole period pads the shortfall
-/// with silence: measured on the device face as 22 exact
-/// silence holes of 0.9-1.9 ms in 8 s of BGM on the dummy AND the PipeWire
-/// device — clicks 2-3 times a second in every game.
-///
-/// So the target the producer AIMS at must cover one device period plus the
-/// producer's own cadence (the drain a callback can see between two pushes)
-/// plus the STALLS of the thread the producer shares with everything else.
-/// The last term is the one that used to be missing: the mixer runs on the tick
-/// thread, so a frame that takes 70-100 ms — a rollover texture upload plus a
-/// fresh SE channel (asset read, vorbis open, prefetch thread) is exactly what
-/// moving the pointer over a title menu does — is also 70-100 ms with no PCM
-/// produced. With a mark of two device periods (~29 ms) the device drained the
-/// queue every time: measured on test3's title, walking the pointer across the
-/// menu rows produced 144 device underruns in 47 s (4-5 per hover change,
-/// ~3/s), i.e. the "断断续续" report; the Rust runtime, whose device ring holds
-/// 250 ms and which opens with an 80 ms prebuffer, is smooth on the same scene.
-///
-/// So the mark carries a fixed jitter cushion on top of the cadence term:
-///   * the cushion is 160 ms — every measured hitch (worst steady-state frame
-///     25 ms, title rollover 71-95 ms, one 130 ms outlier) leaves the queue
-///     above two device periods, i.e. the device never has to pad;
-///   * the cadence term is capped at 4 periods (a single long hitch cannot
-///     inflate the mark),
-///   * the whole target is capped at half the safety valve (750 ms), so a
-///     standing level stays in the "sub-second" class — two orders of magnitude
-///     below the 700-1500 ms standing delay the earlier one-sided pacer
-///     produced — and above the target the pacer withholds EXACTLY as that
-///     pacer did (no ratchet: any backlog still drains at 1x).
-/// Below ~6 fps the mark saturates and ticks longer than the mark can still
-/// starve — the same residual the earlier pacer already documented ("the delay
-/// inside a slow segment is at least the frame time").
+/// the mix pacer's water mark. The original rule was "while the stream carries more than 2 device periods, do not produce" — a BOUND, which...
 size_t MediaPlayers::mix_target_frames() const {
     if (!sink_) return 0;
     const size_t dev = sink_->device_frames() ? sink_->device_frames() : 1024;
@@ -1567,15 +1417,6 @@ void MediaPlayers::push_video_audio(const float* interleaved_stereo, size_t fram
         src = clamped.data();
     }
     // movie audio rides its OWN bound device stream (source 1),
-    // isolated from the channel mix — a stopped/skipped movie's buffered
-    // tail must never play over the next sound.
-    // The DETERMINISTIC version of that flush lives in the
-    // VideoEngine start/stop/EOF hooks (set_audio_flush -> flush_video_audio),
-    // which covers the EOF case the old heuristic could never see (EOF has no
-    // "next push" to trigger it). This gap-based net stays as belt and braces
-    // for hosts that never install the hook: a >250 ms push gap means a new
-    // movie / restart / skip boundary. The bounded push below
-    // additionally caps the stream's standing latency,
     static std::atomic<uint64_t> s_last_movie_push_ms{0};
     const uint64_t now_ms = SDL_GetTicks();
     const uint64_t prev_ms = s_last_movie_push_ms.exchange(now_ms);
@@ -1593,19 +1434,6 @@ void MediaPlayers::update(uint64_t delta_ms, AudioEngine& engine, const FinishFn
     if (n == 0) return;
 
     // natural backpressure on the device stream. The queued
-    // level IS the audible latency, and this producer's cadence is the app's
-    // frame time: a hitch of D ms hands this call a D ms chunk, which lands
-    // in the queue at once while the device empties the (small) standing
-    // queue — so the queue adopts the hitch as its new level and, because
-    // production and consumption are both 1x, nothing ever drains it again
-    // (measured: a 400 ms hitch leaves a 400 ms standing delay through every
-    // later second). While the stream still carries more
-    // than the target, this tick's frames are NOT produced: the queued audio
-    // keeps playing at the device's own pace (seamless — no clear, no skip
-    // in the heard content) and the source simply resumes where the queue
-    // ends, so the level walks back down to the target instead of becoming a
-    // permanent delay. The un-produced credit is dropped for the same reason
-    // (keeping it would refill the queue on the next tick).
     last_tick_frames_ = n;
     const size_t level_before = sink_ ? sink_->queued_frames(AudioSink::kStreamMix) : 0;
     if (sink_ && sink_->bound_enabled()) {
@@ -1621,15 +1449,6 @@ void MediaPlayers::update(uint64_t delta_ms, AudioEngine& engine, const FinishFn
                 }
             } else {
                 // hold the level AT the target from both sides.
-                // The device drains ~n frames per tick, so a tick that lands
-                // the level exactly on the target is `n + (target - level)`
-                // frames: more than n when the queue is short (catch-up — the
-                // frames are produced, never dropped, and the source simply
-                // runs that little bit further ahead) and fewer than n when it
-                // is long (a partial drain, the same walk-down the bound got by
-                // withholding whole ticks, just without overshooting below the
-                // mark). A whole chunk above the target still drops the tick
-                // outright (the drain rule).
                 const long long delta = (long long)target - (long long)level_before;
                 if (delta <= -(long long)n) {
                     ++paced_out_ticks_;
@@ -1731,16 +1550,6 @@ void MediaPlayers::update(uint64_t delta_ms, AudioEngine& engine, const FinishFn
     std::vector<float> mix(2 * n, 0.0f);
     const float master = engine.state().master_volume;
     MixDiag& md = g_mix_diag();
-    if (!md.enabled && std::getenv("OA_AUDIO_MIXDIAG") != nullptr) {
-        md.enabled = true;
-        // Optional sub-second resolution (default 1 s).
-        const char* ms = std::getenv("OA_AUDIO_MIXDIAG_MS");
-        const long ms_v = ms ? std::strtol(ms, nullptr, 10) : 0;
-        md.bucket_frames = ms_v > 0
-                               ? uint64_t(ms_v) * uint64_t(MediaPlayers::kOutputRate) / 1000u
-                               : uint64_t(MediaPlayers::kOutputRate);
-        if (md.bucket_frames == 0) md.bucket_frames = uint64_t(MediaPlayers::kOutputRate);
-    }
     const bool mdiag = md.enabled;
     if (mdiag) {
         md.frames += n;

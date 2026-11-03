@@ -11,7 +11,7 @@
 #include <vector>
 
 #include "core/fs/physfs_fs.h"
-#include "core/runtime/runtime.h"
+#include "core/runtime/runtime_game.h"
 
 namespace {
 int failures = 0;

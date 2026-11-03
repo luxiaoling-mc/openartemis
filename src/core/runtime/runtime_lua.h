@@ -1,41 +1,5 @@
 #pragma once
-// Lua 5.1 host bridge for Artemis — public contract.
-//
-// The runtime's Lua domain: one thin contract header + ONE implementation TU
-// (core/runtime/runtime_lua.cpp) beside the other runtime files
-// (runtime_iet.cpp / runtime_media.cpp / runtime_save.cpp); the former lua/
-// directory under core is gone.
-//
-// LuaBridge is exactly what its name says: a
-// *bridge* between the Artemis script interpreter (oa::runtime::Interpreter)
-// and one shared Lua 5.1 VM per interpreter — it owns the lua_State, boots
-// the Lua-side host surface and forwards every engine request back into the
-// interpreter/runtime through LuaHost closures (variables, tag queue,
-// input/media state) without circular includes.
-//
-// Lua-side injections (install_engine_api, VM boot):
-//   * the engine handle — ONE opaque full userdata per VM whose guarded
-//     metatable carries the whole e:* method surface (merged in by the host
-//     surface sections; see the register_* openers in
-//     core/runtime/runtime_lua.cpp). The
-//     handle only travels as the first argument `e` of every host->Lua call (calllua rows, FPM (e, p)
-//     event handlers, tag/event filter callbacks) — the Lua-side contract
-//     of the original engine. Host code recovers the owning bridge from
-//     the method-closure upvalue (bridge_from_state) and re-pushes the
-//     handle through an anonymous luaL_ref anchor (push_engine) whenever
-//     it calls back into Lua.
-//   * `pluto` — persist/unpersist (binary stream based) global table.
-// Every engine pcall installs a debug.traceback message handler, so LuaError
-// messages carry the Lua call trace directly (no global/registry
-// side-channel). Host services are closures so the interpreter/runtime can
-// wire variables, tag queue and input/media state without circular includes.
-// The Lua host surface is ONE translation unit (core/runtime/runtime_lua.cpp,
-// "small interface, big file"): this header is the whole public contract, and
-// the register_* openers / shared helpers that used to live in the deleted
-// lua_api.h are now TU-internal sections of that file (shared helpers +
-// openers, bridge object, tag/sys/input/surface/emote/filter/pluto).
-// install_engine_api calls the openers in order, the same shape as Lua's own
-// linit.c / luaL_openlibs.
+// Lua 5.1 host bridge for Artemis — public contract. The runtime's Lua domain: one thin contract header + ONE implementation TU (core/runti...
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -81,17 +45,6 @@ struct LuaHost {
     /// side falls back to the deferred queue.
     std::function<bool(const std::string&, std::map<std::string, std::string>)> run_tag_now;
     /// Sync Lua-originated e:tag{"calllua",...} dispatch.
-    /// Mirrors the inline [calllua] tag semantics of .asb streams: the Lua
-    /// callback runs at enqueue time — before the enclosing Lua flow can
-    /// rebuild the state the callback reads (e.g. button groups) — instead
-    /// of at the deferred queue drain. Params arrive as Lua literals; the
-    /// interpreter resolves variable references exactly like the asb path.
-    /// Returns false when "function" is missing/empty (caller keeps the
-    /// historical deferred path so a broken call still surfaces the same
-    /// drain-time error); true when dispatched (missing VM function = silent
-    /// no-op, the optional-callback convention). Lua errors from the
-    /// callback are thrown (caller converts them to lua_error at the pcall
-    /// boundary).
     std::function<bool(const std::string& function,
                        const std::map<std::string, std::string>& params)>
         run_calllua_sync;
@@ -103,13 +56,6 @@ struct LuaHost {
     std::function<bool(const std::string& fn_name)> call_handler;
 
     // -- E-mote layer methods -------------------------------------------------
-    /// Route one EmoteLayer Lua method call to the runtime emote player for
-    /// the layer id. `s` carries the first string argument and `s2` the second
-    /// one (timeline/variable name; setVariableDiff's src+dst labels are the
-    /// only two-string shape the frameworks use), n1..n3 the numeric ones;
-    /// `out` receives the numeric result for getters and `sout` the string
-    /// result of getVariableLabelAt. False when unwired (bridge falls back to
-    /// no-ops).
     std::function<bool(const std::string& id, const std::string& method,
                        const std::string& s, const std::string& s2, double n1,
                        double n2, double n3, double* out, std::string* sout)>
@@ -197,20 +143,6 @@ public:
     std::string stack_trace(int max_depth = 12) const;
 
     /// Engine->game-Lua dispatch error policy (docs/research/130).
-    ///
-    /// A Lua error raised while the ENGINE was calling into game Lua aborts
-    /// only THAT call: it is reported here (the message already carries the
-    /// debug.traceback decoration) and the dispatch site returns its
-    /// "not dispatched" verdict. The original runtime never lets a game-Lua
-    /// error kill the process. This engine already fired that policy at two
-    /// boundaries (lyevent handler, event filter); the remaining ones were
-    /// fatal, which turned a data-side script error into an app exit 
-    /// (research/130: blanked system/extend/auth.lua).
-    ///
-    /// Repeats of the same (what,name) pair are rate-limited — the reference
-    /// guards a broken per-frame handler the same way. `OA_LUA_STRICT=1`
-    /// restores the pre-130 fail-fast (rethrows, i.e. the tick aborts) for
-    /// defect hunting / CI.
     void report_dispatch_error(const char* what, const std::string& name,
                                const std::string& msg) const;
 

@@ -27,12 +27,12 @@
 //       every entry keeps its own clock, pass() ends the whole list,
 //       stopTimeline(name) ends one entry, step() folds every entry's end
 //       pose, the list is capped at 8;
-//   REF/NEW same-process A-B (OA_EMOTE_LEGACY_SLOTS=1 = pre-S3 model):
+//   （历史 A/B 开关已删除：播放模型唯一。）
 //       gesture tracks flip constant -> moving, the differing variable set
 //       stays inside the timeline's own tracks, and the loop-boundary frame
 //       is only reachable in the NEW model.
 //
-// Env: OA_TEST_TG3_PFS (甜蜜女友3 root.pfs) / OA_TEST_SLNY_PFS (きら☆かの
+// Env: OA_TEST_TG3_PFS (甜蜜女友3 root.pfs) —— 单包覆盖（きら☆かの 臂已移除：
 // root.pfs) — arms run when set, exit 77 when neither is (the FPM/NekoMiko
 // asset-gate convention).
 #include <algorithm>
@@ -658,284 +658,9 @@ void run_arm(const Arm& arm) {
                 }
             }
 
-            // (7) OA_EMOTE_PARALLEL=0 restores single-slot replacement: A's
-            // labels stop being written once B is pushed (frozen at the push)
-            if (!probe.empty()) {
-                set_env("OA_EMOTE_PARALLEL", "0");
-                oa::emote::EmotePlayer pseq;
-                unset_env("OA_EMOTE_PARALLEL");
-                std::string e4;
-                if (pseq.load(*bytes, 1920, 2048, &e4)) {
-                    pseq.set_external_pose(true);
-                    pseq.play_timeline(A, 0);
-                    pseq.progress(3.0);
-                    const double frozenAt = pseq.get_variable(probe);
-                    pseq.play_timeline(B, 1);
-                    const auto slots = pseq.foreground_slots();
-                    checku(slots.size() == 1,
-                           "G2 A-B: OA_EMOTE_PARALLEL=0 restores replacement",
-                           (unsigned long long)slots.size());
-                    pseq.progress(20.0);
-                    const double later = pseq.get_variable(probe);
-                    std::printf("[%s] G2 A-B parallel=0 '%s': at-push=%.3f after-20f=%.3f\n",
-                                arm.tag, probe.c_str(), frozenAt, later);
-                    checkf(std::fabs(later - frozenAt) < 1e-9,
-                           "G2 A-B: with PARALLEL=0 the replaced track freezes (old behaviour)",
-                           later);
-                } else {
-                    check(false, "G2 A-B: player load");
-                }
-            }
         }
     }
 
-    // --- REF/NEW same-process A-B (OA_EMOTE_LEGACY_SLOTS=1) ---------------
-    // Both players are FRESH for every probed timeline: the persistent
-    // variable domain would otherwise carry the residue of the previous run
-    // (and the two arms play it out differently), which shows up as differing
-    // labels the probed timeline never writes. The loop-boundary A-B runs
-    // last on its own fresh pair.
-    {
-        // The switches are latched in the CONSTRUCTOR (same convention as
-        // OA_EMOTE_FPS/OA_EMOTE_HALFRES), so the A-B players are built here.
-        auto make_pair = [&](std::unique_ptr<oa::emote::EmotePlayer>* outRef,
-                             std::unique_ptr<oa::emote::EmotePlayer>* outNew) {
-            set_env("OA_EMOTE_LEGACY_SLOTS", "1");
-            auto ref = std::make_unique<oa::emote::EmotePlayer>();
-            std::string e1;
-            const bool ok1 = ref->load(*bytes, 1920, 2048, &e1);
-            unset_env("OA_EMOTE_LEGACY_SLOTS");
-            auto neu = std::make_unique<oa::emote::EmotePlayer>();
-            std::string e2;
-            const bool ok2 = neu->load(*bytes, 1920, 2048, &e2);
-            if (!ok1 || !ok2) check(false, "REF/NEW: A-B player load");
-            if (ok1) ref->set_external_pose(true);
-            if (ok2) neu->set_external_pose(true);
-            *outRef = std::move(ref);
-            *outNew = std::move(neu);
-            return ok1 && ok2;
-        };
-        const size_t probeCount = std::min<size_t>(2, arm.gestures.size());
-        for (size_t gi = 0; gi < probeCount; ++gi) {
-            const std::string label = arm.gestures[gi];
-            const auto* tl = find_tl(file, label);
-            if (!tl) continue;
-            std::unique_ptr<oa::emote::EmotePlayer> ref, neu;
-            if (!make_pair(&ref, &neu)) continue;
-            const Shape sh = shape_of(*tl);
-            const int frames = int(sh.end) + 30;
-            const Run rr = run_timeline(*ref, label, frames, 0, true);
-            const Run rn = run_timeline(*neu, label, frames, 0, true);
-            std::set<std::string> diffLabels;
-            int firstDiffFrame = -1;
-            const size_t n = std::min(rr.snaps.size(), rn.snaps.size());
-            for (size_t f = 0; f < n; ++f) {
-                for (const auto& [k, v] : rn.snaps[f]) {
-                    if (g_async_labels.count(k)) continue; // blink/physics, not a surface
-                    const auto it = rr.snaps[f].find(k);
-                    const double rv = it == rr.snaps[f].end() ? 0.0 : it->second;
-                    if (std::fabs(rv - v) > 1e-9) {
-                        diffLabels.insert(k);
-                        if (firstDiffFrame < 0) firstDiffFrame = int(f);
-                    }
-                }
-            }
-            const std::set<std::string> tlLabels = labels_of(*tl);
-            // The selector-control derivation rewrites every option label of a
-            // selector whose own value (or option label) a track writes, so
-            // that closure is part of "the timeline's own effect".
-            std::set<std::string> own = tlLabels;
-            for (const auto& sel : file.selectors) {
-                bool touched = own.count(sel.label) > 0;
-                for (const auto& opt : sel.options)
-                    if (tlLabels.count(opt.label)) touched = true;
-                if (touched)
-                    for (const auto& opt : sel.options) own.insert(opt.label);
-            }
-            std::set<std::string> outside;
-            for (const auto& k : diffLabels)
-                if (!own.count(k)) outside.insert(k);
-            std::printf("[%s] REF/NEW '%s': legacy sigs=%zu new sigs=%zu "
-                        "diffLabels=%zu subset=%d firstDiffFrame=%d\n",
-                        arm.tag, label.c_str(), rr.uniqueSigs, rn.uniqueSigs,
-                        diffLabels.size(), outside.empty() ? 1 : 0, firstDiffFrame);
-            if (!outside.empty()) {
-                std::printf("[%s]   outside:", arm.tag);
-                for (const auto& k : outside) std::printf(" %s", k.c_str());
-                std::printf("\n");
-            }
-            checku(rr.uniqueSigs == 1,
-                   "REF/NEW: the pre-S3 model leaves the gesture frozen",
-                   (unsigned long long)rr.uniqueSigs);
-            checku(rn.uniqueSigs >= 2, "REF/NEW: the S3 model moves it",
-                   (unsigned long long)rn.uniqueSigs);
-            check(outside.empty(),
-                  "REF/NEW: differences stay inside the timeline's own tracks");
-            check(!diffLabels.empty(), "REF/NEW: the gesture timeline actually differs");
-        }
-        // loop-boundary REF/NEW (待機): both arms obey the reference wrap
-        // (`local >= loopEnd`), so neither exposes the loopEnd marker and both
-        // stop at loopEnd - 1. The loop can therefore no longer discriminate
-        // the two slot models — the gesture probes above do that (legacy
-        // frozen at t0 vs the S3 model moving).
-        const std::string label = "待機";
-        const auto* tl = find_tl(file, label);
-        if (tl) {
-            std::unique_ptr<oa::emote::EmotePlayer> ref, neu;
-            const bool ok = make_pair(&ref, &neu);
-            const int loopEnd = tl->loopEnd;
-            const int frames = loopEnd + 20;
-            const Run rr = ok ? run_timeline(*ref, label, frames) : Run{};
-            const Run rn = ok ? run_timeline(*neu, label, frames) : Run{};
-            auto scan = [&](const Run& r) {
-                bool hit = false;
-                for (double t : r.ts)
-                    if (std::fabs(t - double(loopEnd)) < kEps) hit = true;
-                return hit;
-            };
-            const bool refHit = scan(rr), newHit = scan(rn);
-            std::printf("[%s] REF/NEW '%s' loop=[%d,%d]: legacy maxT=%.0f hit=%d | "
-                        "new maxT=%.0f hit=%d\n",
-                        arm.tag, label.c_str(), tl->loopBegin, loopEnd, rr.maxT,
-                        refHit ? 1 : 0, rn.maxT, newHit ? 1 : 0);
-            check(ok && !refHit && !newHit,
-                  "REF/NEW: neither arm exposes the loopEnd marker (G7)");
-            checkf(std::fabs(rn.maxT - double(loopEnd - 1)) < kEps,
-                   "REF/NEW: the new model stops at loopEnd-1", rn.maxT);
-            checkf(std::fabs(rr.maxT - double(loopEnd - 1)) < kEps,
-                   "REF/NEW: the legacy model stops at loopEnd-1", rr.maxT);
-        }
-
-        // --- S2 G5 (research/124 §2.3): +-180 angle-interpolation wrap -------
-        // The tg3/slny rig encodes the neck/body axes as 348/350 degrees for
-        // the NEGATIVE authored endpoints (t=0) against 0 degrees at t=30, so
-        // any axis value strictly inside (-30..0) samples an intermediate tick
-        // between two keys that straddle the +-180 boundary. The pre-S2 engine
-        // lerped the raw values (348 -> 0 at the midpoint = 174 degrees, "the
-        // long way round"); the reference folds the pair to the short way
-        // (E:emoterunner.cpp:604-620). The assertions pin all three facts:
-        // both arms agree EXACTLY at the authored keys, they differ hugely in
-        // between, and the wrapped arm is continuous where the old one jumps.
-        {
-            oa::emote::EmoteFile s2file;
-            if (s2file.load(*bytes, &err)) {
-                oa::emote::StaticRenderOptions opt;
-                opt.fitToCanvas = false;
-                opt.scale = 0.6;
-                opt.dx = 960.0;
-                opt.dy = 1024.0;
-                auto collect = [&](const std::map<std::string, double>& vars,
-                                   std::vector<oa::emote::EmoteDrawPart>* out) {
-                    out->clear();
-                    return oa::emote::emote_collect_parts(s2file, vars, 1920, 2048,
-                                                                 opt, out, &err);
-                };
-                auto max_delta = [](const std::vector<oa::emote::EmoteDrawPart>& a,
-                                    const std::vector<oa::emote::EmoteDrawPart>& b) {
-                    if (a.size() != b.size()) return -1.0;
-                    double m = 0;
-                    for (size_t i = 0; i < a.size(); ++i) {
-                        if (a[i].verts.size() != b[i].verts.size()) return -1.0;
-                        for (size_t k = 0; k < a[i].verts.size(); ++k)
-                            m = std::max(m, std::hypot(a[i].verts[k].x - b[i].verts[k].x,
-                                                       a[i].verts[k].y - b[i].verts[k].y));
-                    }
-                    return m;
-                };
-                for (const char* axis : {"head_slant", "body_slant"}) {
-                    double maxArm = 0, keyDelta = 0, maxStepOn = 0, maxStepOff = 0;
-                    std::vector<oa::emote::EmoteDrawPart> prevOn, prevOff;
-                    for (int i = 0; i <= 10; ++i) {
-                        const double val = -30.0 + 3.0 * i; // tick 0 .. 30 exactly
-                        std::map<std::string, double> vars{{axis, val}};
-                        std::vector<oa::emote::EmoteDrawPart> on, off;
-                        oa::emote::emote_set_s2_policy(1, -1, -1, -1);
-                        const bool okOn = collect(vars, &on);
-                        oa::emote::emote_set_s2_policy(0, -1, -1, -1);
-                        const bool okOff = collect(vars, &off);
-                        oa::emote::emote_set_s2_policy(-1, -1, -1, -1);
-                        if (!okOn || !okOff) { check(false, "S2 G5: collect failed"); break; }
-                        const double d = max_delta(on, off);
-                        maxArm = std::max(maxArm, d);
-                        // authored keys: the axis endpoints sit exactly on the
-                        // authored ticks, so the wrap cannot matter there
-                        if (i == 0 || i == 10) keyDelta = std::max(keyDelta, d);
-                        if (i > 0) {
-                            maxStepOn = std::max(maxStepOn, max_delta(prevOn, on));
-                            maxStepOff = std::max(maxStepOff, max_delta(prevOff, off));
-                        }
-                        prevOn = on;
-                        prevOff = off;
-                    }
-                    std::printf("[%s] S2 G5 '%s' sweep -30..0: maxArmDelta=%.2f "
-                                "deltaAtAuthoredKeys=%.3f maxStep on=%.2f off=%.2f\n",
-                                arm.tag, axis, maxArm, keyDelta, maxStepOn, maxStepOff);
-                    check(keyDelta < 1e-9,
-                          "S2 G5: both arms are identical at the authored axis keys");
-                    checkf(maxArm > 100.0,
-                           "S2 G5: the wrap changes the interpolated pose (data-live)",
-                           (unsigned long long)maxArm);
-                    checkf(maxStepOff > maxStepOn * 4.0,
-                           "S2 G5: the wrapped interpolation is continuous where the raw "
-                           "lerp jumps (the +-180 detour)",
-                           (unsigned long long)(maxStepOff / std::max(1.0, maxStepOn)));
-                }
-                // default policy: the wrap is ON (env OA_EMOTE_ANGLEWRAP=0 off)
-                check(oa::emote::emote_s2_policy().angleWrap,
-                      "S2 G5: the default policy has the angle wrap enabled");
-
-                // --- S2 G8b (research/124 §2.4): content-less tail fallback ---
-                // Default OFF and inert for every in-range axis value; the
-                // mechanism is reachable when a parameter tick is driven past
-                // the authored tail.
-                auto hash_of = [&](const std::map<std::string, double>& vars) {
-                    std::vector<oa::emote::EmoteDrawPart> parts;
-                    if (!oa::emote::emote_collect_parts(s2file, vars, 1920, 2048, opt,
-                                                               &parts, &err))
-                        return std::string("ERR");
-                    unsigned long long h = 1469598103934665603ULL;
-                    for (const auto& pt : parts) {
-                        h ^= (unsigned long long)pt.source;
-                        h *= 1099511628211ULL;
-                        for (const auto& v : pt.verts) {
-                            h ^= (unsigned long long)std::llround(v.x * 4096.0);
-                            h *= 1099511628211ULL;
-                            h ^= (unsigned long long)std::llround(v.y * 4096.0);
-                            h *= 1099511628211ULL;
-                        }
-                    }
-                    char b[32];
-                    std::snprintf(b, sizeof(b), "%016llx/%zu", h, parts.size());
-                    return std::string(b);
-                };
-                size_t inRange = 0;
-                for (const auto& vars : std::vector<std::map<std::string, double>>{
-                         {}, {{"head_slant", 20}}, {{"body_slant", -20}},
-                         {{"head_UD", 12}}, {{"body_UD", -8}}}) {
-                    oa::emote::emote_set_s2_policy(-1, 0, -1, -1);
-                    const std::string off = hash_of(vars);
-                    oa::emote::emote_set_s2_policy(-1, 1, -1, -1);
-                    const std::string on = hash_of(vars);
-                    oa::emote::emote_set_s2_policy(-1, -1, -1, -1);
-                    if (off != on) ++inRange;
-                }
-                std::printf("[%s] S2 G8b: in-range differing=%zu/5\n", arm.tag, inRange);
-                checku(inRange == 0,
-                       "S2 G8b: the tail fallback is inert for in-range axis values",
-                       (unsigned long long)inRange);
-                // The out-of-range reachability arm is gone. d72a2cb made the
-                // content-less-tail rule reference behaviour instead of a
-                // policy arm: pick_frame() applies it for `node.type == 1`
-                // shape containers unconditionally, so
-                // EmoteS2Policy::tailFallback is an assigned-but-never-read
-                // switch and toggling it cannot change geometry. The in-range
-                // arm above still pins that the rule is inert in range. (The
-                // same assertion was removed from emote_playback_test.)
-            } else {
-                check(false, "S2: emote file load for the angle/tail arms");
-            }
-        }
-    }
 }
 
 } // namespace
@@ -943,9 +668,8 @@ void run_arm(const Arm& arm) {
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
     const char* tg3 = std::getenv("OA_TEST_TG3_PFS");
-    const char* slny = std::getenv("OA_TEST_SLNY_PFS");
-    if ((!tg3 || !*tg3) && (!slny || !*slny)) {
-        std::printf("neither OA_TEST_TG3_PFS nor OA_TEST_SLNY_PFS set; skipping\n");
+    if (!tg3 || !*tg3) {
+        std::printf("OA_TEST_TG3_PFS unset; skipping\n");
         return 77;
     }
     Arm tg;
@@ -954,14 +678,7 @@ int main() {
     tg.entry = "image\\fg\\say_6.psb";
     tg.gestures = {"うんうん", "思考", "首かしげ", "びっくり"};
     tg.statics = {"普通Ａ", "笑顔表Ａ", "ジト目Ａ"};
-    Arm sl;
-    sl.tag = "slny";
-    sl.env = "OA_TEST_SLNY_PFS";
-    sl.entry = "image\\fg\\kir_2.psb";
-    sl.gestures = {"うんうん", "耳ぴく", "首かしげ", "考える"};
-    sl.statics = {"デフォ顔", "平常", "怒り"};
     run_arm(tg);
-    run_arm(sl);
 
     std::printf("%s\n", failures ? "FAILED" : "PASS");
     return failures ? 1 : 0;

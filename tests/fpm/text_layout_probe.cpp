@@ -9,7 +9,7 @@
 #include <string>
 
 #include "core/fs/physfs_fs.h"
-#include "core/runtime/runtime.h"
+#include "core/runtime/runtime_game.h"
 #include "core/render/font.h"
 
 namespace {
@@ -260,7 +260,7 @@ int main() {
         // ascent/bearing formula used by draw (offset_y = ascent−bitmap_top).
         // ------------------------------------------------------------------
         if (adv && adv_unit) {
-            oa::render::FontSystem fsys(fs.get(), &rt);
+            oa::render::FontSystem fsys(fs.get(), &rt, &rt.text());
             const oa::render::FontDesc& af = adv_unit->font;
             const uint32_t cp_a = 0x3042; // あ
             const oa::render::FontSystem::GlyphMeasure gm = fsys.measure_glyph(af, cp_a);

@@ -1,30 +1,5 @@
 #pragma once
-// Single project-source virtual file system on top of PhysicsFS, split into
-// the two mount categories the engine needs:
-//
-//   READ-ONLY (game assets)   — PhysFileSystem below: one project source
-//     (real directory, or an Artemis PFS pack, or pack + its own real parent
-//     directory overlay where loose files win). Also served by the custom
-//     PHYSFS_Archiver in physfs_fs.cpp.
-//   READ-WRITE (saves + file API) — WritableMount below: one writable real
-//     directory (PhysicsFS write dir) mounted read-back at a private point.
-//
-// All game-visible file bytes go through this one PhysicsFS session, so the
-// android/wasm hosts only need to hand the right real roots in; no engine
-// code touches the OS filesystem directly.
-//
-// The engine previously layered its own readers (DirFileSystem /
-// PfsFileSystem / FallbackFileSystem + pfs_archive + stdio DirSaveStore);
-// this header replaces that whole family.
-//
-// Case folding: PhysicsFS lookups are exact-case, but the IFileSystem
-// contract is case-insensitive virtual paths. PhysFileSystem therefore
-// resolves every virtual path against the mounted tree per component
-// (enumerate + ASCII-fold match, cached per directory).
-//
-// scan_pfs_file / extract_pfs_archive keep the metadata/self-extract
-// surfaces the opfs tool and boot-subset tests need (they no longer have a
-// standalone archive object to poke at).
+// Single project-source virtual file system on top of PhysicsFS, split into the two mount categories the engine needs: READ-ONLY (game asse...
 #include <array>
 #include <cstdint>
 #include <functional>
@@ -70,19 +45,7 @@ size_t extract_pfs_archive(
     const std::string& archive_path, const std::string& dir,
     const std::function<bool(const PfsEntryInfo&)>& filter = nullptr);
 
-// ---------------------------------------------------------------------------
-// Read-write category (saves / future file API).
-//
-// PhysicsFS splits IO into two mount classes: the read-only search path
-// (PhysFileSystem above, game assets) and ONE writable real directory.
-// WritableMount is the second category: its real root becomes the PhysicsFS
-// write dir (writes/mkdir/delete land there) AND is mounted at a private
-// mountpoint so reads/modification-time queries go through the same session.
-// Every file in the engine therefore flows through PhysicsFS on all
-// platforms (android/wasm write roots arrive via oa::plat::default_save_root
-// etc.); nothing below touches std::filesystem for game-visible bytes except
-// the one-time real-root bootstrap.
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------- Read-write category (saves / future file API).
 
 class WritableMount {
 public:
@@ -114,11 +77,6 @@ private:
 class PhysFileSystem final : public IFileSystem {
 public:
     /// Mount one project source.
-    ///  * source_path names a DIRECTORY: the tree is the file system.
-    ///  * source_path names a PFS ARCHIVE: pack (+ volume set) is mounted;
-    ///    with sidecar_dir (default) the archive's own real parent directory
-    ///    is mounted at the same point with higher priority when it exists.
-    /// Throws std::runtime_error when the source cannot be mounted.
     explicit PhysFileSystem(std::string source_path, bool sidecar_dir = true);
 
     ~PhysFileSystem() override;

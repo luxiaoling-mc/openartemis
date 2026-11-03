@@ -27,7 +27,7 @@ extern "C" {
 }
 
 #include "core/fs/fs.h"
-#include "core/runtime/runtime.h"
+#include "core/runtime/runtime_game.h"
 
 namespace {
 int failures = 0;

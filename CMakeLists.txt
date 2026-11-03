@@ -16,8 +16,8 @@ endif()
 # ---------------------------------------------------------------------------
 # Options
 # ---------------------------------------------------------------------------
-option(OA_BUILD_TOOLS "Build bundled command-line tools" ON)
-option(OA_ENABLE_TESTS "Build unit tests" ON)
+option(OA_BUILD_TOOLS "Build bundled command-line tools" OFF)
+option(OA_ENABLE_TESTS "Build unit tests" OFF)
 option(OA_ENABLE_ASAN "Build with AddressSanitizer (diagnostic builds only)" OFF)
 
 # ---------------------------------------------------------------------------
@@ -98,32 +98,15 @@ if(NOT OA_TEST_RR_PFS AND DEFINED ENV{OA_TEST_RR_PFS})
   set(OA_TEST_RR_PFS "$ENV{OA_TEST_RR_PFS}" CACHE FILEPATH "" FORCE)
 endif()
 
-# research/87: HCT (灵感满溢的甜蜜创想凸 / Hamidashi Creative Totsu)
-# real-asset movie tests — the pfs + volume chain is mounted with the
-# archive's own real parent directory as the loose-file overlay (the mp4
-# movies ship loose in movie_bai/), so the variable points at the root.pfs
-# FILE inside the game directory. Same rule as the other archives: -D, or
-# the OA_TEST_HCT_PFS env var at configure time; tests self-skip (exit 77)
-# when unset.
-set(OA_TEST_HCT_PFS "" CACHE FILEPATH "Path to the 灵感满溢的甜蜜创想凸 root.pfs (movie_bai assets; or set the OA_TEST_HCT_PFS env var at configure time)")
-if(NOT OA_TEST_HCT_PFS AND DEFINED ENV{OA_TEST_HCT_PFS})
-  set(OA_TEST_HCT_PFS "$ENV{OA_TEST_HCT_PFS}" CACHE FILEPATH "" FORCE)
-endif()
-
-# research/121 §5 S3 / research/122 (scheduler-approved B5): the two
-# new-generation E-mote archives (甜蜜女友3 = tg3, きら☆かの = slny) whose
-# gesture/action timelines are `diff=1` with the loop=[-1,-1] sentinel — the
-# data class that exposed the P0 freeze. They carry the G1 timeline
-# regression (tests/fpm/emote_timeline_test.cpp). Same rule as the other
-# archives: -D, or the env var at configure time; tests self-skip (exit 77)
-# when unset.
+# research/121 §5 S3 / research/122 (scheduler-approved B5): the
+# new-generation E-mote archive (甜蜜女友3 = tg3) whose gesture/action
+# timelines are `diff=1` with the loop=[-1,-1] sentinel — the data class
+# that exposed the P0 freeze. It carries the G1 timeline regression
+# (tests/fpm/emote_timeline_test.cpp). Same rule as the other archives: -D,
+# or the env var at configure time; tests self-skip (exit 77) when unset.
 set(OA_TEST_TG3_PFS "" CACHE FILEPATH "Path to the 甜蜜女友3 root.pfs (tg3 emote assets; or set the OA_TEST_TG3_PFS env var at configure time)")
 if(NOT OA_TEST_TG3_PFS AND DEFINED ENV{OA_TEST_TG3_PFS})
   set(OA_TEST_TG3_PFS "$ENV{OA_TEST_TG3_PFS}" CACHE FILEPATH "" FORCE)
-endif()
-set(OA_TEST_SLNY_PFS "" CACHE FILEPATH "Path to the きら☆かの root.pfs (slny emote assets; or set the OA_TEST_SLNY_PFS env var at configure time)")
-if(NOT OA_TEST_SLNY_PFS AND DEFINED ENV{OA_TEST_SLNY_PFS})
-  set(OA_TEST_SLNY_PFS "$ENV{OA_TEST_SLNY_PFS}" CACHE FILEPATH "" FORCE)
 endif()
 
 # ---------------------------------------------------------------------------

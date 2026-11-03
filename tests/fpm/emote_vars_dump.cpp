@@ -148,7 +148,7 @@ int main(int argc, char** argv) {
             std::map<std::string, double> vars;
             for (const auto& tr : f.timelines[size_t(ti)].variables) {
                 double v = 0;
-                if (oa::emote::emote_sample_track(tr, t, false, &v)) vars[tr.label] = v;
+                if (oa::emote::emote_sample_track(tr, t, &v)) vars[tr.label] = v;
             }
             std::vector<oa::emote::EmoteDrawPart> parts;
             std::string e2;
@@ -815,7 +815,7 @@ int main(int argc, char** argv) {
         std::map<std::string, double> vars;
         for (const auto& tr : f.timelines[size_t(ti)].variables) {
             double v = 0;
-            if (oa::emote::emote_sample_track(tr, t, false, &v)) vars[tr.label] = v;
+            if (oa::emote::emote_sample_track(tr, t, &v)) vars[tr.label] = v;
         }
         std::printf("[rendert] '%s' t=%g vars=%zu\n",
                     f.timelines[size_t(ti)].label.c_str(), t, vars.size());

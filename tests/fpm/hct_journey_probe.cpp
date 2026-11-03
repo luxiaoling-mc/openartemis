@@ -1,7 +1,7 @@
 // research/88 diagnostic journey probe over the HCT archive
 // (灵感满溢的甜蜜创想凸): boot -> title -> UI click script -> walk story ->
 // log every video window (channel/file/audio counters per 100 ticks) and the
-// UI layers at each park. REPORT-ONLY (like emote_axis_dump): not registered
+// UI layers at each park. REPORT-ONLY: not registered
 // as a ctest. OA_TEST_HCT_PFS gates 77.
 //
 // Driving knobs:
@@ -29,7 +29,7 @@
 #endif
 
 #include "core/fs/physfs_fs.h"
-#include "core/runtime/runtime.h"
+#include "core/runtime/runtime_game.h"
 #include "core/runtime/runtime_save.h"
 
 namespace {

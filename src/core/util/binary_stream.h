@@ -1,33 +1,5 @@
 #pragma once
-// Generic tagged binary stream (MessagePack-flavored), the transport of the
-// engine save-domain serializers. Design reference: krkrsdl3
-// cpp/tjs2/tjsBinarySerializer — little-endian one-byte type-tag stream where
-// integers/strings/raw byte blocks/arrays/maps carry their own tags and
-// lengths, so no escaping is ever needed and byte runs travel verbatim.
-//
-// Every document starts with a fixed header:
-//     bytes 0..3  magic 'O','A','S','B'
-//     bytes 4..7  u32 LE format version (kFormatVersion = 1)
-// Writers prepend it automatically; Readers validate it.
-//
-// Tag table (byte values are stable; never reuse a reserved value):
-//   0x00..0x7f  positive fixint (value = tag)
-//   0x80..0x8f  map of (tag & 0x0f) entries           0x90..0x9f  array of n
-//   0xa0..0xbf  string of (tag & 0x1f) bytes          0xc0  nil
-//   0xc1  reserved           0xc2  true               0xc3  false
-//   0xc4  str8 (u8 len)      0xc5  str16 (u16 LE)     0xc6  str32 (u32 LE)
-//   0xc7  raw8 (u8 len)      0xc8  raw16 (u16 LE)     0xc9  raw32 (u32 LE)
-//   0xca  float32 (f32 LE)   0xcb  float64 (f64 LE)
-//   0xcc  uint8  0xcd  uint16  0xce  uint32  0xcf  uint64
-//   0xd0  int8   0xd1  int16   0xd2  int32   0xd3  int64
-//   0xd4..0xd9  reserved
-//   0xda  map16 (u16 LE)     0xdb  map32 (u32 LE)
-//   0xdc  array16 (u16 LE)   0xdd  array32 (u32 LE)
-//   0xde 0xdf  reserved
-//   0xe0..0xff  negative fixint (int8 value = tag)
-//
-// Strings are length-prefixed UTF-8 byte runs; the codec copies them verbatim
-// (no charset validation, embedded NULs fine). Raw blocks are opaque octets.
+// Generic tagged binary stream (MessagePack-flavored), the transport of the engine save-domain serializers. Design reference: krkrsdl3 cpp/...
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>

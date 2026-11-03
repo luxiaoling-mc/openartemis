@@ -25,7 +25,7 @@
 #include "core/fs/fs.h"
 #include "core/fs/physfs_fs.h"
 #include "core/fs/project.h"
-#include "core/runtime/runtime.h"
+#include "core/runtime/runtime_game.h"
 #include "core/runtime/runtime_save.h"
 #include "core/render/layer.h"
 #include "core/render/text.h"
@@ -304,8 +304,8 @@ int main(int argc, char** argv) {
         }
         rt.open_project("windows");
         rt.boot_project();
-        c.stage_w = rt.project_.config.stage_width;
-        c.stage_h = rt.project_.config.stage_height;
+        c.stage_w = rt.project().config.stage_width;
+        c.stage_h = rt.project().config.stage_height;
         std::printf("[bt91] stage %.0fx%.0f\n", c.stage_w, c.stage_h);
 
         oa::runtime::FrameInput idle;

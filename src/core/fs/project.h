@@ -1,16 +1,5 @@
 #pragma once
-// Project layer: tolerant INI parsing + system.ini -> ProjectConfig.
-//
-// The generic INI reader (parser semantics below) was folded into this
-// header when the config parser lost every consumer but Project::open; its
-// INI types live directly in oa::fs (the folder's namespace).
-//
-// INI semantics:
-//   - comments start with ';' or '#'
-//   - section headers [NAME], section/key names ASCII-uppercased
-//   - 'key = value' lines; inline comments after ';'
-//   - blank lines ignored
-//   - bool values: 1/true/on/yes (any case) are true.
+// Project layer: tolerant INI parsing + system.ini -> ProjectConfig. The generic INI reader (parser semantics below) was folded into this h...
 #include <cstdint>
 #include <map>
 #include <string>

@@ -1,26 +1,6 @@
 #pragma once
 
-// GlesRenderBackend：原生 OpenGL ES 后端的接口实现。
-// 同一 RenderBackend 接口（backend.h）上的第二个实现，
-// **不使用 SDL_Render** —— GLES 上下文（SDL_GL ES profile）由本后端在
-// create() 内创建，之后全部原语用直接手写 GLES 调用实现：
-//   纹理 = GL 纹理对象；离屏 target = FBO；quad/几何 = 顶点缓冲 +
-//   GLSL ES 300 着色器（不做固定管线、不经 SDL）；blend/clip/读回 = GL 状态。
-//
-// 可观测语义基准 = SdlRenderBackend（对照基准，语义/行为零漂移）。为做到
-// 逐像素一致，本实现镜像了本机 sdl 线实际生效的 SDL3 "opengl" 渲染驱动
-// （GL2.1 compat + GLSL1.20）的渲染数学：直色 RGBA8（无 premultiply）、
-// copy/fill 全走三角形几何、顶点色 = 纹理 color/alpha mod（fill = draw
-// color）、片段色 = texture*vcolor、SDL3.4 FULL blend 模式位域分解成
-// glBlendFuncSeparate、target 渲染 row0=内容顶（读回不翻行）、窗口渲染
-// y 翻转到 letterbox dst 区（SDL_RenderReadPixels 语义同构）。
-//
-// 版本要求：GLES >= 3.0（shader #version 300 es）；创建失败 → create()
-// false + last_error() 可读原因，宿主报错退出（不许静默降级到 sdl、
-// 不许画错）。
-//
-// GL 头/库依赖为零：GLES3 入口点全部经 SDL_GL_GetProcAddress 加载
-// （无 <GLES3/gl3.h> 依赖 → windows/android/linux 构建面一致）。
+// GlesRenderBackend：原生 OpenGL ES 后端的接口实现。 同一 RenderBackend 接口（backend.h）上的第二个实现， **不使用 SDL_Render** —— GLES 上下文（SDL_GL ES profile）由本后端在 cre...
 
 #include "core/render/backend.h"
 

@@ -1,15 +1,5 @@
 #pragma once
-// Engine save formats — runtime save contract (part of the
-// runtime_save family; implementation lives in runtime_save.cpp, binary
-// since the payload became a single hand-written binary document;
-// design/table: core/util/binary_stream.h):
-//   - sys files (saveg.dat / system.dat): one binary document whose payload
-//     is a flat domain map {stripped-key: value}
-//   - numbered saves (SaveData): one binary document whose payload is the
-//     tagged map described below
-// Only the LOCAL variable domain travels with numbered saves (g./s. persist
-// via saveg/system.dat; numbered_save keeps persistent domains out of the
-// snapshot).
+// Engine save formats — runtime save contract (part of the runtime_save family; implementation lives in runtime_save.cpp, binary since the...
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -50,14 +40,7 @@ struct AudioSnap {
     bool empty() const { return !bgm && se.empty() && voice.empty(); }
 };
 
-// ---------------------------------------------------------------------------
-// Scene snapshot (openartemis-lite): verbatim layer props replay. Layer
-// ids/dotted parents come back via Compositor::create autovivify; root props
-// ("!") are carried separately.
-// ---------------------------------------------------------------------------
-/// One [lyevent] row on a layer (misc-B: layer event registrations travel
-/// with the scene snapshot — Layer.event_handlers is serialized as
-/// part of Scene, compositor/).
+// --------------------------------------------------------------------------- Scene snapshot (openartemis-lite): verbatim layer props repla...
 struct LayerEventHandlerSnap {
     std::string type; // "click" / "rollover" / "rollout" / "dragin" / ...
     bool enabled = true;
@@ -76,12 +59,7 @@ struct LayerSnap {
     std::vector<LayerEventHandlerSnap> handlers;
 };
 
-/// One message layer's visible page. The text engine's stream is runtime
-/// structure (never part of the scene snapshot), so without this the window
-/// comes back empty after a load: the saved position sits PAST the [print]
-/// that produced the line on screen, and nothing re-issues it. iMel titles
-/// autosave at every line end, so the very first thing a returning player sees
-/// is that empty window.
+/// One message layer's visible page. The text engine's stream is runtime structure (never part of the scene snapshot), so without this the w...
 struct TextLayerSnap {
     std::string id;
     bool active = false;
@@ -92,21 +70,7 @@ struct TextLayerSnap {
     bool revealed = true;                    // fully revealed when saved
 };
 
-// ---------------------------------------------------------------------------
-// One numbered save.
-//
-// Binary payload layout:
-//   "local_variables": map<string, Value>     (Value tags: nil/bool/int/
-//                                               float64/string)
-//   "current_script":  string
-//   "current_line":    int (>= 0)
-//   "call_stack":      array of { "script": string, "return_line": int }
-//   "scene"?:          { "root_props": map<string,string>,
-//                        "layers": array of layer maps }
-//   "audio"?:          { "bgm"?: channel, "se": [...], "voice": [...] }
-// A channel map: id/file strings, loop_play/skippable bools, gain/pan ints.
-// Unknown keys are skipped on read (forward tolerance within a version).
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------- One numbered save.
 struct SaveData {
     int version = kSaveFormatVersion;
     std::map<std::string, oa::runtime::Value> local_variables; // local domain keys
@@ -137,6 +101,8 @@ struct SaveData {
 std::string encode_domain_map(const std::map<std::string, oa::runtime::Value>& vars);
 /// Decode a domain-map binary document; throws oa::util::FormatError.
 std::map<std::string, oa::runtime::Value> decode_domain_map(const std::string& bytes);
+/// Sanitize the project ini SAVEPATH into a clean relative prefix (empty -> "save").
+std::string sanitize_savepath(const std::string& raw);
 
 } // namespace oa::runtime
 

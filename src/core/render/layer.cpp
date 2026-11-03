@@ -1,6 +1,5 @@
 #include "core/render/layer.h"
 #include "core/render/render_internal.h" // tween/[anime]/[trans] 语义类型（render 内部面）
-#include "core/render/content_role.h" // 角色委托: draw_order overlay-live 读侧判定
 
 #include <algorithm>
 #include <array>
@@ -16,12 +15,7 @@
 
 namespace oa::render {
 
-// ---------------------------------------------------------------------------
-// 动画态（tween 桶 + [tweenset] 收集器 + [anime] 回放）
-// 由 layer.h 的 5 个具名成员收进本不透明结构。成员声明顺序 = 原顺序 ⇒
-// 构造/析构顺序逐位不变；AnimStore 只在本 TU 可见（layer.h 只前向声明），
-// anim/transition 类型因此不再出现在任何公开头。
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------- 动画态（tween 桶 + [tweenset] 收集器 + [anime] 回放） 由 layer.h 的 5 个具名成...
 struct Compositor::AnimStore {
     // tween 桶（per-layer active tweens, tweenset collector）
     std::map<std::string, std::vector<Tween>> tweens_;
@@ -44,33 +38,6 @@ bool Compositor::layer_anime_active(const std::string& id) const {
 
 namespace {
 
-// ---------------------------------------------------------------------------
-// 写入口 → 方面位的键扫描。只按"批里出现
-// 哪些键"归类(set_props/lytween param 同语义);未知/自定义键按 Content
-// 兜底(intermediate_render/colormultiply/layermode 等滤镜面都是 Content)。
-// 归类只被统一 invalidate 簿记消费;方面清单见 layer.h DirtyAspect。
-// ---------------------------------------------------------------------------
-DirtyAspect props_aspect(const std::map<std::string, std::string>& p) {
-    DirtyAspect a = DirtyAspect::Content; // 几何(宽高)/文件/color/mask/滤镜/未知
-    for (const auto& [k, v] : p) {
-        (void)v;
-        if (k == "left" || k == "x" || k == "top" || k == "y" ||
-            k == "anchorx" || k == "anchory" || k == "xscale" ||
-            k == "yscale" || k == "zoom" || k == "rotate" ||
-            k == "reversex" || k == "reversey") {
-            a = DirtyAspect(uint16_t(a) | uint16_t(DirtyAspect::Transform));
-        } else if (k == "visible") {
-            a = DirtyAspect(uint16_t(a) | uint16_t(DirtyAspect::Visibility));
-        } else if (k == "alpha") {
-            a = DirtyAspect(uint16_t(a) | uint16_t(DirtyAspect::Opacity));
-        } else if (k == "clip") {
-            a = DirtyAspect(uint16_t(a) | uint16_t(DirtyAspect::Clip));
-        } else {
-            // Content 兜底(含 width/height/color/mask/file/自定义键)
-        }
-    }
-    return a;
-}
 
 std::string_view trim_view(std::string_view v) {
     while (!v.empty() && std::isspace((unsigned char)v.front())) v.remove_prefix(1);
@@ -257,10 +224,10 @@ void Layer::set_props(const std::map<std::string, std::string>& p) {
                 solid_rgba[2] = (*rgba)[3]; // b
                 solid_rgba[3] = (*rgba)[0]; // a
                 file.clear();
-                // color 路由同时解除宿主供帧绑定 —— 旧实现
-                // 靠 file 清空隐式降级(Solid),内容来源状态必须同步(纯色层
-                // 不再是视频/emote 层)。
-                content = LayerContent::Unbound;
+                // color 路由解除宿主绑定（纯色层不再画宿主纹理）。
+                host_bound = false;
+                texture.reset();
+                tex_w = tex_h = 0;
             }
         } else if (k == "mask") {
             mask = v; // set_mask: empty string clears
@@ -463,7 +430,7 @@ void Compositor::clear_scene() {
     // (reset/load 面;现状 legacy 无对应计数)。
     // 全节点内容消亡 = 内容写,经统一收口
     // (角色随节点消亡,无重派生;簿记位不变)。
-    note_content_change("*", DirtyAspect::Content);
+    touch();
 }
 
 void Compositor::restore_event_handler_row(const std::string& id,
@@ -506,11 +473,8 @@ void Compositor::create(const std::string& id,
     // then the SetProperties pass (lyc extras / lyc2 alpha); color may
     // re-enter solid mode and unbind the file (reduced order).
     l->set_props(props);
-    // 统一 invalidate 簿记(节点创建/重绑定 = 内容写,
-    // 经统一收口 note_content_change —— 写入口收敛表行
-    // "create": script_created/file/path + set_props 全键,存档恢复也走它)
-    note_content_change(id, DirtyAspect(uint16_t(DirtyAspect::Content) |
-                                        uint16_t(props_aspect(props))));
+    // 层状态写收口（创建/重绑定都走这里）。
+    touch();
 }
 
 /// 删除逻辑图层子树时，同步清理落在该子树上的消息层绑定与默认消息层。
@@ -582,7 +546,7 @@ void Compositor::remove(const std::string& id) {
         // 簿记: 整棵被删子树逐 id 记内容写(节点不
         // 存在时的 lydel no-op 不记 —— legacy 仍保守计数);
         // 统一收口(角色随节点消亡,无重派生 —— 收敛表行 remove)
-        note_content_change(s, DirtyAspect::Content);
+        touch();
         nodes_.erase(s);
     }
 }
@@ -618,45 +582,17 @@ void Compositor::set_props(const std::string& id,
     ensure_path(id); // lyprop on a missing id materializes the node
     Layer* l = find_mut(id);
     // [lyprop] does NOT author the node for text drawing.
-    // set_props runs for anchoring/hiding/centering rewrites everywhere
-    // (uihelp tip centering, csvbtn clear rows, mw window show/hide), so a
-    // binding-materialized node must not become drawable for unboxed message
-    // text just because such a rewrite touched it — snll config uihelp tips
-    // (500.z.help, printed with no [font] row in data) used to draw via this
-    // hole after their hover lyprop (moved them from the story slot to the
-    // default corner; user rule: with no text box the tip must not draw at
-    // all, FPM's boxed uihelp keeps drawing). Only [lyc]/[lyc2] creation
-    // (Compositor::create) marks the node as script-created.
     l->set_props(props);
     // 簿记: lyprop 写入口(含拖拽/图标等经本入口的写;
     // 缺失 id 的物化一并计入)。统一收口(收敛表行 set_props:逐键幂等
     // 解析含 color 清 file / w/h 角色升级,全部 kind 相关 typed 写经此)。
-    note_content_change(id, props_aspect(props));
+    touch();
 }
 
 Layer* Compositor::resolve_host_bind_carrier(const std::string& id, bool allow_auto) {
     Layer* l = find_mut(id);
     if (l) return l;
     // A missing carrier is auto-materialized only in the system overlay zone
-    // — the "500." id family (repo overlay convention, e.g. snll's title
-    // petal layer 500.z.mv whose [video] row precedes the later lyprop that
-    // creates it) — or when the caller passes allow_auto.
-    // In-story layer videos (story [bg movie]/[video] rows whose carriers are
-    // owned by the ADV scene system) must keep the strict bind-onto-existing-
-    // layer rule: auto-materializing them bound snll's recall-montage noise
-    // strip (ノイズa.ogv — a 7-frame loop of 88-100%-white frames drawn
-    // fullscreen over the recap) and the montage turned into a near-white
-    // flicker.
-    // The exception widens for LOOPING effect-strip videos
-    // whose decoded frame-0 content is a sparse overlay (dark canvas,
-    // keyed-alpha coverage <= 1/3 — the runtime computes this with the
-    // same oa::media::layer_video_key_alpha map the upload host uses):
-    // btjy's story-start weather loops (snow03.ogv etc.) never create
-    // their carrier leaf (the framework only lyprops the ancestor chain),
-    // so without this allowance the whole layer-video family is silently
-    // invisible in-story. Dense strips (snll's near-white noise) and
-    // one-shot wipes/cut-ins still refuse here, keeping the
-    // regression surface untouched.
     if (id.rfind("500.", 0) != 0 && !allow_auto) return nullptr;
     ensure_path(id);
     return find_mut(id);
@@ -675,7 +611,7 @@ bool Compositor::set_layer_file(const std::string& id, const std::string& file,
     l->mask.clear();
     // 簿记: 绑定成功(含物化)记内容写;失败 no-op 不记。
     // 统一收口(收敛表行 set_layer_file:file/path 绑定清 color/mask)
-    note_content_change(id, DirtyAspect::Content);
+    touch();
     return true;
 }
 
@@ -691,9 +627,11 @@ bool Compositor::bind_video_layer(const std::string& id, bool allow_auto) {
     l->path.clear();
     l->has_color = false;
     l->mask.clear();
-    l->content = LayerContent::VideoFrame;
+    l->host_bound = true;   // 通道 id == 层 id；纹理由源 update 后挂上来
+    l->texture.reset();
+    l->tex_w = l->tex_h = 0;
     // 簿记: 绑定成功(含物化)记内容写;失败 no-op 不记。
-    note_content_change(id, DirtyAspect::Content);
+    touch();
     return true;
 }
 
@@ -702,11 +640,13 @@ bool Compositor::unbind_video_layer(const std::string& id) {
     if (!l) return false;
     // 匹配语义:视频起停/EOF 收尾只在层仍绑着视频帧时解绑 —— 场景期间
     // 重新绑定过的层(静态图/emote)不被清掉(旧 file 字符串比对的内容态版本)。
-    if (l->content != LayerContent::VideoFrame) return false;
-    l->content = LayerContent::Unbound;
+    if (!l->host_bound) return false;
+    l->host_bound = false;
+    l->texture.reset();
+    l->tex_w = l->tex_h = 0;
     l->file.clear();
     // 簿记: 实际解绑才记。统一收口
-    note_content_change(id, DirtyAspect::Content);
+    touch();
     return true;
 }
 
@@ -720,8 +660,29 @@ bool Compositor::bind_emote_layer(const std::string& id, bool allow_auto) {
     l->path.clear();
     l->has_color = false;
     l->mask.clear();
-    l->content = LayerContent::EmoteCanvas;
-    note_content_change(id, DirtyAspect::Content);
+    l->host_bound = true;   // 画布纹理由 emote GPU 合成写入
+    l->texture.reset();
+    l->tex_w = l->tex_h = 0;
+    touch();
+    return true;
+}
+
+bool Compositor::set_host_texture(const std::string& id,
+                                  std::shared_ptr<oa::render::HostTexture> tex,
+                                  int w, int h) {
+    if (!tex || w <= 0 || h <= 0) return false;
+    if (id == kOverlayNodeId) set_overlay_file(); // 结构槽按需物化
+    Layer* l = find_mut(id);
+    if (!l) return false;
+    const bool changed = !l->host_bound || l->texture != tex ||
+                         l->tex_w != w || l->tex_h != h;
+    l->host_bound = true;
+    l->texture = std::move(tex);
+    l->tex_w = w;
+    l->tex_h = h;
+    // 绑定/尺寸变化才重算计划；同一纹理的逐帧 update 只需重绘（调用方
+    // request_repaint），不触发整棵计划重建。
+    if (changed) touch();
     return true;
 }
 
@@ -744,7 +705,7 @@ std::vector<const Layer*> Compositor::draw_order() const {
     const auto ov = nodes_.find(kOverlayNodeId);
     const bool overlay_live =
         ov != nodes_.end() && ov->second->layer.visible &&
-        oa::render::content_role_of(ov->second->layer).textured_content(ov->second->layer);
+        oa::render::textured_content(ov->second->layer);
     if (overlay_live) out.push_back(&ov->second->layer);
 #ifndef NDEBUG
     // 调试自检:场景区前序必须逐元素等于场景层全量 compare_ids 排序(旧
@@ -767,26 +728,22 @@ std::vector<const Layer*> Compositor::draw_order() const {
 void Compositor::set_overlay_file() {
     SceneNode* n = find_node(kOverlayNodeId);
     if (n) {
-        // clear_overlay_file() 只清 file(节点留驻);再次播放时必须幂等
-        // 恢复 file/visible —— 否则后续全屏视频(如 常轨脱离ReReCall 路线
-        // OP)画的是空文件节点,整段黑屏(首个视频后的所有全屏视频)。
-        const bool changed = n->layer.file != kOverlayNodeId || !n->layer.visible;
-        n->layer.file = kOverlayNodeId;
+        // clear_overlay_file() 只清宿主纹理(节点留驻);再次播放时恢复可见。
+        const bool changed = !n->layer.visible;
         n->layer.visible = true;
         // 簿记: 只记实际转场(播放中每帧幂等重复不记);
         // 统一收口(收敛表行 set_overlay_file:幂等不变量)
-        if (changed) note_content_change(kOverlayNodeId, DirtyAspect::Content);
+        if (changed) touch();
         return;
     }
     auto overlay_node_ = std::make_unique<SceneNode>();
     overlay_node_->layer.id = kOverlayNodeId;
-    overlay_node_->layer.file = kOverlayNodeId;
     overlay_node_->layer.has_color = false;
     overlay_node_->layer.visible = true;
     SceneNode* raw = overlay_node_.get();
     nodes_.emplace(raw->layer.id, std::move(overlay_node_));
     // 簿记: 槽节点首次物化 = 内容写;统一收口同上
-    note_content_change(kOverlayNodeId, DirtyAspect::Content);
+    touch();
 }
 
 const oa::render::SceneNode* Compositor::overlay_node() const {
@@ -798,11 +755,15 @@ const oa::render::SceneNode* Compositor::overlay_node() const {
 void Compositor::clear_overlay_file() {
     SceneNode* n = find_node(kOverlayNodeId);
     if (!n) return;
-    const bool was_bound = !n->layer.file.empty();
+    // 宿主内容（视频）的"解绑"必须同时清纹理：旧实现只看 file，视频走
+    // 宿主纹理后 file 恒空，导致播完的最后一帧永久盖在画面上。
+    const bool was_bound = !n->layer.file.empty() || n->layer.host_bound ||
+                           n->layer.texture != nullptr;
     n->layer.file.clear();
-    // 簿记: 只记实际解绑(空态重复调用不记);统一
-    // 收口(收敛表行 clear_overlay_file:幂等不变量)
-    if (was_bound) note_content_change(kOverlayNodeId, DirtyAspect::Content);
+    n->layer.host_bound = false;
+    n->layer.texture.reset();
+    n->layer.tex_w = n->layer.tex_h = 0;
+    if (was_bound) touch();
 }
 
 // ---------------------------------------------------------------------------
@@ -857,15 +818,20 @@ void Compositor::set_message_layer_binding(const std::string& message_id,
                                            const std::string& scene_id) {
     message_layer_bindings_[message_id] = scene_id;
     deleted_message_layers_.erase(message_id);
+    // 绑定表是帧计划的输入（槽位 → 消息层 id 的归属）：必须让计划失效。
+    // 只递增版本号，不记脏面（不是层内容几何，簿记口径保持不变）。
+    touch();
 }
 
 void Compositor::revive_message_layer(const std::string& message_id) {
     deleted_message_layers_.erase(message_id);
+    touch();
 }
 
 void Compositor::set_default_message_layer(
     const std::optional<std::string>& message_id) {
     default_message_layer_ = message_id;
+    touch();
 }
 
 std::optional<std::string> Compositor::resolve_message_target(
@@ -885,21 +851,6 @@ std::optional<std::string> Compositor::resolve_message_target(
 
 bool Compositor::is_message_layer_visible(const std::string& message_id) const {
     // 宿主树/删除/绑定的收敛
-    // 显式规则（compositor_test 断言锚点）。消息文本生命周期 = 宿主
-    // 窗口树生命周期（窗口树模型：节点删除即消息失效）：
-    //   1. 删除簿记标记（随 lydel/[alldelete] 父子树清理置位）⇒ 不可见；
-    //   2. 绑定目标场景节点存在但不可有效可见 ⇒ 不可见（文本绘制槽位自身
-    //      或其祖先被隐藏）；
-    //   3. 绑定目标是引擎消息槽节点（scene_id != message_id，layered=0 独立
-    //      消息，为显式槽区节点——结构判定，无前缀字符串），或绑定目标
-    //      缺失（layered identity 节点尚未建 / 独立 overlay 未被引用）⇒
-    //      host_tree_anchor_visible：沿消息 id 祖先链取最近现存节点的有效
-    //      可见性（FPM 的 [lyprop id=game.mwid visible=0]（mw.lua msg_hide）
-    //      隐藏整棵消息窗树、[alldelete]（image.lua lydel 1/400/500/600）
-    //      删光整棵窗口树——两种情况下覆盖文本都必须随之消失，真机：切屏/
-    //      退出/回标题黑页上的剧情文字残留）；
-    //   4. 绑定目标即消息 id（layered identity）且节点存在 ⇒ 自身有效可见性
-    //      （规则 2 已排除不可见情形）。
     if (deleted_message_layers_.count(message_id)) return false;
     const std::string scene_id = bound_scene_id(message_id);
     const Layer* target = find(scene_id);
@@ -927,14 +878,6 @@ bool Compositor::host_tree_anchor_visible(const std::string& message_id) const {
 bool Compositor::is_message_layer_drawable(const std::string& message_id,
                                            bool text_positioned) const {
     // 文本绘制门槛 = is_message_layer_visible（宿主树/删除/自身显隐语义）
-    // + 绘制盒门槛：渲染器只在文本层有脚本指定落点时才注入字形——
-    //   a) 文本层配置过 [font] 排版键（left/top/width/height）→ 自带绘制盒；
-    //   b) 绑定节点被脚本显式创建/改写（script_created,lyc/lyc2/lyprop）。
-    // 文本层既无绘制盒、绑定节点又只是 chgmsg 绑定自动物化（ensure_path）
-    // 的孤儿打印 → 不绘制：场景里没有任何东西给它一个位置,绘制只会把它
-    // 丢在继承来的外来几何上（NekoMiko config.lua 残留的 ui_message 数值
-    // 打印 500.p0X —— 该游戏布局没有这些读出槽,真机 Artemis 无可依附文本
-    // 盒即不显示;此处把"无可依附盒"落地为引擎规则,不改游戏数据）。
     if (!is_message_layer_visible(message_id)) return false;
     const std::string scene_id = bound_scene_id(message_id);
     const Layer* target = find(scene_id);
@@ -974,7 +917,7 @@ void Compositor::set_root_props(const std::map<std::string, std::string>& props)
     // 现状 legacy 的 LayerSetProps("!") 一并计数)。
     // 收敛表行 set_root_props = 特例:根 holder 非节点、
     // 无内容角色,经统一收口仅为簿记位不变(无重派生可做)。
-    note_content_change("", props_aspect(props));
+    touch();
 }
 
 bool Compositor::world_transform(const std::string& id, Affine2* out) const {
@@ -1129,18 +1072,7 @@ const char* kFpmGlueKeys[][2] = {{"click", "click"},       {"over", "rollover"},
                                  {"out", "rollout"},       {"dragin", "dragin"},
                                  {"drag", "drag"},         {"dragout", "dragout"}};
 
-/// FPM `lyevent` mode ops (disable/enable) are GROUP
-/// operations. The framework stops a choice screen's rows after an option
-/// click through btnstat (system/adv/button.lua:707) on the select group
-/// root — getMWID("select") = "1.80.120" — while the actual rows are
-/// registered on descendant layers ("1.80.120.N.0.0.0"). With an exact-id
-/// apply the disable never reached any row: every over/out stayed live inside
-/// the select-exit chain, and a rollout in the click -> select_clicknext
-/// window ran the game's select_out, cleared scr.select.id and the queued
-/// clicknext indexed v[nil] (select.lua:484/482 crash family — the
-/// still-pointer maintenance channel is closed elsewhere; this closes the
-/// game's own group-disable channel). Walk the target layer plus descendants
-/// and flip the rows of the given event type.
+/// FPM `lyevent` mode ops (disable/enable) are GROUP operations. The framework stops a choice screen's rows after an option click through bt...
 void set_row_mode_recursive(SceneNode* n, const std::string& event_type,
                             bool enable) {
     if (!n) return;
@@ -1185,10 +1117,8 @@ void Compositor::apply_lyevent(const std::string& id,
     ensure_path(id);
     Layer* layer = find_mut(id);
     if (!layer) return;
-    // 簿记: [lyevent] 写入口(行增删改/递归 mode;行只
-    // 影响命中/拖拽行为面;ensure_path 物化也计入)。非内容态写 —— 不在
-    // 内容写收敛表内,直走 mark_dirty。
-    mark_dirty(id, DirtyAspect::Handlers);
+    // [lyevent] 写 = 命中/拖拽行为面变化，同样进版本号。
+    touch();
 
     if (event_type.empty() && mode != "reset") {
         // FPM glue: a type-less lyevent row (button.lua:125-128) is expanded
@@ -1504,11 +1434,9 @@ void Compositor::apply_one_tween(const std::map<std::string, std::string>& p,
                      bucket.end());
     }
     bucket.push_back(std::move(tw));
-    // 簿记: 补间注册 = 目标层属性写(实际生效在活动期,
-    // 由 animated_now 帧项覆盖;此处只记事件级写,param 归方面)。属性动画轨
-    // 注册不改内容态(写发生在活动帧,走 advance_tweens 的 None 收口) ——
-    // 不在内容写收敛表内,直走 mark_dirty。
-    mark_dirty(id, props_aspect({{param, std::string()}}));
+    // 属性动画轨注册不改内容态（写在活动帧收口）——但版本号要动，
+    // 计划需要按新轨重算。
+    touch();
 }
 
 void Compositor::apply_lytween(const std::map<std::string, std::string>& params,
@@ -1560,16 +1488,10 @@ std::vector<TweenDone> Compositor::apply_lytweendel(const std::string& id) {
             // 簿记: 实际 settle 写(按 param 方面;无
             // tween 的 lytweendel no-op 不记 —— legacy 保守计数);
             // 统一收口(收敛表行 apply_lytweendel settle)
-            note_content_change(id, props_aspect({{t.param, std::string()}}));
+            touch();
         }
         if (t.set_id) sets.insert(*t.set_id);
         // a removed tween with a pending completion is a script-timer
-        // round that ends HERE — deliver the completion once so the data's
-        // round-end bookkeeping runs (the FPM sample-preview cycle in
-        // ui/config.lua rearms only from its completion handler; a silent
-        // cancel strands it). Only the directly-deleted id's bucket
-        // is delivered; tweenset cascade removals keep their plain abort
-        // semantics (no completion churn for aborted sequences).
         if (!t.handler.empty() || !t.handler_file.empty() ||
             !t.handler_label.empty()) {
             TweenDone d;
@@ -1624,7 +1546,7 @@ std::vector<TweenDone> Compositor::advance_tweens(uint64_t now_ms) {
                 // 活动帧写收口(None = 簿记不记 —— 自然完成帧由
                 // animated_now/prev 兜底;与 lytweendel 的事件级 settle 记法
                 // 区分,见收敛表行 advance_tweens)
-                note_content_change(id, DirtyAspect::None);
+                touch();
                 wants_delete = wants_delete || t.delete_on_finish;
                 if (!t.handler.empty() || !t.handler_file.empty() ||
                     !t.handler_label.empty()) {
@@ -1648,7 +1570,7 @@ std::vector<TweenDone> Compositor::advance_tweens(uint64_t now_ms) {
             l->set_props({{t.param, format_tween_param(t.param, t.get_value(now_ms))}});
             // 活动帧值写收口(None = 簿记不记 —— animated_now
             // 帧项覆盖;收敛表行 advance_tweens 的逐帧值写落点)
-            note_content_change(id, DirtyAspect::None);
+            touch();
         }
         if (keep.empty()) {
             anim_->tweens_.erase(it);
@@ -1699,7 +1621,7 @@ std::vector<TweenDone> Compositor::advance_tweens(uint64_t now_ms) {
                 // 活动帧写收口(None = 簿记不记;anime 帧直写
                 // file/mask/props 的落点 —— 收敛表行 advance_tweens 的
                 // 原坐标;角色随帧写即时投影,值语义无缓存)
-                note_content_change(id, DirtyAspect::None);
+                touch();
             }
         }
         for (const std::string& id : finished) anim_->anime_states_.erase(id);
@@ -1769,7 +1691,7 @@ void Compositor::apply_anime(const std::map<std::string, std::string>& params,
         anim_->anime_states_[id] = std::move(st);
         // 簿记: [anime] init = 内容/属性写(文件绑定+状态);
         // 统一收口(收敛表行 apply_anime init:首帧 file/mask/props 直写)
-        note_content_change(id, DirtyAspect::Content);
+        touch();
         return;
     }
     if (mode == "add") {
@@ -1783,7 +1705,7 @@ void Compositor::apply_anime(const std::map<std::string, std::string>& params,
         it->second.frames.push_back(std::move(frame));
         // 簿记: 状态追加(事件级写;播放期帧写不记)。
         // 统一收口(状态追加本身不改内容态,簿记位不变)
-        note_content_change(id, DirtyAspect::Content);
+        touch();
         return;
     }
     if (mode == "end") {
@@ -1806,7 +1728,7 @@ void Compositor::apply_anime(const std::map<std::string, std::string>& params,
         }
         // 簿记: 播放启动(首帧已应用)。
         // 统一收口(收敛表行 apply_anime end:首帧应用 = 内容写)
-        note_content_change(id, DirtyAspect::Content);
+        touch();
         return;
     }
     // unknown modes are ignored
@@ -1814,20 +1736,7 @@ void Compositor::apply_anime(const std::map<std::string, std::string>& params,
 
 } // namespace oa::render
 
-// ===========================================================================
-// §8 anim/transition 语义核。本段集中 anim/tween/[anime] 的缓动与时间线数学、
-// [trans] 语义机（Transition）：
-//   - tween/[anime] 的持有者与逐帧消费者都是本文件的 Compositor
-//     （AnimStore + apply_lytween/advance_tweens/apply_anime）；
-//   - [trans] 语义机（Transition）的唯一改写者是 runtime，但它的声明面与
-//     tween 同在 render_internal.h，故一并落此，保持"每域一个实现文件"。
-// 落点在同 TU 的另一条硬约束（实测）：本文件是 tests/* 里链接 libopenartemis
-// 时**必被拉取**的成员，且不含字体/后端依赖；若把这段语义核并进
-// renderer.cpp.o，会因该成员
-// 携带 RenderEngine→FontSystem→FT_* 未定义引用而连带拉入 font.cpp.o，使不链
-// Freetype::Freetype 的测试目标链接失败（静态库按需拉取闭包）。
-// 本段只依赖本文件头部统一提供的 include/namespace 包装，函数体无其他前置。
-// ===========================================================================
+// =========================================================================== §8 anim/transition 语义核。本段集中 anim/tween/[anime] 的缓动与时间线数学、 [tr...
 namespace oa::render {
 
 

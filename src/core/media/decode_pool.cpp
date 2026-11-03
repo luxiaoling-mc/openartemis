@@ -9,10 +9,6 @@ namespace oa::media {
 namespace {
 
 int env_threads() {
-    if (const char* e = std::getenv("OA_DECODE_THREADS"); e && *e) {
-        const int v = std::atoi(e);
-        if (v >= 0) return v;
-    }
     return -1; // unset
 }
 

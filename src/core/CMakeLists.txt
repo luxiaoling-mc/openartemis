@@ -1,4 +1,5 @@
-# libopenartemis: engine library (no windowing dependency yet)
+# libopenartemis: engine library. The host App (runtime + renderer + frame
+# loop) lives in runtime.cpp and exposes no SDL types.
 add_library(libopenartemis STATIC
   version.cpp
   util/sha1.cpp
@@ -6,7 +7,7 @@ add_library(libopenartemis STATIC
   fs/project.cpp
   fs/physfs_fs.cpp
   util/binary_stream.cpp
-  runtime/runtime.cpp        # 内核 + 控制域 + 对外薄转发
+  runtime/runtime.cpp        # 内核 + 控制域 + 宿主 App + 主循环
   runtime/runtime_media.cpp
   runtime/runtime_save.cpp
   # 官方（原生 SDK）存档容器 BOWX/BOWG/BOWS 的只读解码器：zlib 流 + 尾部
@@ -65,6 +66,7 @@ target_include_directories(libopenartemis PUBLIC
 find_package(Vorbis CONFIG REQUIRED)
 find_package(unofficial-theora CONFIG REQUIRED)
 find_package(PNG CONFIG REQUIRED)
+find_package(Freetype CONFIG REQUIRED)
 # JPEG decode: libjpeg-turbo. Android/iOS-shipped Artemis
 # archives (thyt) store story bgs (image/bg) and extras (image/ez) as real
 # JPEG while ev/fg/cg/rule stay PNG; media::decode_image dispatches on magic
@@ -83,6 +85,7 @@ target_link_libraries(libopenartemis PUBLIC
     Vorbis::vorbisfile
     unofficial::theora::theora
     PNG::PNG
+    Freetype::Freetype
     JPEG::JPEG
     ZLIB::ZLIB
     $<IF:$<TARGET_EXISTS:PhysFS::PhysFS>,PhysFS::PhysFS,PhysFS::PhysFS-static>)

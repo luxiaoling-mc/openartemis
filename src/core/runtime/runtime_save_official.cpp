@@ -1,11 +1,4 @@
-// 官方 Artemis 存档容器（BOWX / BOWG / BOWS）只读解码器。
-// 布局与实测依据见 runtime_save_official.h 的文件头注释。
-//
-// 设计约束（与 runtime_save.cpp 的"失败语义原子"一致）：
-//   - 这里只做结构校验 + 切字节，任何不一致都抛 FormatError，绝不返回半份数据；
-//   - 不修改输入字节，不猜字段语义（图层命令栈、Pluto 值都原样留着）；
-//   - 所有长度/偏移都在使用前对边界做一次显式检查（存档来自外部，
-//     zlib 头里的 raw_len 与目录偏移都是攻击面）。
+// 官方 Artemis 存档容器（BOWX / BOWG / BOWS）只读解码器。 布局与实测依据见 runtime_save_official.h 的文件头注释。 设计约束（与 runtime_save.cpp 的"失败语义原子"一致）： - 这里只做结构校验 + 切字节...
 #include "core/runtime/runtime_save_official.h"
 
 #include <algorithm>
@@ -313,16 +306,7 @@ std::vector<OfficialFrame> read_frames(Cursor& c, bool* truncated) {
     return out;
 }
 
-/// BOWS 字段 25（文本图层的排版状态）：u32 count, × count:
-///   string layer_id, u32 n_groups, × n_groups: (排版组)
-/// 每组以 u32 类型开头，紧跟 4 个 f32 = 文字框 (left, top, width, height)；
-/// 之后是字体面/字号/字距/颜色等排版细节（两代版本的尾巴长度都不一样：
-/// test4 是双字面 + 度量，test13 多了 ruby 面），所以这里**只解每层第一组
-/// 的矩形**，剩下的按图层 id 重新定位，不猜尾巴。
-///
-/// 定位方式：把 f24（文本命令，同为这批图层 id）的顺序当作锚点，在字段里
-/// 顺序查找 `<u32 长度><id>`。官方存的顺序与 f24 一致（实测两版都是），
-/// 多出来的图层（f25 比 f24 多一条的情况）不影响后面锚点继续命中。
+/// BOWS 字段 25（文本图层的排版状态）：u32 count, × count: string layer_id, u32 n_groups, × n_groups: (排版组) 每组以 u32 类型开头，紧跟 4 个 f32 = 文字框 (left, top, widt...
 std::map<std::string, OfficialRect> read_text_rects(const std::string& raw, size_t begin,
                                                     size_t end,
                                                     const std::vector<OfficialLayer>& text_layers) {
@@ -603,11 +587,6 @@ OfficialImportStats import_official_variables(
         }
         Value value = infer_official_value(raw);
         // 官方把 Lua 表（g.config / g.script / lua.scr …）存成 native Pluto
-        // 的二进制。原样搬过来的话，游戏 Lua 调 pluto.unpersist 时本引擎会
-        // 认不出（它读的是自己的标签流），而且是**静默**失败——unpersist 的
-        // 契约是"读不出来就给空表"，于是 g.config 变成 {}、conf.language 丢
-        // 失，test4 每次启动都以为自己是首次运行、反复弹语言选择。所以在
-        // 导入这一步就转成本引擎的文档格式。
         if (looks_like_official_pluto(raw)) {
             if (auto converted = convert_official_pluto(raw)) {
                 value = Value::make_string(*converted);
@@ -626,16 +605,7 @@ OfficialImportStats import_official_variables(
     return stats;
 }
 
-// ---------------------------------------------------------------------------
-// 官方 Pluto 值（native engine 的 pluto.persist 输出）→ 本引擎的 pluto 文档
-// ---------------------------------------------------------------------------
-// 官方引擎的 `pluto` 是真正的 Pluto 库（hoelzro/pluto），二进制形状是
-//   [u32 first][u32 ref][u32 type] …
-// 而本引擎的 `pluto.persist` 用的是自己的标签流（core/util/binary_stream.h，
-// 带 "OASB" 头）。两者不通用，所以官方存档里那些"持久化的 Lua 表"变量
-// （g.script / lua.scr / lua.log …）搬过来以后，游戏 Lua 再调
-// pluto.unpersist 会读不出来。这里在**导入时**转一次：官方值 → 值树 →
-// 本引擎文档。转不动就保留原始字节（调用方决定怎么处理）。
+// --------------------------------------------------------------------------- 官方 Pluto 值（native engine 的 pluto.persist 输出）→ 本引擎的 pluto 文档...
 namespace {
 
 constexpr int kPlutoMaxDepth = 128;

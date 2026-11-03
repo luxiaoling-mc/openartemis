@@ -17,6 +17,7 @@
 #include "core/fs/physfs_fs.h"
 #include "core/fs/physfs_fs.h"
 #include "core/render/font.h"
+#include "core/render/text.h"
 
 namespace {
 int failures = 0;
@@ -39,7 +40,8 @@ int main() {
     if (fpm && *fpm) {
         try {
                         oa::fs::PhysFileSystem fs(fpm, false);
-            oa::render::FontSystem font(&fs, nullptr);
+            oa::render::TextEngine text;
+            oa::render::FontSystem font(&fs, nullptr, &text);
             std::printf("[font] FPM default face: %s\n",
                         font.default_face_loaded() ? "loaded" : "MISSING");
             check(font.default_face_loaded(), "FPM: default text face resolves");
@@ -51,7 +53,8 @@ int main() {
     if (nm && *nm) {
         try {
                         oa::fs::PhysFileSystem fs(nm, false);
-            oa::render::FontSystem font(&fs, nullptr);
+            oa::render::TextEngine text;
+            oa::render::FontSystem font(&fs, nullptr, &text);
             std::printf("[font] NekoMiko default face: %s\n",
                         font.default_face_loaded() ? "loaded" : "MISSING");
             check(font.default_face_loaded(),

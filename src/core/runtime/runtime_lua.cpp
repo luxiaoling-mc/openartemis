@@ -1,26 +1,4 @@
-// Lua 5.1 host bridge — ONE translation unit.
-//
-// "Small interface, big file": the public contract is the single thin header
-// core/runtime/runtime_lua.h (LuaHost + LuaBridge); everything else the Lua
-// host surface needs lives here. The Lua domain lives in the runtime family
-// (beside runtime_iet/runtime_media/runtime_save) and the former core/lua
-// directory is gone. This file merges the eight former TUs of that directory
-//
-//   lua_bridge.cpp bridge object + shared helpers
-//   lua_tag.cpp    e:tag / e:enqueueTag
-//   lua_sys.cpp    variables/clock/random/include/file/status/handlers/debug
-//   lua_input.cpp  input/touch/mouse/overrideKey
-//   lua_surface.cpp surface + font cache
-//   lua_emote.cpp  E-mote layer objects
-//   lua_filter.cpp tag/event/log filter setters + filter dispatch
-//   lua_pluto.cpp  global `pluto` persist/unpersist codec
-//
-// and the former internal contract header lua_api.h, whose shared
-// helpers (bridge_from_state / merge_bridge_methods / value_to_string /
-// read_command_table / l_traceback) and per-domain openers (register_*) are
-// now TU-internal anonymous-namespace entities. Lua-side shape is
-// unchanged: ONE guarded engine-handle userdata whose metatable carries the
-// whole e:* method surface, plus the `pluto` global.
+// Lua 5.1 host bridge — ONE translation unit. "Small interface, big file": the public contract is the single thin header core/runtime/runti...
 #include "core/runtime/runtime_lua.h"
 
 #include <cmath>
@@ -46,14 +24,7 @@ extern "C" {
 
 namespace oa::runtime {
 
-// ---------------------------------------------------------------------------
-// Shared internal helpers.
-// ---------------------------------------------------------------------------
-// Module openers (defined in the tag/sys/input/surface/emote/filter/pluto
-// sections below): install_engine_api in the bridge-object section calls them
-// in order, the Lua linit.c/luaL_openlibs shape. Internal
-// linkage — this TU is their only caller (they were the last names
-// declared by the deleted lua_api.h contract header).
+// --------------------------------------------------------------------------- Shared internal helpers.
 static void register_pluto(lua_State* L);
 static void register_tag(lua_State* L, LuaBridge* bridge);
 static void register_sys(lua_State* L, LuaBridge* bridge);
@@ -190,40 +161,8 @@ int l_traceback(lua_State* L) {
 
 } // namespace
 
-// ---------------------------------------------------------------------------
-// Standard-library block list (os / io / loaders).
-// ---------------------------------------------------------------------------
-// Frameworks in the target ecosystem genuinely use os.date, io.open and
-// io.close (save-row date stamps, ordinary file reads/writes), so the stock
-// libraries stay in place. What must not stay reachable is the process-level
-// surface a desktop scripting library of that era exposes:
-//
-//   os.execute / os.system      run an arbitrary host command
-//                               (os.execute survives as a stub that always
-//                               answers 0 = "no shell available": it is the
-//                               standard capability probe frameworks call at
-//                               boot, and a nil field would raise instead)
-//   os.exit                     terminate the engine process
-//   os.remove / os.rename       rewrite the host filesystem
-//   os.setlocale                process-wide locale change
-//   os.tmpname                  host temp-file creation
-//   io.popen                    spawn a shell
-//   io.tmpfile / io.input / io.output   ambient host streams
-//   dofile / loadfile / loadstring / load, package.loadlib   load native or
-//                               arbitrary code
-//
-// (*os.system exists only in the Windows Lua build; blocking it by name keeps
-// the policy identical on every platform.)
-//
-// Entries are removed with the plain Lua C API (pushnil + setfield), so what
-// survives keeps upstream 5.1 behaviour untouched. OA_LUA_STDLIB=stock skips
-// the block list (A/B arm).
+// --------------------------------------------------------------------------- Standard-library block list (os / io / loaders).
 namespace {
-
-bool stdlib_block_disabled() {
-    const char* v = std::getenv("OA_LUA_STDLIB");
-    return v && std::strcmp(v, "stock") == 0;
-}
 
 void drop_table_fields(lua_State* L, const char* tname, const char* const* names, size_t n) {
     lua_getglobal(L, tname);
@@ -238,21 +177,13 @@ void drop_table_fields(lua_State* L, const char* tname, const char* const* names
     lua_pop(L, 1);
 }
 
-/// `os.execute()` with no argument is Lua 5.1's "is a shell available?" probe.
-/// Frameworks probe it before deciding to spawn an external helper — Artemis'
-/// system/extend/updater.lua does exactly that (`os.execute() == 1 and
-/// isFile("Updater.exe")`). Removing the field outright turned that probe into
-/// "attempt to call field 'execute' (a nil value)" at boot. Answer 0 ("no
-/// shell"): the caller takes its "updater unavailable" branch and nothing is
-/// ever executed, so the process-level surface stays closed.
+/// `os.execute()` with no argument is Lua 5.1's "is a shell available?" probe. Frameworks probe it before deciding to spawn an external help...
 int l_os_execute_unavailable(lua_State* L) {
     lua_pushinteger(L, 0);
     return 1;
 }
 
 void apply_stdlib_block_list(lua_State* L) {
-    if (stdlib_block_disabled()) return;
-
     static const char* const kOsBanned[] = {
         "exit", "remove", "rename", "setlocale", "tmpname", "system",
     };
@@ -362,26 +293,6 @@ void LuaBridge::install_save_open_redirect(lua_State* L) {
 
 void LuaBridge::install_engine_api() {
     // Lua native-library boot (the analog of luaL_openlibs / linit.c): the
-    // slices of the Lua host surface are the tag/sys/input/surface/emote/
-    // filter/pluto sections of THIS file, each exporting one register_*
-    // opener declared above. Slice sections
-    // merge their static luaL_Reg tables into the engine handle's method
-    // table on top of the stack; pluto owns its own global table.
-    //
-    // The Lua side meets the bridge as ONE engine handle (full userdata):
-    //   * its payload stores the owning LuaBridge* (identity; the working
-    //     recovery path is the method-closure upvalue, see
-    //     bridge_from_state / merge_bridge_methods),
-    //   * its metatable IS the method table — merged by the openers above —
-    //     with __index pointing back at itself (method lookup) and a
-    //     __metatable guard: scripts can call e:* methods but cannot
-    //     enumerate, overwrite or re-metatable the API surface,
-    //   * it is anchored by ONE anonymous luaL_ref (engine_ref_). The handle
-    //     only ever reaches Lua as the first argument `e` of a host->Lua call
-    //     (calllua rows / FPM (e, p) event handlers / tag + event filter
-    //     callbacks) — every such call goes through push_engine, so scripts
-    //     that only ever get the engine as a parameter (the original engine's
-    //     contract) see a fully populated surface without any global name.
 
     LuaBridge** slot = static_cast<LuaBridge**>(lua_newuserdata(L_, sizeof(LuaBridge*)));
     *slot = this;
@@ -419,7 +330,6 @@ int64_t LuaBridge::next_random() {
 }
 
 void LuaBridge::run_code(const std::string& code, const std::string& chunk_name) {
-    if (std::getenv("OA_LUA_DEBUG")) std::fprintf(stderr, "[lua] run_code: %s\n", chunk_name.c_str());
     if (luaL_loadbuffer(L_, code.data(), code.size(), chunk_name.c_str()) != 0) {
         const std::string msg = lua_tostring(L_, -1) ? lua_tostring(L_, -1) : "load error";
         lua_pop(L_, 1);
@@ -440,171 +350,7 @@ void LuaBridge::run_code(const std::string& code, const std::string& chunk_name)
 
 bool LuaBridge::call_function(const std::string& dotted,
                               const std::map<std::string, std::string>& params) {
-    if (std::getenv("OA_LUA_DEBUG"))
-        std::fprintf(stderr, "[lua] call_function: %s\n", dotted.c_str());
-    // OA_SELTRACE: state dump at every select_exit
-    // chain entry (engine dispatch, see Interpreter::call_lua_function in
-    // runtime_iet.cpp) plus direct select_click calls. Prints the Lua-side
-    // story position and the scr.select state at the exact moment
-    // clicknext/exittrans runs, so a user crash log (select.lua:482/484
-    // family) identifies the chain that reached clicknext without a live
-    // scr.select. Env-gated: zero output unless OA_SELTRACE is set.
-    if (std::getenv("OA_SELTRACE") && dotted == "estag_call") {
-        static uint64_t est_seq = 0;
-        lua_getglobal(L_, "scr");
-        std::string est;
-        if (lua_istable(L_, -1)) {
-            lua_getfield(L_, -1, "est");
-            if (lua_istable(L_, -1)) {
-                char buf[400];
-                std::snprintf(buf, sizeof(buf), "est#%d", (int)lua_objlen(L_, -1));
-                est = buf;
-                for (int i = 1; i <= (int)lua_objlen(L_, -1); ++i) {
-                    lua_rawgeti(L_, -1, i);
-                    if (lua_istable(L_, -1)) {
-                        lua_rawgeti(L_, -1, 1);
-                        const char* tg = lua_tostring(L_, -1);
-                        if (tg && est.size() < 360) {
-                            est += " [";
-                            est += tg;
-                            est += "]";
-                        }
-                        lua_pop(L_, 1);
-                    }
-                    lua_pop(L_, 1);
-                }
-            }
-            lua_pop(L_, 1);
-        }
-        lua_pop(L_, 1);
-        std::fprintf(stderr, "[seltrace] s%llu estag_call %s ms=%llu\n",
-                     (unsigned long long)++est_seq, est.c_str(),
-                     (unsigned long long)(host_.now_ms ? host_.now_ms() : 0));
-    }
-    if (std::getenv("OA_SELTRACE") &&
-        (dotted == "select_clicknext" || dotted == "select_exittrans" ||
-         dotted == "select_click")) {
-        static uint64_t sel_trace_seq = 0;
-        auto field_str = [&](int tbl, const char* key) -> std::string {
-            // reads tbl[key]; leaves the stack balanced (Lua 5.1 has no
-            // lua_absindex: normalize negative indexes manually)
-            if (lua_type(L_, tbl) != LUA_TTABLE) return "?";
-            const int abs = tbl > 0 ? tbl : lua_gettop(L_) + tbl + 1;
-            lua_getfield(L_, abs, key);
-            const char* v = lua_tostring(L_, -1);
-            std::string out = v ? v : "";
-            if (out.empty() && !lua_isnil(L_, -1)) {
-                if (lua_isnumber(L_, -1) || lua_isboolean(L_, -1)) {
-                    const char* n = lua_tostring(L_, -1);
-                    out = n ? n : "";
-                }
-            }
-            lua_pop(L_, 1);
-            return out.empty() ? "-" : out;
-        };
-        std::string ip_file, ip_block, ip_count, ip_sel;
-        bool ip_ok = false;
-        lua_getglobal(L_, "scr");
-        const bool scr_tbl = lua_istable(L_, -1) != 0;
-        if (scr_tbl) {
-            lua_getfield(L_, -1, "ip");
-            if (lua_istable(L_, -1)) {
-                ip_ok = true;
-                ip_file = field_str(-1, "file");
-                ip_block = field_str(-1, "block");
-                ip_count = field_str(-1, "count");
-            }
-            lua_pop(L_, 1); // ip
-        }
-        // select state: presence / # / id / autoselect / name / hide / wait
-        std::string sel_state = "nil";
-        if (scr_tbl) {
-            lua_getfield(L_, -1, "select");
-            if (lua_istable(L_, -1)) {
-                char buf[320];
-                std::string idv = field_str(-1, "id");
-                std::string asv = field_str(-1, "autoselect");
-                std::string nmv = field_str(-1, "name");
-                std::string hdv = field_str(-1, "hide");
-                std::string wtv = field_str(-1, "wait");
-                std::snprintf(buf, sizeof(buf),
-                              "tbl(#%d,id=%s,auto=%s,name=%s,hide=%s,wait=%s)",
-                              (int)lua_objlen(L_, -1), idv.c_str(), asv.c_str(),
-                              nmv.c_str(), hdv.c_str(), wtv.c_str());
-                sel_state = buf;
-            }
-            lua_pop(L_, 1); // select
-        }
-        lua_pop(L_, 1); // scr
-        std::string caller;
-        lua_Debug ar;
-        for (int lvl = 1; lvl <= 4; ++lvl) {
-            if (!lua_getstack(L_, lvl, &ar)) break;
-            if (!lua_getinfo(L_, "nSl", &ar)) continue;
-            char one[512];
-            // lua_Debug::short_src is a char array (never null).
-            std::snprintf(one, sizeof(one), "%s @%s", ar.name ? ar.name : "?",
-                          ar.short_src);
-            caller += one;
-            caller += "; ";
-            if (caller.size() > 380) break;
-        }
-        std::fprintf(stderr,
-                     "[seltrace] s%llu lua %s ms=%llu ip{file=%s block=%s "
-                     "count=%s} select=%s lua_callers[%s]\n",
-                     (unsigned long long)++sel_trace_seq, dotted.c_str(),
-                     (unsigned long long)(host_.now_ms ? host_.now_ms() : 0),
-                     ip_file.c_str(), ip_block.c_str(), ip_count.c_str(),
-                     sel_state.c_str(), caller.c_str());
-        (void)ip_ok;
-    }
-    // OA_NM_SELDBG: attribute select_* Lua calls — the engine
-    // layer/push dispatch invokes the handler directly (no Lua caller) while
-    // the keyconfig chain calls it from setonpush_calllua (Lua caller).
-    if (std::getenv("OA_NM_SELDBG") && dotted.rfind("select_", 0) == 0) {
-        static uint64_t sel_seq = 0;
-        std::string caller;
-        lua_Debug ar;
-        for (int lvl = 1; lvl <= 4; ++lvl) {
-            if (!lua_getstack(L_, lvl, &ar)) break;
-            if (!lua_getinfo(L_, "n", &ar)) continue;
-            if (ar.name) {
-                caller = ar.name;
-                break;
-            }
-        }
-        std::fprintf(stderr, "[seldbg] s%llu lua %s caller=%s\n",
-                     (unsigned long long)++sel_seq, dotted.c_str(),
-                     caller.empty() ? "(engine)" : caller.c_str());
-        if (dotted == "select_clicknext") {
-            // state probe: scr.select rows + id at entry (kept off-stack)
-            char idbuf[32] = "(nil)";
-            lua_getglobal(L_, "scr");
-            const bool scr_tbl = lua_istable(L_, -1) != 0;
-            if (scr_tbl) {
-                lua_getfield(L_, -1, "select");
-                const bool sel_tbl = lua_istable(L_, -1) != 0;
-                if (sel_tbl) {
-                    lua_pushliteral(L_, "id");
-                    lua_gettable(L_, -2);
-                    if (lua_isnumber(L_, -1))
-                        std::snprintf(idbuf, sizeof(idbuf), "%lld",
-                                      (long long)lua_tonumber(L_, -1));
-                    else if (lua_isstring(L_, -1))
-                        std::snprintf(idbuf, sizeof(idbuf), "%s",
-                                      lua_tostring(L_, -1));
-                    lua_pop(L_, 1);
-                    std::fprintf(stderr,
-                                 "[seldbg]   clicknext probe: #select=%d id=%s\n",
-                                 (int)lua_objlen(L_, -1), idbuf);
-                } else {
-                    std::fprintf(stderr, "[seldbg]   clicknext probe: scr.select=nil\n");
-                }
-                lua_pop(L_, 1); // select
-            }
-            lua_pop(L_, 1); // scr
-        }
-    }
+    
     // Fast path then dotted walk from _G.
     if (!push_dotted_function(L_, dotted)) return false;
     // First argument: the engine handle (FPM (e, p) convention), re-pushed
@@ -614,11 +360,6 @@ bool LuaBridge::call_function(const std::string& dotted,
     for (const auto& [k, v] : params) {
         lua_pushlstring(L_, v.data(), v.size());
         lua_setfield(L_, -2, k.c_str());
-    }
-    // lua_pcall expects [function, arg1, arg2] with the function first; the
-    // traceback handler goes below it so errors come back pre-decorated.
-    if (std::getenv("OA_LUA_DEBUG")) {
-        std::fprintf(stderr, "[lua] pre-call stack: %d items (fn at -3)\n", lua_gettop(L_));
     }
     lua_pushcfunction(L_, l_traceback);
     lua_insert(L_, -4); // [handler, fn, engine, params]
@@ -646,8 +387,6 @@ bool LuaBridge::call_plain(const std::string& dotted) {
 
 void LuaBridge::report_dispatch_error(const char* what, const std::string& name,
                                       const std::string& msg) const {
-    // Fail-fast escape hatch (see the header contract): the pre-130 behavior.
-    if (std::getenv("OA_LUA_STRICT")) throw LuaError(msg);
     // Rate limit per (what,name): a broken per-frame handler (vsync) would
     // otherwise log at frame rate — the reference runtime guards it exactly
     // this way.
@@ -732,14 +471,6 @@ int l_tag(lua_State* L) {
         return 0;
     }
     // e:tag{"calllua",...} from Lua runs synchronously (the
-    // .asb [calllua] tag runs inline; the deferred queue drain let the
-    // enclosing Lua flow rebuild state — button groups, dialogs — before the
-    // callback executed, so per-button out handlers read a stale group and
-    // game code indexed nil (thyt exui.lua:100 crash family). Errors inside
-    // the nested call are converted to a regular Lua error at this pcall
-    // boundary (the outer engine call unwinds cleanly). A missing/empty
-    // "function" keeps the historical queue path so its drain-time error
-    // surfaces unchanged.
     if ((tag == "calllua" || tag == "forcedcalllua") &&
         bridge->host().run_calllua_sync) {
         auto fnit = params.find("function");
@@ -823,11 +554,6 @@ int l_var(lua_State* L) {
         return 1;
     }
     // e:var 语义 = 变量的文本形态(与 Artemis 一致):数值/布尔一律以字符串
-    // 呈现("0"/"1"/"500"),缺失 -> "0"。mkmh(2023+) 框架对 e:var 结果做
-    // 字符串操作(== "0"、:gsub、字符串连接),数字返回会直接炸
-    // (attempt to index a number value);需要算术的地方都显式 tonumber()。
-    // 老游戏(fpm/NekoMiko/thyt)的 Lua 对数值变量一律字符串比较(== "0"),
-    // 数值返回反而是错的;脚本侧 $ 表达式不受影响(内部仍是 Value)。
     switch (v->kind) {
         case oa::runtime::ValueKind::Int: {
             // lua_pushfstring 不支持 %lld(C 格式);经 snprintf 中转。
@@ -988,9 +714,6 @@ int l_debug(lua_State* L) {
     } else {
         data = value_to_string(L, 2);
     }
-    if (std::getenv("OA_LUA_DEBUG")) {
-        std::fprintf(stderr, "[lua-debug lv=%d] %s\n", level, data.c_str());
-    }
     return 0;
 }
 
@@ -1089,14 +812,6 @@ int l_get_script_block(lua_State* L) {
     }
     const auto block = bridge->host().script_block(file, index);
     if (!block) {
-        // Never hand back nil: iMel's tagFilters index the result
-        // unconditionally (`local command = currentTag.command`), so a nil
-        // turned every [waitstop] into a Lua error → filter "not handled" →
-        // no wait armed → the story ran by itself. An empty block keeps the
-        // filter alive (its command compares as "" = unknown row).
-        if (std::getenv("OA_STORYDBG"))
-            std::fprintf(stderr, "[script] getScriptBlock('%s', %zu) -> empty block\n",
-                         file, index);
         lua_createtable(L, 0, 2);
         lua_pushliteral(L, "");
         lua_setfield(L, -2, "command");
@@ -1366,13 +1081,6 @@ const char* const kEmoteLayerMethods[] = {
     "fadeOutTimeline", "pass", "step", "skip", "setVariable", "getVariable",
     "stop", "getTimelinePlaying", "isTimelinePlaying", "progress",
     // KukkoroDays system/adv/emote.lua (research/127) — the older Windows
-    // framework variant saves/restores the whole variable domain around a pose
-    // change, so the layer object needs the domain enumeration and the 差分
-    // (difference) writer:
-    //   playTimeline(): for i=0, layer:countVariables() do
-    //                       local l = layer:getVariableLabelAt(i) ... end
-    //                   layer:setVariableDiff("cheek", "face_cheek", diff,0,0)
-    //   vsync():        layer:getVariable("face_cheek") + setVariableDiff
     "countVariables", "getVariableLabelAt", "setVariableDiff",
 };
 
@@ -1385,16 +1093,6 @@ int l_emote_layer_method(lua_State* L) {
         id = lua_tostring(L, lua_upvalueindex(3));
 
     // parse arguments by method family. Lua method syntax puts the self
-    // table at index 1: string-first methods take their string at 2 and
-    // numbers at 3..5 (setVariableDiff is the two-string shape:
-    // srcLabel at 2, dstLabel at 3, value at 4); numeric-first methods
-    // (setScale/setCoord/setZoom, progress(ct) — 甜蜜女友3
-    // ex.progress/emote.vsync — and getVariableLabelAt(index))
-    // take their numbers at 2..4. For playTimeline this is exactly the
-    // official SDK PlayTimeline(label, flags) shape: the
-    // label lands in s and the flags bitfield in n1 (arg 3), which
-    // runtime_media forwards to EmotePlayer::play_timeline(label, flags) —
-    // TIMELINE_PLAY_PARALLEL=1 appends to the foreground list.
     const bool two_string = std::strcmp(which, "setVariableDiff") == 0;
     std::string s;
     std::string s2;
@@ -1838,13 +1536,6 @@ void read_pluto_value(lua_State* L, oa::util::Reader& r, int depth) {
         for (size_t i = 0; i < n; ++i) {
             read_pluto_value(L, r, depth + 1); // key
             // Only a *real* NaN number key is unusable (rawset would make it
-            // unreachable) and nil keys are illegal. The numeric-string
-            // coercion path must NOT apply here: lua_isnumber/lua_tonumber
-            // accept the plain string "nan"/"inf" (strtod), so a legitimate
-            // string key named "nan" (Artemis config rows, e.g. snll
-            // conf.nan) used to be rejected as a NaN number and the whole
-            // pluto document collapsed to {} — 读档 conf_reload then hit
-            // conf.mspeed == nil (getMSpeed crash).
             if (lua_isnil(L, -1)) {
                 lua_pop(L, 1);
                 throw oa::util::FormatError("pluto unpersist: invalid map key");

@@ -42,10 +42,9 @@
 #endif
 
 #include "core/fs/physfs_fs.h"
-#include "core/runtime/runtime.h"
+#include "core/runtime/runtime_game.h"
 #include "core/runtime/runtime_save.h"
 #include "core/render/layer.h"
-#include "core/render/layer_kind.h" // layer-model S5: 绑定判定经内容角色
 
 namespace {
 using K = oa::runtime::WaitReason::Kind;
@@ -195,8 +194,7 @@ void video_dump(oa::runtime::GameRuntime& rt, const char* tag, bool veil_stats) 
         // S5 (research/108): 绑定判定 = 层的内容来源状态(视频帧域 = Video 角色);
         // 保留命名空间 file 比对已删除。
         for (const oa::render::Layer* l : rt.scene().draw_order()) {
-            if (l->id == id && l->visible &&
-                oa::render::kind_of(*l) == oa::render::LayerKind::Video)
+            if (l->id == id && l->visible && l->host_bound)
                 bound = true;
         }
         std::string veil;

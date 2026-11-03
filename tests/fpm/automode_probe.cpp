@@ -17,7 +17,7 @@
 #include <string>
 
 #include "core/fs/physfs_fs.h"
-#include "core/runtime/runtime.h"
+#include "core/runtime/runtime_game.h"
 
 namespace {
 const char* kind_str(oa::runtime::WaitReason::Kind k) {

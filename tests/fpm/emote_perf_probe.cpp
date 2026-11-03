@@ -33,10 +33,9 @@
 #include <SDL3/SDL.h>
 
 #include "core/fs/physfs_fs.h"
-#include "core/render/content_role.h"
 #include "core/render/layer.h"
 #include "core/render/renderer.h"
-#include "core/runtime/runtime.h"
+#include "core/runtime/runtime_game.h"
 
 namespace {
 using Clock = std::chrono::steady_clock;
@@ -325,8 +324,8 @@ int main(int argc, char** argv) {
     // emote_render_parts -> draw_scene -> present), i.e. the windowed
     // emote-pump cost the app pays at the pose cadence.
     if (env_int("OA_PERF_GPU", 0)) {
-        const int sw = rt.project_.config.stage_width;
-        const int sh = rt.project_.config.stage_height;
+        const int sw = rt.project().config.stage_width;
+        const int sh = rt.project().config.stage_height;
         if (!SDL_Init(SDL_INIT_VIDEO)) {
             std::printf("[perf] GPU mode: SDL_Init failed: %s\n", SDL_GetError());
         } else {
@@ -355,11 +354,10 @@ int main(int argc, char** argv) {
                     const auto t0 = Clock::now();
                     rt.tick(16, in);
                     // ---- host frame pump: the real core-side pump ----
-                    // (RenderEngine::pump_host_frames — same call the app
+                    // (图像源自己在 tick 里推送，探针不再拉取)
                     // loop makes; the probe's local rev map is no longer the
                     // delivery mechanism, only the churn replay below uses
                     // its own bookkeeping.)
-                    re.pump_host_frames(nullptr);
                     if (i >= frames && i % 120 == 0) {
                         // replay the one-shot during churn
                         for (auto& [id, st] : rt.emote_layers()) {
@@ -371,8 +369,8 @@ int main(int argc, char** argv) {
                             }
                         }
                     }
-                    // ---- scene draw + present (render_beigin..render_end) --
-                    re.render_beigin();
+                    // ---- scene draw + present (render_begin..render_end) --
+                    re.render_begin();
                     re.draw_scene(rt.scene(), 1.0);
                     re.progress_transition();
                     re.render_end();

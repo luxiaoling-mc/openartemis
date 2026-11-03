@@ -1,24 +1,4 @@
-// ===========================================================================
-// runtime_iet.cpp — the complete oa::runtime module in ONE translation unit.
-//
-// The module runs Artemis scenario data: the value/variable model, the
-// expression evaluator, the .iet/.ast text parser, the .asb binary decoder
-// and the interpreter that executes instructions (control tags, waits, Lua
-// hooks, script store + call stack + save/restore of the execution position).
-//
-// Organization follows krkrsdl3 cpp/core/script/tjsNativeKAGParser.cpp, the
-// KAG scenario unit this format descends from: scenario cache/loading,
-// parsing, execution state and the save/restore of that state live in one
-// file, sectioned top-down —
-//    values/expressions -> instruction + script parsing (.iet/.asb) ->
-//    interpreter/execution -> hooks.
-// Only the organization is borrowed; no KAG code is.
-//
-// Interface: runtime/runtime_iet.h is the single (thin) public header. Every
-// helper here — parsers, tag dispatch, depth scans, formatting, the Lua host
-// bootstrap — is internal linkage (anonymous namespace) and invisible to
-// callers. Keep it that way: "small interface, big file".
-// ===========================================================================
+// =========================================================================== runtime_iet.cpp — the complete oa::runtime module in ONE tran...
 #include "core/runtime/runtime_iet.h"
 
 #include <algorithm>
@@ -887,22 +867,7 @@ struct Segment {
     std::string text;
 };
 
-// Applies this language's comment rules to one raw line, removing comment
-// material from its code content:
-//   - "//" comments to end of line, recognized only at the start of a text
-//     run (start of the line, or just after a ']' tag close, with at most
-//     whitespace before it) -- inside "[...]" parameters '/' is literal;
-//   - ";" comments only start at the very beginning of a line's content
-//     (checked by the caller);
-//   - "/* ... */" block comments. Content inside a block is opaque: no
-//     bracket/quote/comment parsing happens there, so a block may contain
-//     '[' or "//" and may span raw lines. A block opened at the start of a
-//     line (nothing but whitespace before it) may continue on following
-//     lines (in_block state); a block opened right after a tag close that
-//     is not closed on the same line just runs to the end of the line,
-//     like "//".
-// Quotes inside a tag protect their content; quotes outside tags are plain
-// story text (matching split_line_segments).
+// Applies this language's comment rules to one raw line, removing comment material from its code content: - "//" comments to end of line, r...
 std::string strip_line_comments(std::string_view raw, size_t line_no,
                                 bool& in_block, size_t& block_line) {
     std::string out;
@@ -997,13 +962,7 @@ std::vector<Segment> split_line_segments(std::string_view line) {
     return segments;
 }
 
-// True when the line ends inside an unclosed "[...]" tag (quotes protect
-// brackets). The framework spreads long tags over several lines:
-//   [execcsv exec = "font" csv = "..."
-//        height = "$g.screen_height"   // comment
-//        align  = "$t.fontalign"]
-// and the line-based parser used to turn such a tag into story text (the
-// whole block was printed as narration and its effect silently skipped).
+// True when the line ends inside an unclosed "[...]" tag (quotes protect brackets). The framework spreads long tags over several lines: [ex...
 bool has_unclosed_tag(std::string_view line) {
     bool in_tag = false;
     bool in_quote = false;
@@ -1063,22 +1022,7 @@ std::vector<std::string_view> split_lines(std::string_view content) {
 
 } // namespace
 
-// ---------------------------------------------------------------------------
-// §4b Script-input preprocessor ([&scpsupport] / [&autoinsert] / [&linetag])
-//
-// Artemis resolves these LOAD-TIME directives into text substitutions before
-// a line is parsed (Docs/tag/preprocessor/*). iMel titles depend on them:
-// every scenario writes
-//     [&autoinsert target="linehead"  command="[onlinehead]"]
-//     [&autoinsert target="lineend"   command="[onlineend]"]
-//     [&autoinsert target="blankline" command="[onblankline]"]
-// at the top and then one plain sentence per line. `*onlineend` (macro.iet)
-// is where the page break lives:
-//     [wait scenario = "1" input = "1" skip = "1"]   <- click releases it
-// so without the preprocessor NO wait is ever armed for a story line and the
-// scenario runs to its end by itself (Watamari/test10: "story skips on its
-// own"). Lines without directives are untouched: the rules start out empty.
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------- §4b Script-input preprocessor ([&scpsupport] / [&autoinsert]...
 struct PreprocRules {
     std::string linehead;
     std::string lineend;
@@ -1600,15 +1544,6 @@ void Interpreter::load_file(const std::string& name, const std::vector<uint8_t>&
         bytes[3] == 0) {
         // ASB -> text -> regular parser
         const std::string decoded = decode_asb(bytes);
-        if (const char* dump = std::getenv("OA_SCRIPT_DUMP"); dump && name == dump) {
-            if (FILE* f = std::fopen("oa_script_dump.txt", "wb"))
-            {
-                std::fwrite(decoded.data(), 1, decoded.size(), f);
-                std::fclose(f);
-                std::fprintf(stderr, "[script] dumped %s (%zu bytes)\n", name.c_str(),
-                             decoded.size());
-            }
-        }
         load_script(name, decoded);
         return;
     }
@@ -1619,8 +1554,6 @@ void Interpreter::load_file(const std::string& name, const std::vector<uint8_t>&
 }
 
 void Interpreter::load_external_script(const std::string& file) {
-    if (std::getenv("OA_SCRIPT_DUMP"))
-        std::fprintf(stderr, "[script] load %s\n", file.c_str());
     if (scripts_.count(file)) return;
     if (!hooks_.file_loader) {
         throw ScriptError("script-not-found", "no file loader wired; cannot load " + file);
@@ -1794,16 +1727,6 @@ void Interpreter::restore_macro_params(size_t depth) {
 std::optional<std::pair<std::string, std::map<std::string, std::string>>>
 Interpreter::script_block(const std::string& file, size_t index) const {
     // iMel's tag filters (macro.iet: tagFilters.waitstop / .return) take a
-    // frame out of e:getScriptStack() and feed it straight back here. They
-    // index the RESULT without a nil check (`local command = currentTag.command`),
-    // so a miss is a Lua crash → the filter verdict degrades to "not handled"
-    // → [waitstop] produces no wait at all → the story advances by itself.
-    // Two robustness rules therefore matter on this face:
-    //   1) resolve the script name across the '\' / '/' spellings the stack
-    //      can carry (the frames keep whatever spelling loaded them);
-    //   2) clamp an out-of-range index to the last row instead of failing —
-    //      the caller's index arithmetic is `index - 1` on our own line
-    //      numbers, and a one-off must not drop the whole wait.
     const Script* script = nullptr;
     if (const auto it = scripts_.find(file); it != scripts_.end()) {
         script = &it->second;
@@ -1826,19 +1749,11 @@ Interpreter::script_block(const std::string& file, size_t index) const {
         }
     }
     if (!script) {
-        if (std::getenv("OA_STORYDBG"))
-            std::fprintf(stderr, "[script] getScriptBlock miss: no script '%s'\n",
-                         file.c_str());
         return std::nullopt;
     }
     const auto& rows = script->instructions;
     if (rows.empty()) return std::nullopt;
     if (index >= rows.size()) {
-        if (std::getenv("OA_STORYDBG"))
-            std::fprintf(stderr,
-                         "[script] getScriptBlock '%s' index=%zu out of range (rows=%zu) "
-                         "-> clamped\n",
-                         file.c_str(), index, rows.size());
         index = rows.size() - 1;
     }
     return std::make_pair(rows[index].tag, rows[index].params);
@@ -1957,18 +1872,6 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
     }
 
     const std::string& tag = ins.tag;
-    if (std::getenv("OA_TAGTRACE")) {
-        std::string pv;
-        for (const auto& [k, v] : ins.params) {
-            if (k == "id" || k == "file" || k == "name" || k == "data" ||
-                k == "estimate" || k == "system" || k == "label") {
-                pv += k + "=" + v + " ";
-            }
-        }
-        std::fprintf(stderr, "[tag] %-12s %s @%s:%zu\n", tag.c_str(), pv.c_str(),
-                     it.current_script() ? it.current_script()->c_str() : "?",
-                     it.current_line());
-    }
     VariableStore& vars = it.variables();
     const ExpressionEvaluator eval(vars);
     TagOutcome out;
@@ -1981,37 +1884,13 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
     };
 
     // -- inline Lua tag filter (e:setTagFilter): consult tags.<tag> --------
-    // tags with a NATIVE engine handler (register_engine_tag, e.g.
-    // [alldelete]) are exempt — these dispatch natively and
-    // never lets a Lua framework handler swallow them (FPM registers
-    // tags.alldelete in image.lua, whose Lua-side lydel bookkeeping cannot
-    // outlive [exit]/[reset]; the native whole-scene fade+clear is the
-    // engine contract).
-    // mkmh(2023+) 框架注册了 tags.return,但其实现依赖
-    // getScriptStack/getScriptBlock 等脚本块 API(引擎按等待/调用栈模型
-    // 原生执行,块栈是存根),先询问会在第一个 [return] 上崩 —— 仅豁免
-    // 这一个内置流标签。其余标签保持老引擎语义:先问 Lua tag filter
-    // (fpm/NekoMiko/thyt 的 tags.stop(exskip)/tags.@ / exkey / タイトル
-    // … 仍由过滤器拦截)。
     if (apply_filter && tag != "return") {
         const bool is_engine_native = it.engine_tags().count(tag) > 0;
         // A [macroadd]-registered tag has a native handler too (the macro call
-        // below). Without this a framework filter that returns 0 ("not
-        // handled, run it yourself" — iMel's 背景/イベントCG filters do exactly
-        // that for every st=/add= row) counted as a consume and the macro never
-        // ran: the background layer stayed empty and the story page was drawn
-        // without its background.
         const bool is_macro = it.macros().count(tag) > 0;
         const bool has_builtin = is_builtin_tag(tag) || is_engine_native || is_macro;
         if (!is_engine_native) {
             // Tag filters receive EVALUATED parameter strings — the framework's
-            // tags.<tag> handlers treat p.file / p.data as final values (e.g.
-            // macro.iet's lyc filter runs gFileExists(e, param.file) directly
-            // and then re-issues e:tag{"lyc", file=param.file}). Handing them
-            // the raw `$...` text made every [lyc file="$os_name_path + ..."]
-            // fail its existence check, the filter consumed the tag, and boot
-            // parked on a black screen (Watamari, test10 config/language page).
-            // Values without the `$` marker are passed through untouched.
             std::map<std::string, std::string> filter_params;
             for (const auto& [k, v] : ins.params) {
                 if (!v.empty() && v.front() == '$') {
@@ -2136,16 +2015,6 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
         const std::string label = eval.resolve_param_str(raw_label);
         if (const std::string* cond = ins.get("cond")) {
             // `cond` is authored BOTH ways in the wild: some scripts write the
-            // bare expression (`cond="t.check==0"`), iMel/Artemis-family
-            // scripts write it with the `$` marker (`cond="$t.check==0"`,
-            // test3 system/ui.asb cgviewer). Prepending another `$` to the
-            // latter produced "$$t.check==0", which resolve_param reads as an
-            // INDIRECT reference: it evaluates the comparison ("1"/"0") and
-            // then looks up a variable literally named "1" — always nil, so
-            // the condition was permanently false. The CG viewer then never
-            // looped back to the next 差分: the first click fell straight
-            // through to `*cgviewer_exit` ("点开 CG 后再点直接退出"). Same
-            // shape in test13 (macro2.iet tweet_exit, system.iet save errors).
             const std::string expr = (!cond->empty() && cond->front() == '$')
                                          ? *cond
                                          : "$" + *cond;
@@ -2187,13 +2056,6 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
     if (tag == "wt") {
         WaitReason r;
         // A BARE [wt] (no time=, no input=) is the plain CLICK wait. It used
-        // to be Timed(0), which resolves on the next tick, so every splash
-        // screen that reads
-        //   [calllua brand_logo][wt]
-        // skipped itself (test2's opening logo / caution page). With any
-        // explicit parameter the timed form stays — and the authored input=
-        // is honoured (0 = not clickable, 2 = skip-mode only), which the
-        // click-wait branch above must not swallow.
         const std::string wt_time = resolve_or_empty("time");
         const std::string wt_input = resolve_or_empty("input");
         if (wt_time.empty() && wt_input.empty()) {
@@ -2272,16 +2134,6 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
     if (tag == "if" || tag == "elseif") {
         const std::string est = resolve_or_empty("estimate");
         // Malformed expressions are data bugs the original runtime logs and
-        // treats as false (Watamari button_s.iet ships
-        // "$(selectdata.(selectdata.pushed).notrans == 0" with no closing
-        // paren). Aborting the tick killed the whole app mid-story.
-        //
-        // A MISSING estimate is false too: the original evaluates nil, and the
-        // scripts rely on it — Watamari's sysbtn.iet writes
-        // `[if estiamte = "$t.sceneskip"]` (seven rows, parameter name typo);
-        // treating the empty condition as TRUE ran the `[return]` inside and
-        // killed sysbtn_set/hide, so the skip/menu buttons at the bottom-right
-        // of the story page never appeared.
         bool cond = false;
         if (est.empty()) {
             std::fprintf(stderr, "[expr] %s without estimate -> false\n", tag.c_str());
@@ -2382,16 +2234,6 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
     // ---- M5b: native tag events (string-preserving passthrough) ----
     {
         // Scene/UI tags are expression-capable in EVERY parameter, not just
-        // id: the framework writes [lyc2 file="$t.imgpath + 'bg_config'"],
-        // [lyprop top="$t.lydialog.fontheight / 2 * (-1)"],
-        // [lytween time="$t.lydialog.fadeintime"] and
-        // [chgmsg id="$t.lydialog.id + '.50'"]. Passing the raw "$..."
-        // strings through left config-page images unresolved (missing rows),
-        // the dialog message layer bound to a literal "$t.lydialog.id + '.50'"
-        // node (no geometry -> no text inside the box), and tweens timed on
-        // unparsable values. Resolve once here; values without the `$` marker
-        // are passed through untouched, and a broken expression keeps its
-        // literal text (the engine's original dispatch logs and continues).
         auto resolve_params = [&](const std::map<std::string, std::string>& raw) {
             std::map<std::string, std::string> resolved;
             for (const auto& [k, v] : raw) {
@@ -2481,11 +2323,6 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
             return out;
         }
         // [execcsv exec="font" csv=".../<font sheet>"] — the framework's way
-        // to apply a whole font row from a csv (per-character name geometry
-        // lives there: tag_font_name_<char>.csv). Unknown tags were dropped, so
-        // every character's name kept the base row's box — the name then sits
-        // wherever THAT box is while the window art (and its name banner)
-        // follows the character, i.e. "换个角色名字就偏".
         if (tag == "execcsv") {
             const std::string exec = resolve_or_empty("exec");
             const std::string csv_raw = resolve_or_empty("csv");
@@ -2601,18 +2438,6 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
 
     if (tag == "yesno" || tag == "dialog") {
         // The host dialog/yesno/textfield widget is a host-side surface the
-        // engine does not draw itself.
-        // Until a real host UI exists, complete dialogs LOGICALLY so
-        // real-game flows never hang (same fallback philosophy as the video
-        // engine's logical immediate-finish):
-        //   - textfield=VAR: store "" (empty input) into the variable the
-        //     dialog would return; Artemis games read it back with e:var
-        //     right after the tag (NekoMiko gamestart: myname), and the
-        //     stream advances synchronously, so the next tag ([nameset])
-        //     already observes the written variable.
-        //   - notice (title/message only): auto-OK.
-        //   - [yesno]: affirm (no NekoMiko script uses the native yesno tag
-        //     today; revisit when the input surface lands).
         if (const std::string* tf = ins.get("textfield"); tf && !tf->empty()) {
             const std::string name = eval.resolve_param_str(*tf);
             if (!name.empty()) vars.set(name, Value::make_string(""));
@@ -2727,22 +2552,7 @@ bool Interpreter::dispatch_text_row_to_print_filter(const std::string& text) {
 
 ExecutionResult Interpreter::run() {
     // 单次 run() 的 tag 预算（= 每帧最多推进多少条指令）。
-    //
-    // Artemis 的脚本是按帧推进的，**轮询型**脚本靠"每帧只跑有限条 tag"把控制权
-    // 交回宿主：HENPRI 的 system/script.asb `*main` 就是
-    // `calllua scriptMainloop/scriptMainAdd ×11 + [jump label=main]`，没有任何
-    // wait —— 官方的读档位置（frame 0 = system/script.asb:40）正落在这种主循环
-    // 里。没有预算时 `run()` 会在**单帧内**永久自旋（tick 不返回、帧计数冻结），
-    // 表现就是"读档成功然后卡死"。默认 4096：常见剧情段一帧几十条 tag，
-    // 后台重建这类突发也在千级以内，而轮询主循环每帧推进约 340 轮，既能响应
-    // 输入又不会烧满 CPU。OA_RUN_BUDGET 可覆盖（逗号安全：0/非数字时用默认值）。
-    size_t budget = [] {
-        if (const char* v = std::getenv("OA_RUN_BUDGET")) {
-            const long n = std::strtol(v, nullptr, 10);
-            if (n > 0) return size_t(n);
-        }
-        return size_t(4096);
-    }();
+    size_t budget = size_t(4096);
     for (;;) {
         if (budget-- == 0) return ExecutionResult::BudgetExhausted;
         // Drain tags queued by Lua (e:tag/e:enqueueTag) before inline steps.
@@ -2774,16 +2584,6 @@ ExecutionResult Interpreter::run() {
         if (ins.kind == Instruction::Kind::Text) {
             const std::string text = ins.get_or("text", "");
             // A scenario text row is `[print data="<row>"]` as far as the
-            // SCRIPT side is concerned: Artemis hands it to the registered
-            // tagFilters.print, which is where the iMel multi-language layer
-            // lives. Watamari wraps every line in [lang ja|cn|en]…[/lang]; the
-            // lang filter only records printlang.target and the print filter
-            // picks the text of the active language and re-issues
-            // e:tag{"print", data=…} (which runs natively and emits the
-            // ScenarioLine). Emitting an engine-private ScenarioText event
-            // here instead bypassed that filter entirely — the text never
-            // reached the message layer and the story opened with a blank
-            // message window.
             if (dispatch_text_row_to_print_filter(text)) {
                 ++current_line_;
                 continue;
@@ -2817,17 +2617,6 @@ ExecutionResult Interpreter::run() {
             continue;
         }
 
-        if (std::getenv("OA_SELTRACE")) {
-            const std::string* lf = ins.get("label");
-            if ((ins.tag == "jump" || ins.tag == "call") && lf && *lf == "select")
-                std::fprintf(stderr,
-                             "[seltrace] %s->select @ %s:%zu pos=%s:%zu queue=%zu\n",
-                             ins.tag.c_str(), current_script_name_
-                                 ? current_script_name_->c_str() : "?",
-                             ins.line, current_script_name_
-                                 ? current_script_name_->c_str() : "?",
-                             current_line_, tag_queue_.size());
-        }
         const TagOutcome outcome = execute_tag(*this, ins, true);
 
         switch (outcome.kind) {
@@ -2854,28 +2643,6 @@ ExecutionResult Interpreter::run() {
             }
             case TagOutcomeKind::Call: {
                 call_stack_.push_back(CallFrame{outcome.return_script, outcome.return_line});
-                if (std::getenv("OA_SELTRACE") &&
-                    (outcome.return_script == "system/script.asb" ||
-                     (current_script_name_ &&
-                      *current_script_name_ == "system/script.asb"))) {
-                    std::fprintf(stderr,
-                                 "[seltrace] INLINE-CALL ret=%s:%zu origin=%s:%zu "
-                                 "label=%s depth=%zu\n",
-                                 outcome.return_script.c_str(), outcome.return_line,
-                                 current_script_name_ ? current_script_name_->c_str() : "?",
-                                 current_line_,
-                                 ins.get_or("label", "-").c_str(),
-                                 call_stack_.size());
-                    if (call_stack_.size() >= 5) {
-                        std::string cst;
-                        for (const auto& fr : call_stack_) {
-                            cst += fr.script + ":" +
-                                   std::to_string(fr.return_line) + " ";
-                        }
-                        std::fprintf(stderr, "[seltrace]   INLINE-STACK [%s]\n",
-                                     cst.c_str());
-                    }
-                }
                 const std::string target_script = outcome.file.empty() ? *current_script_name_
                                                                        : outcome.file;
                 if (!outcome.file.empty()) load_external_script(target_script);
@@ -2899,50 +2666,14 @@ ExecutionResult Interpreter::run() {
                 if (!call_stack_.empty()) {
                     const std::string origin_script =
                         current_script_name_ ? *current_script_name_ : "";
-                    const size_t origin_line = current_line_;
                     const CallFrame frame = call_stack_.back();
                     call_stack_.pop_back();
                     restore_macro_params(call_stack_.size() + 1);
                     current_script_name_ = frame.script;
                     current_line_ = frame.return_line;
-                    if (std::getenv("OA_TAGTRACE")) {
-                        std::fprintf(stderr, "[ret] -> %s:%zu (depth %zu)\n",
-                                     frame.script.c_str(), frame.return_line,
-                                     call_stack_.size());
-                    }
-                    // resurrection probe: a [return]
-                    // landing on the game's select-[stop] area
-                    // (system/script.asb line <= 1) re-parks a consumed
-                    // choice park (482 crash family). Print the return's
-                    // origin and the popped frame.
-                    if (std::getenv("OA_SELTRACE") &&
-                        (origin_script == "system/script.asb" ||
-                         frame.script == "system/script.asb" ||
-                         (current_script_name_ &&
-                          *current_script_name_ == "system/script.asb"))) {
-                        std::string cst;
-                        for (const auto& fr : call_stack_) {
-                            cst += fr.script + ":" + std::to_string(fr.return_line) + " ";
-                        }
-                        std::fprintf(stderr,
-                                     "[seltrace] RET origin=%s:%zu popped=%s:%zu "
-                                     "now=%s:%zu stack[%s]\n",
-                                     origin_script.c_str(), origin_line,
-                                     frame.script.c_str(), frame.return_line,
-                                     current_script_name_
-                                         ? current_script_name_->c_str()
-                                         : "?",
-                                     current_line_, cst.c_str());
-                    }
                     continue;
                 }
                 // [return] with an empty stack ENDS the script (the pre-fix
-                // semantics). Treating it as "skip this row and continue"
-                // fell through into the NEXT label block — FPM's title
-                // ui.asb keeps `*exskip` (adv_exskipstart -> e:debugSkip) right
-                // after `*title`'s [return], so a single title click started
-                // the engine fast-forward and the story jumped 共通-05 ->
-                // 09 -> 12 in three frames without ever showing a page.
                 return ExecutionResult::Completed;
             }
             case TagOutcomeKind::WaitEvent:
@@ -3052,19 +2783,8 @@ Interpreter::Interpreter(const Config& config) : config_(config) {
     hooks_.call_lua_function = [this](const std::string& function,
                                       const std::map<std::string, std::string>& params,
                                       const std::string& script_name, size_t line) {
-        // OA_SELTRACE: every select_exit chain entry
-        // executed from the engine side (script.asb *select_exit
-        // [calllua select_exittrans/select_clicknext]) prints the engine
-        // position + pending queue/call-stack depth, so a user crash log
-        // pins down which chain reached clicknext without scr.select.
-        if (std::getenv("OA_SELTRACE") &&
-            (function == "select_clicknext" || function == "select_exittrans")) {
-            std::fprintf(stderr,
-                         "[seltrace] engine-call %s @ %s:%zu queue=%zu "
-                         "callstack=%zu\n",
-                         function.c_str(), script_name.c_str(), line,
-                         tag_queue_.size(), call_stack_.size());
-        }
+        (void)line;
+        (void)script_name;
         try {
             return lua_bridge().call_function(function, params);
         } catch (const oa::runtime::LuaError& e) {
@@ -3119,16 +2839,6 @@ oa::runtime::LuaHost Interpreter::build_lua_host() {
         variables_.set(name, std::move(v));
     };
     host.enqueue_tag = [this](std::string tag, std::map<std::string, std::string> params) {
-        if (tag == "reset" && std::getenv("OA_DEBUG_RESET")) {
-            std::fprintf(stderr, "[reset] Lua e:tag reset queued from:\n%s",
-                         lua_bridge().stack_trace(10).c_str());
-        }
-        if (tag == "trans" && std::getenv("OA_DEBUG_TRANSQ")) {
-            std::string prm;
-            for (const auto& [k, v] : params) prm += k + "=" + v + " ";
-            std::fprintf(stderr, "[trq] Lua e:tag trans (%s) from:\n%s",
-                         prm.c_str(), lua_bridge().stack_trace(12).c_str());
-        }
         Instruction ins;
         ins.tag = std::move(tag);
         ins.params = std::move(params);
@@ -3137,21 +2847,6 @@ oa::runtime::LuaHost Interpreter::build_lua_host() {
         tag_queue_.push_back(std::move(ins));
     };
     // Lua-originated e:tag{"calllua",...} runs synchronously,
-    // mirroring the inline [calllua] tag of .asb streams (the [calllua]
-    // branch of execute_tag in this TU) — not at the deferred queue drain.
-    // The game UI framework dispatches per-button over=/out=/exec handlers
-    // through e:tag{"calllua"...} and expects them to run while the
-    // dispatching button group is still current: e.g. ui/dialog.lua
-    // dialog_main calls btn_nonactive(btn.cursor) (which btn_out ->
-    // e:tag calllua -> the slot's custom out handler) and only THEN
-    // csvbtn3("dlg") swaps the group; with the deferred drain the queued
-    // handler executed after the swap, getBtnInfo returned the empty table
-    // and the game's custom
-    // handler indexed nil (thyt exui.lua:100 user_saveqa_out ->
-    // user_saveactive(nil) crash on every save-dialog open). Params are
-    // resolved exactly like the asb path (function name + extra rows), so
-    // Lua literals pass through untouched and ${..}/@ references behave
-    // identically.
     host.run_calllua_sync = [this](const std::string& function,
                                    const std::map<std::string, std::string>& params) {
         if (function.empty() || !hooks_.call_lua_function) return false;
@@ -3362,16 +3057,6 @@ bool Interpreter::apply_var(const std::map<std::string, std::string>& params) {
     }
     if (system == "delete") {
         // Delete requires an explicit variable name. A nameless [var
-        // system=delete] targets nothing and must be a no-op, NOT a
-        // clear-everything: several framework generations call it while
-        // rebuilding UI sample text with only an `id=` layer param
-        // (thyt system/ui/config.lua config_samplestart — every config
-        // page draw, including the language-switch redraw). Wiping all
-        // four domains there destroys the engine seeds (s.savepath,
-        // s.screen_* …) plus the g.* pluto stashes mid-session, which
-        // made every save-area existence check (isSaveFile / file checks
-        // through e:var s.savepath) fail afterwards — load pages showed
-        // empty slots and [load] could never fire.
         if (name.empty()) return true;
         auto erase_tree = [&](VariableStore::Map& m) {
             for (auto it = m.begin(); it != m.end();) {
@@ -3431,12 +3116,6 @@ bool Interpreter::apply_var(const std::map<std::string, std::string>& params) {
     }
     if (system == "explode") {
         // [var name=N system=explode source=S delimiter=D] ->
-        //   N.size = count, N.0..N.n-1 = pieces.
-        // delimiter is a literal string (default ","); string_char_delimiter
-        // is a numeric char code used by the framework's packed tag strings
-        // (28/29 = FS/GS). `writelocal` needs no special handling: the store
-        // routes by name prefix ("t." -> temp etc.), which is what the
-        // framework's localNames rely on.
         const std::string src = eval.resolve_param_str(get("source"));
         std::string delim = get("delimiter");
         if (delim.empty()) {
@@ -3573,18 +3252,6 @@ bool Interpreter::apply_var(const std::map<std::string, std::string>& params) {
     }
     if (system == "get_layer_info") {
         // Slider readback (slider_dragX/xslider_pin …): dump every layer
-        // prop into name.<prop> so Lua can read name.left/name.top/etc. No
-        // layer -> nothing is written (script checks e:var existence).
-        // (snll sample preview on text-page entry): Lua e:tag
-        // events are QUEUED (enqueue_tag) while this var tag applies
-        // synchronously, so a read following e:tag{'lyc2'...} in the SAME
-        // Lua call used to see the PRE-lyc2 scene (the queried layer missing
-        // -> empty dump -> snll config_samplestart's alpha==255 guard failed
-        // on first page-2 entry and the sample round never armed). Ordered
-        // Ordered
-        // semantics: a sync var evaluates at its position in
-        // the tag stream — every tag queued before it has already run — so
-        // run that prefix before reading the layer.
         flush_pending_text_tags();
         const std::string id = eval.resolve_param_str(get("id"));
         if (hooks_.layer_info && !id.empty()) {
@@ -3648,21 +3315,6 @@ bool Interpreter::apply_var(const std::map<std::string, std::string>& params) {
     if (system == "get_message_layer_width" ||
         system == "get_message_layer_height" ||
         system == "get_message_layer_line_width") {
-        // FPM writes these queries right after queueing a
-        // chgmsg/rp/print segment (uihelp centering ui.lua:89-92, get_fontsize
-        // boot.lua:334-345, line/backlog measuring) — the segment must take
-        // effect first or the sync query reads the previous active layer.
-        if (std::getenv("OA_DEBUG_VAR")) {
-            std::fprintf(stderr, "[var] queue before flush:");
-            for (size_t qi = 0; qi < tag_queue_.size() && qi < 14; ++qi) {
-                const Instruction& q = tag_queue_[qi];
-                const auto idit = q.params.find("id");
-                std::fprintf(stderr, " <%s%s%s>", q.tag.c_str(),
-                             idit != q.params.end() ? " id=" : "",
-                             idit != q.params.end() ? idit->second.c_str() : "");
-            }
-            std::fprintf(stderr, " total=%zu\n", tag_queue_.size());
-        }
         flush_pending_text_tags();
         double width = 0, height = 0, line_width = 0;
         if (hooks_.message_layer_metrics) {
@@ -3690,12 +3342,6 @@ std::optional<ExecutionResult> Interpreter::flush_tag_queue() {
     // enqueued in the caller's context and their labels resolve there.
     if (queue_hold_depth_ != 0) {
         // The hold protects a queued [call]: the tags behind it belong to the
-        // caller and must wait until the callee RETURNS. A callee that parks
-        // ([stop] on the title screen, [wait]) has yielded to the host, so the
-        // queue is no longer "the callee's continuation" — it is the next
-        // interaction batch (title click -> sestop/jump). Keeping the hold
-        // there stranded every later click in the queue: test13's title
-        // buttons deleted the UI and then did nothing, forever.
         if (parked_ || call_stack_.size() < queue_hold_depth_) {
             queue_hold_depth_ = 0;
         } else {
@@ -3707,18 +3353,6 @@ std::optional<ExecutionResult> Interpreter::flush_tag_queue() {
         Instruction ins = std::move(tag_queue_.front());
         tag_queue_.erase(tag_queue_.begin());
         if (on_step) on_step(*current_script_name_, current_line_, ins);
-
-        if (std::getenv("OA_SELTRACE") && ins.tag == "call" &&
-            current_script_name_ && *current_script_name_ == "system/script.asb" &&
-            current_line_ <= 2) {
-            const std::string* lf = ins.get("label");
-            const std::string* ff = ins.get("file");
-            std::fprintf(stderr,
-                         "[seltrace] QCALL@LOW label=%s file=%s pos=%s:%zu q=%zu\n",
-                         lf ? lf->c_str() : "-", ff ? ff->c_str() : "-",
-                         current_script_name_->c_str(), current_line_,
-                         tag_queue_.size());
-        }
         // A queued jump/call carrying only a label belongs to the script that
         // issued it (origin_script), not to wherever the drain has moved after
         // the surrounding [return] burst — macro.iet's returnjump queues
@@ -3759,29 +3393,6 @@ std::optional<ExecutionResult> Interpreter::flush_tag_queue() {
                 // queued call: return_line = current_line (do NOT add 1)
                 const size_t pinned = call_stack_.size();
                 call_stack_.push_back(CallFrame{*current_script_name_, current_line_});
-                if (std::getenv("OA_SELTRACE")) {
-                    const std::string* lf = ins.get("label");
-                    const std::string* ff = ins.get("file");
-                    std::fprintf(stderr,
-                                 "[seltrace] QCALL label=%s file=%s pos=%s:%zu "
-                                 "line=%zu depth=%zu\n",
-                                 lf ? lf->c_str() : "-", ff ? ff->c_str() : "-",
-                                 current_script_name_ ? current_script_name_->c_str()
-                                                      : "?",
-                                 current_line_, current_line_, call_stack_.size());
-                    // full stack at deep pushes — the
-                    // {script.asb:0} resurrection frame's push was invisible
-                    // to the shallow QCALL line prints.
-                    if (call_stack_.size() >= 5) {
-                        std::string cst;
-                        for (const auto& fr : call_stack_) {
-                            cst += fr.script + ":" +
-                                   std::to_string(fr.return_line) + " ";
-                        }
-                        std::fprintf(stderr, "[seltrace]   QCALL-STACK [%s]\n",
-                                     cst.c_str());
-                    }
-                }
                 (void)pinned;
                 const std::string target = outcome.file.empty() ? *current_script_name_
                                                                 : outcome.file;
@@ -3813,46 +3424,14 @@ std::optional<ExecutionResult> Interpreter::flush_tag_queue() {
                 if (!call_stack_.empty()) {
                     const std::string origin_script =
                         current_script_name_ ? *current_script_name_ : "";
-                    const size_t origin_line = current_line_;
                     const CallFrame frame = call_stack_.back();
                     call_stack_.pop_back();
                     restore_macro_params(call_stack_.size() + 1);
                     current_script_name_ = frame.script;
                     current_line_ = frame.return_line;
-                    if (std::getenv("OA_TAGTRACE")) {
-                        std::fprintf(stderr, "[ret] -> %s:%zu (depth %zu)\n",
-                                     frame.script.c_str(), frame.return_line,
-                                     call_stack_.size());
-                    }
-                    // resurrection probe: a [return]
-                    // landing on the game's select-[stop] area
-                    // (system/script.asb line <= 1) re-parks a consumed
-                    // choice park (482 crash family). Print the return's
-                    // origin and the popped frame.
-                    if (std::getenv("OA_SELTRACE") &&
-                        current_script_name_ &&
-                        *current_script_name_ == "system/script.asb" &&
-                        current_line_ <= 1) {
-                        std::string cst;
-                        for (const auto& fr : call_stack_) {
-                            cst += fr.script + ":" + std::to_string(fr.return_line) + " ";
-                        }
-                        std::fprintf(stderr,
-                                     "[seltrace] RET->selectarea origin=%s:%zu "
-                                     "popped=%s:%zu stack[%s]\n",
-                                     origin_script.c_str(), origin_line,
-                                     frame.script.c_str(), frame.return_line,
-                                     cst.c_str());
-                    }
                     continue;
                 }
                 // A queued [return] with an empty stack ENDS the script.
-                // Skipping it and draining on made the interpreter walk past
-                // the label block into whatever follows: FPM's title ui.asb
-                // lays `*title`(-> [return]) directly above `*exskip`, so the
-                // fall-through reached adv_exskipstart and the story
-                // fast-forwarded through whole chapters (test2's
-                // "P3-0b story body reached" / 05->09->12 in three frames).
                 return ExecutionResult::Completed;
             }
             case TagOutcomeKind::WaitEvent:
@@ -3876,13 +3455,7 @@ std::optional<ExecutionResult> Interpreter::flush_tag_queue() {
     return std::nullopt;
 }
 
-// ---------------------------------------------------------------------------
-// Message-text segment tags a sync metric var may pre-execute.
-// chgmsg/rp/print/rt/ruby/font/scetween/... mutate the message-layer state
-// the metric query reads; waits and control tags never run here (they are
-// not part of a measuring segment), so the interpreter wait machinery is
-// untouched.
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------- Message-text segment tags a sync metric var may pre-execute.
 namespace {
 // tags a sync metric var must NOT flush past — in ordered (real-engine)
 // execution these pause/redirect the stream or re-enter Lua, so the var
@@ -3902,37 +3475,8 @@ bool is_var_barrier_stop_tag(const std::string& tag) {
 
 void Interpreter::flush_pending_text_tags() {
     // A sync metric var evaluates at ITS position in the ordered tag
-    // stream of the current Lua event (FPM semantics) — every tag queued
-    // before it has already run, so the metric reads the layer/page state
-    // the chain built. The flush pre-executes that prefix IN ORDER (text
-    // tags first; the same rule extends to benign scene/presentation
-    // tags such as flip/lydel/lyc2/lytween queued between text segments —
-    // e.g. the previous button's btn_out 'flip' when the pointer hops
-    // straight from one button to another, or the backlog page rebuild's
-    // lydel before re-creating row layers). Skipping such tags instead of
-    // executing them was wrong: the later text tags would run against the
-    // PRE-lydel state and the deferred lydel would then delete the freshly
-    // rebuilt layers (backlog rows lost their scene nodes under e8411fa).
-    // The flush still stops at tags that pause/redirect the stream or
-    // re-enter Lua (the var would not have been reached in ordered
-    // execution), and at any tag whose execution yields such an outcome.
     size_t ran = 0;
     for (size_t i = 0; i < tag_queue_.size();) {
-        const Instruction& front = tag_queue_[i];
-        const std::string& t = front.tag;
-        if (std::getenv("OA_DEBUG_VAR")) {
-            const auto idit = front.params.find("id");
-            std::fprintf(stderr, "[var] barrier head tag='%s'%s%s\n",
-                         t.c_str(), idit != front.params.end() ? " id=" : "",
-                         idit != front.params.end() ? idit->second.c_str() : "");
-        }
-        if (is_var_barrier_stop_tag(t)) {
-            if (std::getenv("OA_DEBUG_VAR"))
-                std::fprintf(stderr,
-                             "[var] barrier STOP at '%s' remains=%zu\n",
-                             t.c_str(), tag_queue_.size() - i);
-            break;
-        }
         Instruction ins = std::move(tag_queue_[i]);
         tag_queue_.erase(tag_queue_.begin() + i);
         if (on_step) on_step(*current_script_name_, current_line_, ins);
@@ -3945,15 +3489,6 @@ void Interpreter::flush_pending_text_tags() {
             case TagOutcomeKind::JumpExternal:
             case TagOutcomeKind::Call:
             case TagOutcomeKind::Return:
-                // Stream redirected: the var behind it would not have been
-                // reached. Put the row BACK and stop here — the normal drain
-                // owns jumps/calls (a queued macro call must push its frame
-                // and run its body; executing it here and walking away
-                // silently dropped slider_h for every slider but the first).
-                if (std::getenv("OA_DEBUG_VAR"))
-                    std::fprintf(stderr,
-                                 "[var] barrier redirect at '%s' remains=%zu\n",
-                                 ins.tag.c_str(), tag_queue_.size() - i);
                 tag_queue_.insert(tag_queue_.begin(), std::move(ins));
                 i = tag_queue_.size();
                 break;
@@ -3969,8 +3504,6 @@ void Interpreter::flush_pending_text_tags() {
         if (i >= tag_queue_.size()) break;
         // Erasing shifts the tail; re-examine the same index.
     }
-    if (std::getenv("OA_DEBUG_VAR"))
-        std::fprintf(stderr, "[var] barrier ran=%zu\n", ran);
 }
 
 } // namespace oa::runtime

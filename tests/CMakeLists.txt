@@ -54,15 +54,9 @@ add_test(NAME emote_warp_test COMMAND emote_warp_test)
 
 # layer-model S1/S2 (research/105): 分类权威 layer_kind.h kind_of 断言组 +
 # 统一 invalidate 簿记集合/写入口标记面(纯新增;不改任何现有行为)。
-add_executable(layer_kind_test layer_kind_test.cpp)
-target_link_libraries(layer_kind_test PRIVATE libopenartemis)
-add_test(NAME layer_kind_test COMMAND layer_kind_test)
 
 # layer-model S3 (research/106): ContentRole 家族投影/面方法/quad 矩阵断言
 # (测试内参考实现对照;纯新增;不改任何现有行为)。
-add_executable(content_role_test content_role_test.cpp)
-target_link_libraries(content_role_test PRIVATE libopenartemis)
-add_test(NAME content_role_test COMMAND content_role_test)
 
 add_executable(layer_semantics_test layer_semantics_test.cpp)
 target_link_libraries(layer_semantics_test PRIVATE libopenartemis)

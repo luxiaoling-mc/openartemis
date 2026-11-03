@@ -1,14 +1,5 @@
 #pragma once
-// PSB container reader.
-// Autonomous implementation; the container facts (v1..v4 header layout,
-// name-trie/string/chunk tables, type-byte encoding, adler32 header
-// checksum) were cross-checked against the krkr psbfile plugin reading
-// logic and the documented PSB container format notes — no code is copied
-// from either.
-//
-// The reader works on a byte buffer and keeps every object VALUE as a raw
-// offset plus its type byte; callers walk the tree with the accessors below
-// (object entries / list items / scalars / resources).
+// PSB container reader. Autonomous implementation; the container facts (v1..v4 header layout, name-trie/string/chunk tables, type-byte enco...
 #include <cstdint>
 #include <optional>
 #include <span>

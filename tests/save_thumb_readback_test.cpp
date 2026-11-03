@@ -16,7 +16,7 @@
 
 #include "core/fs/fs.h"
 #include "core/render/renderer.h"
-#include "core/runtime/runtime.h"
+#include "core/runtime/runtime_game.h"
 #include "core/media/image.h"
 #include "core/runtime/runtime_save.h"
 

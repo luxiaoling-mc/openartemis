@@ -1,11 +1,6 @@
 // Save-domain glue.
 //
-// SaveGame/LoadGame dispatch under the openartemis host model: real
-// persistence goes through an injected oa::runtime::SaveStore (the default null
-// store keeps headless runs side-effect free). Save files are binary
-// documents (codec core/util/binary_stream.h; layout in runtime_save.h). 
-// Semantics (files/ layout/domains/onSave-onLoad) are documented in 
-// runtime_save.h.
+// Save/load domain: binary SaveData through an injected SaveStore.
 #include "core/runtime/runtime_internal.h"
 #include "core/runtime/runtime_save.h"
 
@@ -111,16 +106,16 @@ std::string sanitize_savepath(const std::string& raw) { return sanitize_segments
 std::string GameRuntime::RuntimeState::qualify_save_file(const std::string& file) const {
     std::string clean;
     if (!clean_rel_path(file, &clean)) return std::string();
-    if (savepath_.empty() || clean == savepath_ || clean.rfind(savepath_ + "/", 0) == 0) {
+    if (save_.savepath_.empty() || clean == save_.savepath_ || clean.rfind(save_.savepath_ + "/", 0) == 0) {
         return clean;
     }
-    return savepath_ + "/" + clean;
+    return save_.savepath_ + "/" + clean;
 }
 
 bool GameRuntime::RuntimeState::save_file_exists(const std::string& file) const {
     const std::string path = qualify_save_file(file);
-    if (path.empty() || !save_store_) return false;
-    return save_store_->exists(path);
+    if (path.empty() || !save_.save_store_) return false;
+    return save_.save_store_->exists(path);
 }
 
 // ---------------------------------------------------------------------------
@@ -128,12 +123,12 @@ bool GameRuntime::RuntimeState::save_file_exists(const std::string& file) const 
 // ---------------------------------------------------------------------------
 
 void GameRuntime::RuntimeState::sysload() {
-    if (!save_store_) return;
+    if (!save_.save_store_) return;
     for (const bool is_global : {true, false}) {
         const std::string rel = is_global ? kSavegFile : kSystemFile;
         const std::string path = qualify_save_file(rel);
         if (path.empty()) continue;
-        const auto bytes = save_store_->read(path);
+        const auto bytes = save_.save_store_->read(path);
         if (!bytes) continue; // first boot: no file is the default state
         const std::string doc(bytes->begin(), bytes->end());
         // 官方（原生引擎）写下的 BOW* 容器是**另一个格式家族**：容器/目录/
@@ -218,7 +213,7 @@ void preserve_official_original(oa::runtime::SaveStore& store, const std::string
 } // namespace
 
 bool GameRuntime::RuntimeState::syssave() {
-    if (!save_store_ || !interpreter_) return false;
+    if (!save_.save_store_ || !interpreter_) return false;
     const auto& vars = interpreter_->variables();
     const std::map<std::string, oa::runtime::Value> global(vars.global.begin(),
                                                           vars.global.end());
@@ -229,7 +224,7 @@ bool GameRuntime::RuntimeState::syssave() {
                                                                 oa::runtime::Value>& m) {
         const std::string path = qualify_save_file(file);
         if (path.empty()) return;
-        preserve_official_original(*save_store_, path);
+        preserve_official_original(*save_.save_store_, path);
         // Strip the domain prefix off each key.
         std::map<std::string, oa::runtime::Value> stripped;
         for (const auto& [k, v] : m) {
@@ -237,7 +232,7 @@ bool GameRuntime::RuntimeState::syssave() {
         }
         const std::string doc = oa::runtime::encode_domain_map(stripped);
         const std::vector<uint8_t> bytes(doc.begin(), doc.end());
-        if (!save_store_->write(path, bytes)) all_ok = false;
+        if (!save_.save_store_->write(path, bytes)) all_ok = false;
     };
     write_map(kSavegFile, global);
     write_map(kSystemFile, system);
@@ -299,9 +294,6 @@ void collect_text_snapshot(oa::runtime::SaveData* data, const oa::render::TextEn
         s.revealed = !ml.reveal_pending && ml.reveal_index >= ml.char_count;
         data->text_layers.push_back(std::move(s));
     }
-    if (std::getenv("OA_SAVETRACE"))
-        std::fprintf(stderr, "[save] text layers=%zu active=%s\n",
-                     data->text_layers.size(), active.c_str());
 }
 
 /// Rebuild the message layers' pages and re-bind them to the restored scene.
@@ -499,18 +491,12 @@ const char* wait_kind_name(oa::runtime::WaitReason::Kind k) {
 } // namespace
 
 bool GameRuntime::RuntimeState::save_game_to(const std::string& file) {
-    if (!save_store_ || !interpreter_) return false;
-    // onSave (store): serialize sys/gscr/conf into g.* vars; run it with the
-    // tag queue isolated so the queued UI continuation is not consumed.
-    // The FPM handler is `store(e, p)` reading p.file (fileio.lua:5-10), so
-    // the callback needs the standard calllua argument shape, not the
-    // no-argument fire_event used for onEnterFrame (total-acceptance: the
-    // save screen's store crashed with p=nil).
+    if (!save_.save_store_ || !interpreter_) return false;
+    // onSave("store", {file}) runs with the tag queue isolated.
     std::vector<oa::runtime::Instruction> pending = interpreter_->take_tag_queue();
     {
         const std::map<std::string, std::string> onsave_params{{"file", file}};
-        // research/130: a failing save handler abandons the callback, not the
-        // app (original runtime: calllua logs and continues).
+        // A failing save handler logs and continues.
         try {
             (void)interpreter_->lua_bridge().call_function("store", onsave_params);
         } catch (const oa::runtime::LuaError& e) {
@@ -529,108 +515,81 @@ bool GameRuntime::RuntimeState::save_game_to(const std::string& file) {
     for (const auto& f : interpreter_->call_stack()) {
         data.call_stack.emplace_back(f.script, f.return_line);
     }
-    collect_scene_snapshot(&data, scene_);
-    collect_audio_snapshot(&data, audio_);
-    collect_text_snapshot(&data, text_);
+    collect_scene_snapshot(&data, scene());
+    collect_audio_snapshot(&data, media_.audio_);
+    collect_text_snapshot(&data, text());
     const std::string doc = data.encode();
     const std::string path = qualify_save_file(file);
     if (path.empty()) {
         std::fprintf(stderr, "[runtime] save: illegal file name '%s'\n", file.c_str());
         return false;
     }
-    if (!save_store_->write(path, std::vector<uint8_t>(doc.begin(), doc.end()))) {
+    if (!save_.save_store_->write(path, std::vector<uint8_t>(doc.begin(), doc.end()))) {
         std::fprintf(stderr, "[runtime] save: write failed: %s\n", path.c_str());
         return false;
     }
     std::fprintf(stderr, "[runtime] saved %s (%zu local vars, script %s:%zu)\n",
                  path.c_str(), data.local_variables.size(), data.current_script.c_str(),
                  data.current_line);
-    // A numbered save also refreshes the system save (slot index lives in
-    // g.system).
+    // A numbered save refreshes the system save too.
     (void)syssave();
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// 读档加固：清场清单 / 原子失败 / A 面自检 / 有界排空
-// ---------------------------------------------------------------------------
+// Load hardening: clear list / atomic failure / self-check / bounded drain.
 
 size_t GameRuntime::RuntimeState::reset_ephemeral_on_load() {
-    // 读档清场 = [C] 桶的引擎责任人清单（契约见 runtime_internal.h 文件头）。
-    // 本清单与 reset_domains()（runtime.cpp）**必须对齐**，任何一处增删
-    // 条目时另一处同步裁定。逐项落地（"清/留 + 理由 + 证据"）：
-    //   [C] video_.stop_all_videos() + video_finished_
-    //   [C] emote_layers_ + pending_emote_methods_
-    //   [C] drop_pending_tween_cancels()
-    //   [C] inline_event_frame_.reset()
-    //   [留] interpreter tag 队列（② 特判保留：FPM restore() 的
-    //        tag{"call", ui.asb, load_next} 靠它；契约见文件头）
-    //   [C] alldelete_* + capture_pending_
-    //   [C] active_wait_icon_ / hide_snapshot_ / hide_active_；hide_window_ **留**
-    //   [C] skip_enabled_ / exskip_active_ / control_skip_blocked_
-    //   [C] script_status_ / automode_syncse_ / 指针按键瞬时态；pending_events_ 留
-    // 顺序：媒体 → 文本/场景 → 动画投递 → 控制域 → 指针瞬时态；场景清场发生在
-    // ② 桶回写（输入注册表）**之前**（顺序契约 1）。
+    // [C] ephemeral clear list. Must stay aligned with reset_domains();
+    // scene clears before the B-preserve input registry write-back.
+    // Keep: interpreter tag queue, host pending_events_, script config rows.
     size_t cleared = 0;
     const auto clr = [&cleared] { ++cleared; };
 
     // ---- 媒体面（资源态：播放器/解码通道/宿主供帧绑定）----
-    audio_.stop_all_sounds(); clr();
-    if (media_players_) { media_players_->stop_all(); clr(); }
-    video_.stop_all_videos(); clr();  // [C]：通道绑在已清场的层 id 上
-    video_finished_ = false; clr();   // [C]（结束闩；reset_domains 亦漏，见文件头契约）
-    emote_layers_.clear(); clr();     // [C]：播放器（③ 资源）+ 旧层 id
-    emote_view_cache_.clear();        // 回标题/读档不继承上一场景的视图
-    pending_emote_methods_.clear(); clr(); // [C]：方法补发队列（同生共死）
+    media_.audio_.stop_all_sounds(); clr();
+    if (media_.media_players_) { media_.media_players_->stop_all(); clr(); }
+    media_.video_.stop_all_videos(); clr();
+    media_.video_finished_ = false; clr();
+    media_.emote_layers_.clear(); clr();
+    media_.emote_view_cache_.clear();
+    media_.pending_emote_methods_.clear(); clr();
 
     // ---- 文本 / 场景容器 ----
-    text_.clear_scene(); clr();
-    scene_.clear_scene(); clr();      // 节点销毁 ≡ tween/anime 桶随之消亡
-    drop_pending_tween_cancels(); clr(); // [C]：元素持已被释放的 const Layer*
-    transition_.clear(); clr();
-    hovered_.clear(); drag_layer_.clear(); clr();
+    text().clear_scene(); clr();
+    scene().clear_scene(); clr();
+    drop_pending_tween_cancels(); clr();
+    transition().clear(); clr();
+    pointer_.hovered_.clear(); pointer_.drag_layer_.clear(); clr();
     pending_sync_tween_layer_.reset(); clr();
-    inline_event_frame_.reset(); clr();  // [C]：记录的是旧停驻栈索引
-    screenshot_.valid = false; clr();
-    capture_pending_ = false; clr();     // [C]：否则读档后会截一帧错场景
-    alldelete_active_ = false;           // [C]：到期 finish_all_delete 会抹掉
-    alldelete_start_ms_ = 0;             //        刚恢复的场景
-    alldelete_duration_ms_ = 0; clr();
+    inline_event_frame_.reset(); clr();
+    save_.screenshot_.valid = false; clr();
+    save_.capture_pending_ = false; clr();
+    renderer_.stop_all_delete();
     wait_.reset(); wait_remaining_ms_ = 0; clr();
 
     // ---- 控制域（模式闩；配置面 [* allow] 属 ② 保留，不在此）----
-    skip_active_ = false; clr();              // 派生量
-    skip_enabled_ = false; clr();             // [C]：只清派生量会让 skip 复活
-    // [C]：exskip 只静默落旗。**不能**调 end_debug_skip()：它会 fire
-    // onDebugSkipOut → FPM exskip_end 的 quickjump 重放把解释器拉回 backlog 点，
-    // 覆盖刚恢复的位置（读档 = 显式定位，优先级最高）。
-    exskip_active_ = false; clr();
-    control_skip_pressed_ = false; clr();     // 下一 tick 由 keys_down_ 重算
-    control_skip_blocked_ = false; clr();     // [C]：锁到松键的闩跨读档无意义
-    last_control_skip_effective_ = false; clr();
-    automode_ = false; auto_elapsed_ms_ = 0; clr();
-    automode_syncse_.clear(); clr();          // [C]：闸随 automode 同域同清
-    hide_active_ = false; clr();              // [C]：模式闩（与 automode 同类）
-    hide_snapshot_.clear(); clr();            // [C]：已消失场景的可见性现场
-    script_status_ = 0; clr();                // [C]：==4 会让读档后剧本不推进
-    active_wait_icon_.clear(); clr();         // [C]：隐藏路径对旧 id set_props
+    control_.skip_active_ = false; clr();
+    control_.skip_enabled_ = false; clr();
+    // exskip only drops the flag: end_debug_skip() would replay a quickjump
+    // and overwrite the restored position.
+    control_.exskip_active_ = false; clr();
+    control_.control_skip_pressed_ = false; clr();
+    control_.control_skip_blocked_ = false; clr();
+    control_.last_control_skip_effective_ = false; clr();
+    control_.automode_ = false; control_.auto_elapsed_ms_ = 0; clr();
+    control_.automode_syncse_.clear(); clr();
+    control_.hide_active_ = false; clr();
+    control_.hide_snapshot_.clear(); clr();
+    control_.script_status_ = 0; clr();
+    control_.active_wait_icon_.clear(); clr();
 
     // ---- 指针 / 按键瞬时态（[C]；每 tick 由 FrameInput 重算的派生量）----
-    overrides_.clear(); prev_overrides_.clear(); clr();
-    keys_down_.clear(); down_edges_.clear(); up_edges_.clear(); clr();
-    decide_edge_ = false; clr();
+    input_state_.overrides_.clear(); input_state_.prev_overrides_.clear(); clr();
+    input_state_.keys_down_.clear(); input_state_.down_edges_.clear(); input_state_.up_edges_.clear(); clr();
+    input_state_.decide_edge_ = false; clr();
 
-    // 明确**保留**（每条都有理由）：
-    //   hide_window_ / hide_allowed_ / skip_allowed_ / automode_allowed_ /
-    //   rclick_allowed_ / rclick_file_ / keymap_   —— [B] 桶脚本配置：读档没有
-    //     重发路径（FPM init.lua 只在 boot 发），清掉 = 会话配置
-    //     丢失；hide_window_ 的唯一消费者 apply_hide_visibility 已有 find 守卫。
-    //   mouse_x_/mouse_y_/mouse_prev_x_/mouse_prev_y_/mouse_inited_/
-    //   left_down_prev_ —— 镜像物理指针：读档不改变指针位置/按键，清它们会在
-    //     读档后注入一次假 pointer re-seed（假 hover 面）。
-    //   exit_requested_ —— [exit] 控制闩（②：宿主退出请求不因读档失效）。
-    //   pending_events_ —— 见 dispatch_save_events（入口快照 + 新事件留队尾）。
-    //   interpreter_->tag_queue_ —— [留]，② 特判保留（文件头契约）。
+    // Keep: script config rows, physical pointer mirror, exit latch,
+    // host pending_events_, interpreter tag queue (see docs/RUNTIME_STATE.md).
     return cleared;
 }
 
@@ -649,9 +608,7 @@ bool GameRuntime::RuntimeState::preflight_load_position(const oa::runtime::SaveD
     }
     const oa::runtime::Script* s = interpreter_->get_script(data.current_script);
     if (s && data.current_line >= s->instructions.size()) {
-        // 同版本内的数据漂移（脚本改过 ⇒ 行号越界）**不是**失败：解释器把越界
-        // 位置当"脚本结束"（runtime_iet.cpp 的 Completed 分支），行为有定义。
-        // 只报告，让调用方和日志看得见（不静默）。
+        // Out-of-range line = script-completed (defined); report only.
         std::fprintf(stderr,
                      "[runtime] load: preflight: current_line %zu is beyond script '%s' "
                      "end (%zu instructions); the position resolves to script-completed\n",
@@ -661,8 +618,7 @@ bool GameRuntime::RuntimeState::preflight_load_position(const oa::runtime::SaveD
 }
 
 size_t GameRuntime::RuntimeState::self_check_save_data(const oa::runtime::SaveData& data) const {
-    // 只 log 不 throw：A 面是数据，坏数据要"有定义地
-    // 容忍"，不是让读档炸掉。返回问题/记录条目数（诊断计数 load_self_check_issues_）。
+    // Log-only tolerance for bad A-side data; returns the issue count.
     size_t issues = 0;
     std::set<std::string> ids;
     for (const auto& ls : data.layers) {
@@ -763,12 +719,12 @@ size_t GameRuntime::RuntimeState::drain_tag_queue_bounded(const char* phase) {
 LoadResult GameRuntime::RuntimeState::load_game(const std::string& file, int64_t trans_type) {
     // 失败语义：**原子**。位置预检在任何清场之前完成；任一失败
     // ⇒ 运行时状态不被改动，调用方按 LoadResult 分支（不再"只打日志"）。
-    if (!save_store_ || !interpreter_) {
+    if (!save_.save_store_ || !interpreter_) {
         std::fprintf(stderr, "[runtime] load: no save store / interpreter; load unavailable\n");
         return LoadResult::MissingFile;
     }
     const std::string path = qualify_save_file(file);
-    const auto bytes = path.empty() ? std::optional<std::vector<uint8_t>>() : save_store_->read(path);
+    const auto bytes = path.empty() ? std::optional<std::vector<uint8_t>>() : save_.save_store_->read(path);
     if (!bytes) {
         std::fprintf(stderr, "[runtime] load: missing save file: %s\n", path.c_str());
         return LoadResult::MissingFile;
@@ -798,17 +754,18 @@ LoadResult GameRuntime::RuntimeState::load_game(const std::string& file, int64_t
     // ② 桶特判保留的现场：全局输入注册表必须在清场
     // 之前取，场景快照恢复之后回写（顺序契约 1）。诊断：在飞动画（冻结语义，
     // 见文件头"在飞动画契约"）在清场里连同节点消亡，只记不重放。
-    const auto live_input = scene_.input_handlers();
-    const bool had_tweens = scene_.has_tweens();
-    const bool had_anime = scene_.has_anime();
+    const auto live_input = scene().input_handlers();
+    const bool had_tweens = scene().has_tweens();
+    const bool had_anime = scene().has_anime();
 
     // [C] 桶读档清场（逐项见 reset_ephemeral_on_load）。
     const size_t cleared = reset_ephemeral_on_load();
 
-    const SceneRestoreStats rst = restore_scene_snapshot(&scene_, data);
-    restore_text_snapshot(&text_, &scene_, data);
+    const SceneRestoreStats rst = restore_scene_snapshot(&scene(), data);
+    restore_text_snapshot(&text(), &scene(), data);
+    renderer_.request_repaint();
     for (const auto& [k, row] : live_input) {
-        scene_.restore_input_row(k.first, k.second, row);
+        scene().restore_input_row(k.first, k.second, row);
     }
 
     // Restore variables (local domain only; current g./s. survive) and the
@@ -866,7 +823,7 @@ LoadResult GameRuntime::RuntimeState::load_game(const std::string& file, int64_t
                      e.what());
     }
 
-    if (data.has_audio) restore_audio_snapshot(&audio_, data.audio);
+    if (data.has_audio) restore_audio_snapshot(&media_.audio_, data.audio);
     sync_system_audio_volumes();
 
     // [load type=..] runs one transition after the restore (type 0 instant).
@@ -903,14 +860,8 @@ bool GameRuntime::RuntimeState::load_game_from(const std::string& file, int64_t 
 
 void GameRuntime::RuntimeState::dispatch_save_events() {
     if (pending_events_.empty()) return;
-    // 按**入口快照**迭代。存档/读档派发会在处理过程中推进解释器
-    // （读档的 onLoad 链 + tag 队列排空），其事件回调会 push_back 到
-    // pending_events_ —— 就地 range-for 遍历一个正在被 push_back 的 deque 是
-    // 迭代器失效（UB），而旧实现的尾部 `swap(keep)` 还会把处理期间新产生的事件
-    // 整批丢掉（读档链自己排的 [trans]/[wt]/[save] 就这么消失了）。现在：
-    //   - 入口快照决定"本轮处理哪些事件"（不会在派发中途自反馈）；
-    //   - 处理期间新产生的事件按产生顺序留在队列**尾部**，交给下一次派发
-    //     （同一 tick 的 dispatch_control_events 或下一 tick 的宿主 drain）。
+    // Iterate an entry snapshot: load/onLoad may push new events. New events
+    // stay at the queue tail for the next dispatch round.
     std::deque<oa::runtime::Event> in;
     in.swap(pending_events_);
     std::deque<oa::runtime::Event> keep;
@@ -983,13 +934,13 @@ void GameRuntime::RuntimeState::handle_save_tag(const oa::runtime::Event& e) {
     }
     if (e.tag == "autosave") {
         const std::string allow = get("allow");
-        autosave_allow_ = allow.empty() ? 1 : int(save_i64(allow, 1));
+        save_.autosave_allow_ = allow.empty() ? 1 : int(save_i64(allow, 1));
         return;
     }
     if (e.tag == "takess") {
         // [takess]: the host snapshots the frame it is about to present.
-        screenshot_.valid = false;
-        capture_pending_ = capture_fn_ != nullptr;
+        save_.screenshot_.valid = false;
+        save_.capture_pending_ = save_.capture_fn_ != nullptr;
         return;
     }
     if (e.tag == "savess") {
@@ -1010,16 +961,16 @@ void GameRuntime::RuntimeState::handle_file_operation(const std::map<std::string
     const std::string command = get("command");
     if (command == "delete") {
         const std::string path = qualify_save_file(get("target"));
-        if (!path.empty() && save_store_) save_store_->remove(path);
+        if (!path.empty() && save_.save_store_) save_.save_store_->remove(path);
         return;
     }
     if (command == "copy" || command == "move") {
         const std::string src = qualify_save_file(get("src"));
         const std::string dst = qualify_save_file(get("dst"));
-        if (!src.empty() && !dst.empty() && save_store_) {
-            if (auto data = save_store_->read(src)) {
-                if (save_store_->write(dst, *data)) {
-                    if (command == "move") save_store_->remove(src);
+        if (!src.empty() && !dst.empty() && save_.save_store_) {
+            if (auto data = save_.save_store_->read(src)) {
+                if (save_.save_store_->write(dst, *data)) {
+                    if (command == "move") save_.save_store_->remove(src);
                 }
             }
         }
@@ -1077,15 +1028,15 @@ std::vector<uint8_t> resize_rgba(const uint8_t* src, uint32_t sw, uint32_t sh,
 } // namespace
 
 void GameRuntime::RuntimeState::post_frame_capture() {
-    if (!capture_pending_ || !capture_fn_) return;
-    capture_pending_ = false;
+    if (!save_.capture_pending_ || !save_.capture_fn_) return;
+    save_.capture_pending_ = false;
     uint32_t w = 0, h = 0;
-    if (auto rgba = capture_fn_(&w, &h)) {
-        screenshot_.valid = !rgba->empty() && w > 0 && h > 0 &&
+    if (auto rgba = save_.capture_fn_(&w, &h)) {
+        save_.screenshot_.valid = !rgba->empty() && w > 0 && h > 0 &&
                             rgba->size() == size_t(w) * h * 4;
-        screenshot_.w = w;
-        screenshot_.h = h;
-        screenshot_.rgba = screenshot_.valid ? std::move(*rgba) : std::vector<uint8_t>();
+        save_.screenshot_.w = w;
+        save_.screenshot_.h = h;
+        save_.screenshot_.rgba = save_.screenshot_.valid ? std::move(*rgba) : std::vector<uint8_t>();
     }
 }
 
@@ -1096,8 +1047,8 @@ void GameRuntime::RuntimeState::handle_save_screenshot(const std::string& file, 
     // size, then the placeholder size.
     uint32_t w = 320;
     uint32_t h = 180;
-    if (screenshot_.valid && screenshot_.w > 0) w = screenshot_.w;
-    if (screenshot_.valid && screenshot_.h > 0) h = screenshot_.h;
+    if (save_.screenshot_.valid && save_.screenshot_.w > 0) w = save_.screenshot_.w;
+    if (save_.screenshot_.valid && save_.screenshot_.h > 0) h = save_.screenshot_.h;
     if (!width.empty()) {
         try {
             const long v = std::stol(width);
@@ -1113,8 +1064,8 @@ void GameRuntime::RuntimeState::handle_save_screenshot(const std::string& file, 
         }
     }
     std::vector<uint8_t> rgba;
-    if (screenshot_.valid && !screenshot_.rgba.empty()) {
-        rgba = resize_rgba(screenshot_.rgba.data(), screenshot_.w, screenshot_.h, w, h);
+    if (save_.screenshot_.valid && !save_.screenshot_.rgba.empty()) {
+        rgba = resize_rgba(save_.screenshot_.rgba.data(), save_.screenshot_.w, save_.screenshot_.h, w, h);
     } else {
         // Deterministic placeholder: slate background with a border.
         rgba.assign(size_t(w) * h * 4, 0x2A);
@@ -1134,8 +1085,8 @@ void GameRuntime::RuntimeState::handle_save_screenshot(const std::string& file, 
     const std::vector<uint8_t> png = oa::media::encode_png(w, h, rgba);
     if (png.empty()) return;
     const std::string path = qualify_save_file(name);
-    if (path.empty() || !save_store_) return;
-    (void)save_store_->write(path, png);
+    if (path.empty() || !save_.save_store_) return;
+    (void)save_.save_store_->write(path, png);
 }
 
 void GameRuntime::RuntimeState::maybe_autosave_for_wait() {
@@ -1146,13 +1097,13 @@ void GameRuntime::RuntimeState::maybe_autosave_for_wait() {
     if (const oa::runtime::WaitReason* w = wait_ ? &*wait_ : nullptr) {
         sig = std::string(wait_kind_name(w->kind)) + ":" + w->id;
     }
-    if (sig != autosave_wait_sig_) {
-        autosave_wait_sig_ = sig;
-        autosaved_current_wait_ = false;
+    if (sig != save_.autosave_wait_sig_) {
+        save_.autosave_wait_sig_ = sig;
+        save_.autosaved_current_wait_ = false;
     }
-    if (autosave_allow_ == 2 && is_input_wait(wait_ ? &*wait_ : nullptr) &&
-        !autosaved_current_wait_ && save_store_ && save_store_->persistent()) {
-        autosaved_current_wait_ = true;
+    if (save_.autosave_allow_ == 2 && is_input_wait(wait_ ? &*wait_ : nullptr) &&
+        !save_.autosaved_current_wait_ && save_.save_store_ && save_.save_store_->persistent()) {
+        save_.autosaved_current_wait_ = true;
         (void)save_game_to(kAutosaveFile);
     }
 }
@@ -1210,11 +1161,7 @@ constexpr const char* kFont = "font";
 constexpr const char* kBox = "box";
 constexpr const char* kRevealed = "revealed";
 
-/// 版本门（**未来跨版本策略的唯一分派点**）：新于本引擎 → 抛
-/// FormatError（拒绝读，不猜）；旧于本引擎 → 按缺省值读下去（decode 的字段循环
-/// 对缺字段一律用结构体默认值，从不迁移）。存档定义阶段：
-/// 格式未冻结 ⇒ 现在不做跨版本兼容，只保留这一点作为未来加版本分派的位置；
-/// 任何 SaveData 布局改动必须同步 bump kSaveFormatVersion（runtime_save.h）。
+/// Version gate: newer → FormatError; older → defaults (no migration).
 void check_version(const Reader& r) {
     if (r.version() > uint32_t(kSaveFormatVersion)) {
         throw FormatError("save format version " + std::to_string(r.version()) +
@@ -1594,15 +1541,9 @@ std::string SaveData::encode() const {
 // ---------------------------------------------------------------------------
 namespace {
 
-/// BOWS 的"现场"是命令栈；这里把它翻成本引擎的快照模型：
-///   变量 bank        → local_variables（Pluto 表先转成本引擎 pluto 文档）
-///   field 26 命令栈  → scene layers（lyc/lyprop 的属性合并 + lyevent 处理）
-///   field 24 命令栈  → text layers（print 的 data 拼成文本页 + font 属性）
-///   field 29         → 当前 BGM（splay）
-///   field 4 第一帧   → current_script/current_line，后续帧进 call_stack
-/// 已知缺口（docs/OFFICIAL_SAVES.md）：字段 4 的后续帧形状未定论、命令栈里
-/// 的 [lytween]/[wait] 等时序状态无法重放 —— 恢复出来的是"画面 + 文本 +
-/// 变量 + 位置"，不是逐字节等价的现场。
+/// BOWS slot → engine SaveData (best-effort: variables, commands, BGM,
+/// position). In-flight tween/wait timing is not recoverable.
+/// Gaps: docs/OFFICIAL_SAVES.md.
 oa::runtime::SaveData official_slot_to_save_data(
     const oa::runtime::OfficialSlot& slot) {
     oa::runtime::SaveData d;
@@ -1630,10 +1571,7 @@ oa::runtime::SaveData official_slot_to_save_data(
         d.current_script = current->script;
         d.current_line = current->line;
     }
-    // 调用栈：`return_line` 是"本帧结束后回到上层脚本的哪一行"，属于本帧而不是
-    // 下一帧 ⇒ 成对地取 (frames[i].return_line, frames[i+1].script)。0 表示
-    // "没有调用者行"（实测 test4 的单帧、test13 的根帧都是 0），不入栈——否则
-    // 会凭空多出一个回到第 0 行的假帧。
+    // Call stack pairs (frames[i].return_line, frames[i+1].script); 0 = root.
     for (size_t i = 0; i + 1 < slot.frames.size(); ++i) {
         const auto& f = slot.frames[i];
         const auto& caller = slot.frames[i + 1];

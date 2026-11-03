@@ -23,20 +23,7 @@ extern "C" {
 
 #include "core/util/sha1.h"
 
-// ---------------------------------------------------------------------------
-// PhysicsFS-backed project source (see physfs_fs.h for the model).
-//
-// The custom PFS archiver below serves pf2/pf6/pf8 packs (index layout and
-// pf8 XOR payloads ported from the old pfs_archive.cpp reader). Volume sets
-// are classified on the host side BEFORE mounting (same rules as the old
-// PfsArchive ctor): standalone sibling packs are mounted as separate
-// archives (later pack wins), raw byte splits become one concatenated
-// container. Sibling discovery is presence-based (all existing <base>.NNN
-// parts, numbering gaps allowed — see sibling_volumes). Every archive
-// mounts through PHYSFS_mountIo under a unique per-instance name, and each
-// PhysFileSystem instance reads only its own mountpoint subtree — many live
-// instances (unit tests!) never contaminate each other.
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------- PhysicsFS-backed project source (see physfs_fs.h for the model).
 
 namespace oa::fs {
 
@@ -68,25 +55,7 @@ std::string physfs_error() {
     return s ? s : "unknown";
 }
 
-// ---------------------------------------------------------------------------
-// Path encoding (research/129): the engine's path strings are UTF-8 on every
-// platform (research/74 §编码: "游戏侧 SJIS/CP932 → 内部 UTF-8；无 wchar/ANSI
-// codepage"), and PFS index entry names are raw UTF-8 bytes. Two native APIs
-// on Windows disagree with that contract, because they decode `char*` with the
-// process ANSI code page (ACP, 936 on the dev box) instead of UTF-8:
-//   * std::filesystem::path(std::string) throws "No mapping for the Unicode
-//     character exists in the target multi-byte code page";
-//   * std::fopen / UCRT narrow file APIs fail with errno=EILSEQ (42,
-//     "Illegal byte sequence").
-// `path(std::u8string)` is specified to decode char8_t input as UTF-8 (MSVC:
-// MultiByteToWideChar(CP_UTF8)), independent of the ACP *and* of the C locale
-// — which matters because __std_fs_code_page() follows setlocale(LC_ALL,
-// ".UTF-8") at runtime (see research/129 §1 for the probe).
-//
-// POSIX: value_type is char and paths are opaque byte strings, so both helpers
-// below are the identity in bytes — the same behaviour as the pre-fix
-// std::filesystem/std::fopen calls.
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------- Path encoding (research/129): the engine's path strings are U...
 
 /// Interpret UTF-8 path bytes as a native path (Windows: UTF-16).
 sfs::path native_path_from_utf8(std::string_view utf8) {
@@ -552,14 +521,6 @@ std::map<std::string, SharedDir> g_shared_dirs; // real dir path -> mount info
 void physfs_acquire() {
     if (g_phys_refs++ == 0) {
         // PHYSFS_init needs a base directory: its POSIX layer probes
-        // /proc/self/exe first and, with no /proc (Emscripten) or an
-        // argv0 == NULL, `calculateBaseDir` bails with ARGV0_IS_NULL —
-        // PHYSFS_init then returns 0 *without* an error code and nothing can
-        // be mounted (wasm: "PHYSFS_init failed: no error").
-        // Passing an argv0 that contains a dirsep makes PhysicsFS derive the
-        // directory part itself ("/openartemis" -> "/"); only PHYSFS_getBaseDir
-        // reads it and the engine never does. Desktop keeps the historical
-        // NULL + /proc probe.
 #if defined(__EMSCRIPTEN__)
         static const char* const kArgv0Hint = "/openartemis";
 #else
@@ -594,13 +555,7 @@ std::string fresh_name(const char* suffix) {
 // Source planning: classify a PFS path into mountable container(s)
 // ---------------------------------------------------------------------------
 
-/// Discover sibling parts <base>.NNN (three digits) present next to the
-/// archive. Presence-based: a missing middle number does NOT stop the scan,
-/// because real Artemis volume sets ship with numbering gaps (NUKITASHI1:
-/// .000/.001/.002 + .010/.011; NUKITASHI2: .000 + .020). Every present part
-/// joins the set in ascending numeric order, so chain/merge semantics stay
-/// "later part number wins / later bytes follow" exactly as for a
-/// contiguous set.
+/// Discover sibling parts <base>.NNN (three digits) present next to the archive. Presence-based: a missing middle number does NOT stop the s...
 std::vector<std::string> sibling_volumes(const std::string& base_path) {
     std::vector<std::string> out;
     const sfs::path base(base_path);

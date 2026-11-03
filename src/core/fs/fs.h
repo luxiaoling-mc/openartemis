@@ -1,15 +1,5 @@
 #pragma once
-// Virtual file system seam. The engine only talks to IFileSystem; hosts
-// mount a PFS archive and/or a real directory (patch/override). Paths are
-// virtual (e.g. "system.ini", "image/bg/bg001_a.png"), slash separated,
-// matched case-insensitively by implementations.
-//
-// The save domain lives in THIS directory too (store.*): a save
-// IS a filesystem — SaveStore is the read/write seam over relative save paths
-// and DirSaveStore rides the same shared PhysicsFS session as the project
-// source (core/fs/physfs_fs.h, WritableMount). fs/project.* is the project/ini
-// reader, also pure filesystem work. (The save *format* moved out of this
-// directory: it is core/runtime/runtime_save.{h,cpp} now.)
+// Virtual file system seam. The engine only talks to IFileSystem; hosts mount a PFS archive and/or a real directory (patch/override). Paths...
 #include <cstdint>
 #include <memory>
 #include <optional>

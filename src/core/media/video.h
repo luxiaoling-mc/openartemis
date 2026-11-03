@@ -1,18 +1,5 @@
 #pragma once
-// video domain: the video state backend with REAL decode pumps.
-// A channel decodes frames through the
-// decode-source seam — Ogg/Theora via TheoraSource and, when built with
-// FFmpeg (OA_HAVE_FFMPEG, vcpkg "ffmpeg"), ASF/WMV3 and any other
-// libavformat container via FfmpegSource. Both backends and the seam itself
-// are implementation details declared in the internal header
-// core/media/media_internal.h: this public contract only
-// forward-declares what it holds by pointer. Layer video frames are drawn
-// through the layer's VideoFrame content binding (场景侧角色实例给出读取域键),
-// fullscreen frames
-// drawn by the host over the stage. When the file cannot be decoded
-// (missing / undecodable), the channel falls back to the documented logical
-// behavior (non-loop completes right after it starts) so real-game flows
-// never hang.
+// video domain: the video state backend with REAL decode pumps. A channel decodes frames through the decode-source seam — Ogg/Theora via Th...
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -26,6 +13,10 @@
 #include <thread>
 #include <vector>
 
+namespace oa::render {
+class HostTexture; // backend.h：与后端无关的可写纹理
+}
+
 namespace oa::media {
 
 class DecodePool;
@@ -34,16 +25,7 @@ class FfmpegAudioSource; // movie-audio companion (media_internal.h, OA_HAVE_FFM
 
 static constexpr const char* kOverlayVideoId = "@video_overlay";
 
-/// Luma-key mapping for LAYER video frames (effect strips).
-/// The upload host keys the decoded frame with this map and the runtime
-/// reuses it when deciding whether a missing story-layer carrier may be
-/// auto-materialized, so both sides always agree on what a
-/// layer video will look like. Canvas blacks (luma <= 16, the compression
-/// floor of these strips) become fully transparent; content is already
-/// opaque by luma 64 so mid-grey effect strips (btjy weather loops — snow03
-/// flake content luma ~16..190) draw as authored. The older 32..224 ramp
-/// suppressed every mid-tone strip to near-zero alpha, which
-/// made the story-start snowfall invisible.
+/// Luma-key mapping for LAYER video frames (effect strips). The upload host keys the decoded frame with this map and the runtime reuses it w...
 inline uint8_t layer_video_key_alpha(uint8_t luma) {
     if (luma <= 16) return 0;
     if (luma >= 64) return 255;
@@ -98,13 +80,6 @@ struct VideoChannel {
     uint64_t position_ms = 0;
     bool decoded = false; // true when a decoder is attached (real playback)
     /// the channel auto-detected a `<stem>_m.<ext>` mask
-    /// partner next to the playing file (same directory + stem + "_m", same
-    /// extension, resolved through the same loader/magic-path face). While
-    /// set, frames handed out by video_frame carry the engine-level
-    /// composite alpha (the luma-key of the main picture modulated by the
-    /// mask gray) instead of the raw decoder alpha, so hosts must upload
-    /// them verbatim (their host-side luma-key step would re-key a picture
-    /// whose alpha is already final).
     bool mask_on = false;
 
     // -- movie audio (container audio of the playing file) ------------------
@@ -139,21 +114,10 @@ public:
     void set_loader(Loader loader) { loader_ = std::move(loader); }
 
     // -- movie audio --------------------------------------------------------
-    /// Output hook for the decoded movie audio (interleaved stereo f32,
-    /// 44100 Hz). The hook receives already-gained frames and may be called
-    /// from the video driver thread, so it must be thread-safe (hosts push
-    /// into the same SDL_AudioStream the media players use). Null/unset =
-    /// decode + counters still run, samples are dropped (headless/tests).
     using AudioOutput = std::function<void(const float* interleaved_stereo,
                                            size_t frames)>;
     void set_audio_output(AudioOutput out) { audio_output_ = std::move(out); }
     /// deterministic movie-stream flush hook. Unlike the
-    /// ">250 ms push gap" heuristic, this fires at the
-    /// deterministic lifecycle edges — before a movie starts pushing, and
-    /// when the last audio-bearing channel reaches EOF or is stopped — so a
-    /// finished movie can never leave a tail behind (EOF has no "next push"
-    /// for the heuristic to see). Invoked with the engine lock held; the host
-    /// wires it to MediaPlayers::flush_video_audio (a no-op without a device).
     using AudioFlush = std::function<void()>;
     void set_audio_flush(AudioFlush f) { audio_flush_ = std::move(f); }
     /// Movie volume bus (linear 0..1). The runtime syncs it from the script
@@ -163,15 +127,18 @@ public:
         movie_volume_.store(v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v),
                             std::memory_order_relaxed);
     }
-    float movie_volume() const { return movie_volume_.load(std::memory_order_relaxed); }
+
+    /// 与后端无关的可写纹理（渲染层提供；源 update 后交给宿主挂到层上）。
+    using TextureRef = std::shared_ptr<oa::render::HostTexture>;
+    using TextureFactory = std::function<TextureRef(int w, int h)>;
+    /// 纹理工厂（渲染器注入；只在源线程构造对象，不碰后端）。
+    void set_texture_factory(TextureFactory f) { texture_factory_ = std::move(f); }
+    /// 一帧解码完成：通道 + 已更新的纹理（宿主负责挂到层上）。
+    using FramePush = std::function<void(const std::string& channel,
+                                         const TextureRef& tex, int w, int h)>;
+    void set_frame_push(FramePush fn) { frame_push_ = std::move(fn); }
 
     /// Attach the decode pool (optional). When present, every real decode
-    /// channel runs on one pool worker: the worker decodes the SAME
-    /// deterministic frame sequence (including loop restarts) into a
-    /// double-buffered pipe one frame ahead of the caller; the caller
-    /// copies the frame its virtual clock asks for and falls back to its
-    /// own synchronous decoder whenever the worker lags or is unavailable.
-    /// Null = plain synchronous decode (headless/tests stay byte-identical).
     void set_decode_pool(DecodePool* pool) { pool_ = pool; }
 
     // -- fullscreen -----------------------------------------------------------
@@ -183,12 +150,6 @@ public:
     void play_layer(const std::string& id, const VideoConfig& config);
     bool stop_layer(const std::string& id);
     /// Stop every layer channel whose id equals `prefix` or sits below it
-    /// (scene subtree deletion: cgdel / ui-group teardown / whole-scene
-    /// clears). A layer video whose scene carrier is gone has nothing to
-    /// draw; letting it run would decode + mask-composite forever
-    /// (the title petal channel kept pumping into the story,
-    /// the recall-montage strip kept looping after its cgdel). Returns how
-    /// many channels were stopped. Overlay channels are untouched.
     size_t stop_layer_subtree(const std::string& prefix);
     bool is_layer_playing(const std::string& id) const;
 
@@ -214,13 +175,6 @@ public:
     /// Thread-safe snapshot of the engine state (copy under mutex).
     State state() const;
 
-    // 旧的 layer_texture_name 保留命名空间
-    // 键工厂(`__video_layer__:<id>`)已删除 —— 层视频帧的读取域键由场景侧
-    // 角色实例给出(VideoContent::frame_key(层 id),名 = 通道 id = 层 id),
-    // 上传方(app)与读取方(渲染)同源单点;media 层不再认识任何层名拼写。
-    // Luma-keying is decided by the upload caller (layer vs overlay), never by
-    // sniffing the name.
-
     /// Current decoded RGBA frame of a channel (`id` "" = fullscreen).
     /// Returns false when the channel has no current frame (not playing /
     /// decode fallback / before the first frame). `revision` (optional)
@@ -245,6 +199,15 @@ public:
     bool driver_active() const { return driver_running_.load(); }
 
 private:
+    FramePush frame_push_;
+    TextureFactory texture_factory_;
+    std::map<std::string, uint64_t> pushed_rev_;
+    std::map<std::string, TextureRef> textures_; // 每通道一块可写纹理
+
+    /// 收集有新版解码帧的通道（调用方持 engine_mutex_；只读状态）。
+    void collect_fresh_locked(std::vector<std::pair<std::string, bool>>* fresh) const;
+    /// 把新帧推给渲染推送面（锁外调用；video_frame 内部会再次取锁）。
+    void push_frames(const std::vector<std::pair<std::string, bool>>& fresh);
     void driver_loop();
     void ensure_driver();
     void shutdown_driver_if_idle();
@@ -271,11 +234,6 @@ private:
         uint64_t main_seq = 0; // frames the sync decoder pulled (incl. 0)
 
         // Mask partner of a masked channel: the `<stem>_m`
-        // video's own decoder, stepped exactly one frame per DELIVERED main
-        // frame (index lock, caller thread) so the pair stays phase-locked
-        // regardless of the delivery path (pipe worker / sync decoder) and
-        // of loop restarts on equal-length files. Defined out-of-line in
-        // video.cpp (unique_ptr keeps the incomplete type out of this TU).
         struct MaskPartner;
         std::unique_ptr<MaskPartner> mask;
 
@@ -306,14 +264,6 @@ private:
             bool eof = false;      // worker gave up (non-loop end / restart fail)
             bool cancel = false;
             // Mask-compositing worker: the pipe worker steps the `_m` mask
-            // in lockstep with the main stream and bakes the composite into
-            // the delivered slots, so the driver thread never decodes the
-            // mask stream (a 1080p30 masked pair used to cost the driver
-            // ~9 ms per frame of mask decode + alpha bake). On exit the
-            // worker hands its decoders back with their stream positions
-            // intact: a mid-play retirement (worker lag) adopts them, so
-            // the sync fallback resumes at the exact next frame instead of
-            // discarding back from stream zero.
             std::unique_ptr<VideoSource> returned_main;
             std::shared_ptr<VideoSource> returned_mask;
             bool returned_mask_frozen = false;
@@ -327,11 +277,6 @@ private:
     /// (frame 0 decoded). On failure the caller keeps logical behavior.
     bool start_decode(VideoChannel& channel, DecodeState& ds);
     /// Probe the `<stem>_m` sibling of the channel's file and attach it as
-    /// the mask partner. Returns true when a decodable mask
-    /// with matching dimensions attached; frame 0 of the pair is composited
-    /// before returning so the first video_frame already shows the masked
-    /// picture. A missing / undecodable / size-mismatched sibling leaves the
-    /// channel byte-identical to the unmasked pipeline.
     bool attach_mask(VideoChannel& channel, DecodeState& ds);
     /// Advance the mask partner by one frame (index lock with the frame the
     /// caller just delivered) and bake the composite alpha into the current

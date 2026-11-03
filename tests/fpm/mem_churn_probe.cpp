@@ -26,7 +26,7 @@
 
 #include "core/fs/physfs_fs.h"
 #include "core/render/renderer.h"
-#include "core/runtime/runtime.h"
+#include "core/runtime/runtime_game.h"
 
 namespace {
 using Clock = std::chrono::steady_clock;
@@ -82,7 +82,6 @@ int main(int argc, char** argv) {
         for (int i = 0; i < ticks; ++i) {
             rt.tick(16, oa::runtime::FrameInput{});
             if (!no_pump) {
-                re.pump_host_frames(nullptr);
                 // the app presents every frame; SDL's D3D11 backend defers
                 // destroyed-texture release to present, so a probe that
                 // never presents would measure its own deferred queue as a
@@ -94,11 +93,12 @@ int main(int argc, char** argv) {
     };
 
     auto snapshot = [&](const char* tag) {
+        const auto cs = re.cache_stats();
         std::printf(
             "[mem] %-22s rss=%4zuMB textures=%3zu decoded=%3zu "
             "canvases=%2zu atlases=%2zu players=%zu\n",
-            tag, rss_mb(), re.host_texture_count(), re.decoded_count(),
-            re.emote_canvas_count(), re.emote_atlas_count(),
+            tag, rss_mb(), cs.host_textures, cs.decoded_images,
+            cs.emote_canvases, cs.emote_atlases,
             rt.emote_layers().size());
     };
 

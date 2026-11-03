@@ -22,24 +22,25 @@ Artemis 系游戏的数据包（`root.pfs`，可带分卷）并**按真机表现
 ```
 ┌───────────────────────────────────────────────────────────────────────┐
 │ 平台外壳（每平台一份宿主入口）                                          │
-│   desktop: build/<preset>/src/app/openartemis[_test]                   │
+│   desktop: build/<preset>/src/app/openartemis                          │
 │   Android: android/ (Gradle + Java 启动器 + SDLActivity)                │
 │   wasm:    web/index.html + web/serve.py                               │
 └───────────────────────────────┬───────────────────────────────────────┘
                                 │ 一律经 src/app/main.cpp（同一份宿主实现）
 ┌───────────────────────────────▼───────────────────────────────────────┐
-│ 宿主层 src/app                                                        │
-│   main.cpp            窗口/输入/主循环/CLI/资源装载（干净用户版）        │
-│   main_test.cpp       同一 TU 以 OA_TEST_BUILD=1 再编一次（测试超集版）  │
-│   app_test_drive.cpp  测试专用：autodrive 旅程/合成输入/像素度量          │
-│   app_host.h          Options + AppState（两宿主共享）                  │
+│ 宿主层 src/app（SDL 主层）                                             │
+│   main.cpp            SDL 初始化/窗口/事件转换/CLI/启动与退出            │
 │   platform/           oa::plat：每 OS 一个实现 TU                       │
 └───────────────────────────────┬───────────────────────────────────────┘
+                                │ 只交互：启动 / 事件 / 每帧 / 结束
 ┌───────────────────────────────▼───────────────────────────────────────┐
-│ 引擎核心 src/core（**不含任何窗口依赖**）                                │
+│ 引擎内核 src/core                                                      │
+│   runtime/runtime.cpp App→GameRuntime；GameRuntime 直接持有 RenderEngine │
+│   render/             scene/text/transition + SDL 后端/纹理都在这里       │
 │                                                                       │
 │   runtime/    oa::runtime：宿主编排 + Artemis 等待状态机 + 域实现         │
-│      runtime.{h,cpp}          公开契约 + 薄转发 + 内核/控制域            │
+│      runtime.h                App 宿主契约（引擎面见下一行）             │
+│      runtime_game.h           GameRuntime 引擎面（探针/测试 include 它） │
 │      runtime_internal.h       实现面 RuntimeState（三桶维护契约）        │
 │      runtime_iet.{h,cpp}      值/表达式、.iet/.ast 解析、.asb 解码、      │
 │                               解释器（原 oa::script，六 TU 合并为单 TU）  │
@@ -50,10 +51,10 @@ Artemis 系游戏的数据包（`root.pfs`，可带分卷）并**按真机表现
 │      backend.h                **渲染后端唯一接缝**（不含 SDL 类型）      │
 │      backend_sdl.cpp          SDL_Render 实现                          │
 │      backend_gles.{h,cpp}     原生 GLES3 实现（第二条后端）              │
-│      renderer.{h,cpp}         RenderEngine：场景绘制 + 合成 + 纹理缓存   │
+│      renderer.{h,cpp}         RenderEngine：**只栅格化帧计划** + 合成 + 纹理缓存   │
 │      layer.{h,cpp}            层模型（属性/子树/事件行/烘焙）            │
-│      layer_kind.h             **分类权威** kind_of()（纯函数）          │
-│      content_role.h           **层消费面等价委托**（角色=无状态单例）     │
+│      （内容读取面并入 layer.h：textured_content / content_texture_key /
+│       content_quad 直接谓词，无角色类、无分类枚举）                        │
 │      texture_key.h            纹理键 {域,名}（按域分桶，撞名不可能）      │
 │      text.{h,cpp} font.{h,cpp}  文本域：消息层/表意/字形与描边           │
 │   media/      oa::media：音频/视频/解码池/图像                            │
@@ -123,7 +124,7 @@ SDL 事件 ──► AppState 输入 ──► GameRuntime::tick
                 ┌──────────────────┼───────────────────┐
                 ▼                  ▼                   ▼
           ProjectConfig        脚本/图像/音频        存档（WritableMount）
-          (system.ini)         按虚拟路径读取        独立根：OA_SAVE_ROOT
+          (system.ini)         按虚拟路径读取        独立根：save_root（主机策略）
 ```
 
 **规则**：引擎只认 `IFileSystem`；**目录层优先于包**（patch/覆盖语义）。
@@ -132,50 +133,57 @@ SDL 事件 ──► AppState 输入 ──► GameRuntime::tick
 
 | 不变量 | 载体 | 说明 |
 |---|---|---|
-| **分类唯一权威** | `render/layer_kind.h` 的 `kind_of()` | 纯函数；任何判定调整必须同步 `layer_kind` 的断言组与矩阵测试 |
 | **后端唯一接缝** | `render/backend.h` | 头里**不含**任何 `SDL_*` 渲染类型；后端原语 = 引擎真实调用面的最小投影 |
-| **层消费面等价委托** | `render/content_role.h` | 角色 = 无状态单例，派生态由 `kind_of` 直接投影；节点内不嵌角色指针 |
+| **内容读取面** | `render/layer.h` | `textured_content` / `content_texture_key` / `content_quad` 直接谓词（无角色类）；宿主供帧键名 = 层 id |
+| **渲染流水线单向** | `render/renderer.h`（RenderPlan 段） | 生产者写层 → 计划求值 → 栅格化；renderer 不遍历层树、不读 props、不决定顺序（细节 `docs/PIPELINE.md`） |
 | **纹理按域分桶** | `render/texture_key.h` | `TextureKey{域,名}`，跨域撞名在结构上不可能 |
 | **文件系统唯一接缝** | `fs/fs.h` | 引擎只谈虚拟路径；存档是同一 PhysicsFS 会话上的可写挂载 |
-| **运行时状态三桶** | `runtime/runtime_internal.h` | `[A] Serializable` / `[B] RebuiltOnLoad` / `[C] Ephemeral`，每字段一个恢复责任人；缺标注不通过。A 面只放纯数据，禁止句柄/指针/资源 |
+| **运行时状态三桶** | `docs/RUNTIME_STATE.md` | `[A] Serializable` / `[B] RebuiltOnLoad` / `[C] Ephemeral`，每字段一个恢复责任人。A 面只放纯数据，禁止句柄/指针/资源 |
 | **读档顺序契约** | 同上 | B-preserve 回写必须在场景快照恢复**之后**；load 顺序两处为既有实现依赖 |
 | **Lua 面** | `runtime/runtime_lua.{h,cpp}` | Lua 5.1 语义精确对齐；标准库做**屏蔽清单**（保留 `os.date`/`io.open`/`io.close` 等，移除 `os.execute`/`os.system`/`os.exit`/`io.popen`/`loadstring`/`package.loadlib` …） |
 | **引擎→游戏 Lua 错误策略** | `LuaBridge::report_dispatch_error` | 默认"记日志后继续"；`OA_LUA_STRICT=1` 恢复 fail-fast |
 
 ## 5. 宿主接线（`src/app`）
 
-**两个可执行文件，同一份实现**：
+**main.cpp 只做 SDL 层**：命令行解析、SDL 初始化/窗口、SDL 事件转换为
+引擎输入（按键 vk / 鼠标 / 滚轮 / 触屏）、启动 `oa::runtime::App`、每帧调用
+`App::tick()`、退出清理。它不包含渲染或运行时逻辑。
 
-| 程序 | 源 | 内容 | 用途 |
-|---|---|---|---|
-| `openartemis` | `main.cpp` | 干净用户版：CLI、输入、渲染、状态行 | 真机验证 |
-| `openartemis_test` | `main_test.cpp`（=`main.cpp` + `OA_TEST_BUILD=1`）+ `app_test_drive.cpp` | 超集：autodrive 旅程、合成输入、像素度量、诊断 env | AI/回归/验收 |
+**内核 `oa::runtime::App`**（`src/core/runtime/runtime.cpp`）：只拥有一个
+`GameRuntime`，负责打开项目、输入转发与每帧推进。`GameRuntime` 直接持有
+`RenderEngine`；scene/text/transition/绘制状态归 render，runtime 在标签派发和
+`tick` 内完成同步并调用 `renderer.render_frame()`。
 
-`OA_TEST_BUILD=1` 只加测试钩子；**两个二进制在测试设施之外行为一致**。
-`AppState` / `Options` 由 `app_host.h` 在两宿主间共享（同一二进制各 TU 的
-布局必须一致）。
+**公开面分两级**：`runtime.h` 只给宿主（`main.cpp`）——`AppConfig`/`AppResult`/
+`App`，不含 SDL 类型也不含引擎类型；`runtime_game.h` 是引擎面 `GameRuntime`
+（域访问 + 探针/诊断计数），测试与兼容适配器才 include 它。
 
-**启动链**：解析 argv/OA_* → 选数据源（pfs 或目录）→ 挂 `IFileSystem`
-（+ 目录层）→ `Project::open` → 建 `GameRuntime`（其内建 Lua VM 与解释器）
-→ 建 `RenderEngine`（选 sdl/gles 后端）→ 主循环 `tick → 推进媒体 → 绘制 → present`。
+**事件派发**：解释器事件在 `RuntimeState::dispatch_interpreter_event` 一处收口，
+固定域序 `engine → media → text → scene → control → host stream`；只有该入口
+决定事件是否暂停脚本。宿主流事件再按 `save → control` 顺序在 tick 内派发。
+
+**启动链**：main 解析 argv/OA_* → 挂 `oa::plat` → `App::boot()` 打开项目、
+建 `GameRuntime` + `RenderEngine` → main 用 stage 尺寸建 SDL 窗口 →
+`App::attach_window(handle)` 创建后端 → 主循环。
 
 **平台层 `oa::plat`**（`src/app/platform/`）：每 OS 一个实现 TU —
 `platform_desktop.cpp`（存档根 = 游戏目录）、`platform_android.cpp`
 （应用私有存档根 + 生命周期闩锁）、`platform_wasm.cpp`（IDBFS `/save` 挂载 +
-页面持久化/可见性钩子）。两个宿主都编进同一份实现。
+页面持久化/可见性钩子）。
 
 ## 6. 平台与构建
 
 | 目标 | 预设 | 产物 | 备注 |
 |---|---|---|---|
-| Linux/Windows 桌面 | `default`（Ninja Release）、`debug`、`asan`、`windows`（MSVC） | `build/<preset>/src/app/openartemis[_test]`，测试在 `tests/` | 全功能：工具 + 测试 + autodrive |
+| Linux/Windows 桌面 | `default`（Ninja Release）、`debug`、`asan`、`windows`（MSVC） | `build/<preset>/src/app/openartemis`，测试在 `tests/` | 全功能：工具 + 测试 |
 | Android arm64-v8a | `script\build-android.bat`（Gradle + AGP 驱动 CMake） | `android\app\build\outputs\apk\debug\*.apk`，原生侧 `libopenartemis.so` | 只编**用户宿主**；存档根 = 应用私有目录；需 `VCPKG_ROOT`/`ANDROID_NDK_HOME`/`ANDROID_HOME`/JDK17 |
 | Android x64（模拟器） | `android-x64` | 同上 | 用于模拟器验证 |
 | 浏览器 WebAssembly | `script\build-wasm.bat`（emsdk） | `build/wasm/src/app/index.html|js|wasm` | 真 pthreads（全局 `-pthread` + COOP/COEP）；ffmpeg 剔除 |
 
 **共享约定**
 
-- `src/core` 无窗口依赖；`src/app` 是唯一平台相关面。
+- `src/app` 是 SDL 主层（窗口/事件/平台差异）；SDL 类型不进内核接口，
+  只在 `src/core/render` 的后端实现里出现。
 - `tools/` 与 `tests/` 只用桌面目标（Android/wasm 顶层 CMake 跳过）。
 - 构建选项：`OA_BUILD_TOOLS` / `OA_ENABLE_TESTS` / `OA_ENABLE_ASAN`；
   测试资源门：`OA_TEST_*_PFS`（`-D` 或同名环境变量，缺包自跳 exit 77）。
@@ -226,6 +234,10 @@ C++ 工具**复用引擎自己的读取器**（不在工具里重写格式逻辑
   （`runtime_iet.cpp` 合并六个 script TU、`runtime_lua.cpp` 合并九个 lua TU、
   `media/audio.cpp`、`media/video.cpp`、`render`）。
   目标是减少跨 TU 接口面，而不是拆得越碎越好。
+- **`renderer.h` 公开面**：按域分节（生命周期/域访问/帧泵/内容与命中/探针段）；
+  纹理上传、绘制 helper、回读全部 private。事件打标只经 `note()`，计数只经
+  `stats()`/`cache_stats()`；`render_begin/draw_scene/progress_transition/
+  render_end` 仅供性能探针，宿主统一走 `render_frame()`。
 - **命名空间按目录对齐**（一个目录一个顶层命名空间）：`src/core/fs`→`oa::fs`、
   `emote`→`oa::emote`、`util`→`oa::util`、`render`→`oa::render`、
   `runtime`→`oa::runtime`、`media`→`oa::media`、`src/app/platform`→`oa::plat`；
@@ -236,8 +248,9 @@ C++ 工具**复用引擎自己的读取器**（不在工具里重写格式逻辑
 - **第三方**：`third_party/` 尽量保持上游原样；确需补丁必须在此处或紧邻
   README 记录**原因 + 证据**（例：`third_party/lua-5.1.5/README.openartemis.md`
   记录 `lgc.c` 的一处 Android FORTIFY 补丁）。
-- 注释用中文/英文混合是本仓库既有风格；机制性注释应指向证据
-  （文件:行、测试名、旅程名、环境变量）。
+- 注释用中文/英文混合是本仓库既有风格。**机制性长文、历史考古、真实包证据
+  链迁到 `docs/`**（见 `RUNTIME_STATE` / `RUNTIME_NOTES` / `RENDERING` /
+  `EMOTE`）；代码里只留 1–3 行不变量、顺序或非直观原因。
 
 ## 10. 相关文档
 
@@ -245,6 +258,7 @@ C++ 工具**复用引擎自己的读取器**（不在工具里重写格式逻辑
 |---|---|
 | `README.md` | 构建与运行（含各平台命令） |
 | `docs/ARCHITECTURE.md` | 本文：整体结构 |
+| `docs/RUNTIME_STATE.md` | RuntimeState 三桶归属、读档原子性与顺序契约 |
 | `docs/TESTING.md` | `OA_*` 唯一权威表 + 测试布局与验收流 |
 | `docs/PLATFORMS.md` | Android APK / WebAssembly 构建、打包与壳层 |
 | `tools/README.md` | 工具清单与用法 |

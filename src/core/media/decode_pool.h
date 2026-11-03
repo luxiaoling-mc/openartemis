@@ -1,22 +1,5 @@
 #pragma once
-// Media decode thread pool (audio/video decode + media tick off the main
-// thread). Design constraints:
-//
-//   * thread COUNT is fully controllable: constructor argument wins, then
-//     the OA_DECODE_THREADS env var, then a platform default (wasm defaults
-//     to 1 — the common case — but is NOT hard-capped: builds with
-//     pthread/shared memory can set 2+; native defaults to
-//     min(4, hardware_concurrency)).
-//   * worker code is allocation-light (chunk buffers are owned by the
-//     callers) so wasm heaps do not churn per job.
-//   * long-lived jobs (one streaming decode loop per channel) occupy a
-//     worker slot; submit_long() only succeeds while a slot is free, so
-//     callers can fall back to the deterministic synchronous path instead
-//     of queuing behind an unbounded backlog.
-//
-// The pool never changes WHAT is decoded, only WHERE the CPU time is spent:
-// worker output is a byte-identical prefetch of the same deterministic
-// source-frame sequence the synchronous path would produce.
+// Media decode thread pool (audio/video decode + media tick off the main thread). Design constraints: * thread COUNT is fully controllable...
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>

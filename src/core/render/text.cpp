@@ -39,14 +39,7 @@ static bool parse_dbl(std::string_view v, double* out) {
     *out = d;
     return true;
 }
-// Font-pipeline per-operation debug prints ([text] apply_font / font_default)
-// are gated behind OA_DEBUG_FONT=1 (default silent). Kept as a debugging aid
-// for the cross-platform font/pixel work; nothing in the engine or the test
-// suite consumes these lines.
-static bool font_debug_enabled() {
-    const char* v = std::getenv("OA_DEBUG_FONT");
-    return v && *v == '1' && !v[1];
-}
+
 static std::string escape_attr(const std::string& v) {
     std::string r;
     r.reserve(v.size());
@@ -149,7 +142,7 @@ std::vector<std::string> BacklogPage::reproduction_tags(bool allfont) const {
 }
 
 // GlyphIconConfig -------------------------------------------------------
-GlyphIconConfig GlyphIconConfig::from_raw(const std::map<std::string, std::string>& raw) {
+GlyphIconConfig glyph_icon_from_raw(const std::map<std::string, std::string>& raw) {
     GlyphIconConfig c;
     auto non_empty = [&](const char* k) -> const std::string* {
         const auto it = raw.find(k);
@@ -223,14 +216,6 @@ void TextEngine::clear_scene() {
     ruby_open_ = false;
     ruby_annotation_.clear();
     // 按 id 消息层的字体/几何配置 = 会话级:
-    // FPM 用 set_textfont(name, id)(boot/reset 一次性注册,flg.textfont 防重)为
-    // 固定 id 消息层配置字体/几何/layered/排版 —— 该配置跨场景清场存活;场景
-    // 级的是页内容与揭示态。此前 clear_scene 整表清空 layers_,load_game_from
-    // 后这些层被 chgmsg 重建并从活动层继承字体/几何:剧情字表(adv01 top=550)
-    // 渗入 backlog 行层(500.z.bt.tx.<i>.1),行起点整体 +546px 坠出/堆在屏底
-    // (用户所见"backlog 堆积";真机量化 PRE ml.top=4 vs POSTLOAD=550)。
-    // 现在保留各层配置(font/font_stack/geometry/layered/scetween),只清页
-    // 内容、揭示态与显隐标记 —— 配置留存、内容清零,与"会话级不清"注释一致。
     for (auto& [id, l] : layers_) {
         (void)id;
         l.page.clear();
@@ -250,13 +235,6 @@ static bool is_blank_cp(uint32_t cp);
 
 void TextEngine::anchor_active_to_content() {
     // 只认"含非空白字形、未隐藏"的内容层；空白测量层（basefont.font0x
-    // 全角空格）与已清空/隐藏的 UI 层不参与。取字形数最多的层作为剧情
-    // 页载体（名称层等空层天然排除）。仅当消息层栈为空（不在任何
-    // chgmsg 块内）时锚定 + 清栈：chgmsg 块内的活动层由 /chgmsg 的
-    // 弹栈语义管理（翻页清栈使 chgmsg_close 弹空，
-    // text_domain "popped back to the default layer" 失败）；空栈 =
-    // 无在飞 chgmsg 平衡对（load 后 UI 残链已收尾），此时活动层若残留
-    // 在 UI 层（500.pageno 等），锚回内容层并清栈供后续剧情分派。
     if (!layer_stack_.empty()) return;
     std::string best;
     size_t best_chars = 0;
@@ -344,32 +322,9 @@ void TextEngine::switch_layer(std::optional<std::string> id, bool stack,
     active_ = *id;
     MessageLayer& l = active_mut();
     // layered only changes when the tag explicitly carries it — a
-    // bare chgmsg on an existing layer keeps its layered nature (idempotent
-    // select). FPM re-selects the same layer without repeating layered=
-    // (uihelp centering over a layered help slot); the old unconditional
-    // rewrite demoted such a layer to an engine slot mid-flow and stranded
-    // its lyprop target on a detached host node.
     if (layered.has_value()) l.layered = *layered == 1;
 
     // NO cross-layer geometry/font inheritance. A message
-    // layer's paint box comes exclusively from tags that target it ([font]
-    // layout keys left/top/width/height, or a script-authored node). Copying
-    // the PREVIOUS active layer's rect/font into an unpositioned new layer
-    // leaked the story text slot (snll adv01 rect 470,850 + story font) into
-    // unrelated UI prints — snll config uihelp tips (500.z.help, printed
-    // with no font row in snll data) rendered as story-font floats at the
-    // story spot (windowed: tip text y≈855) instead of their designed slot
-    // (uihelp lyprop'd node top≈5, the config page's top help strip);
-    // NekoMiko leftover readout prints (500.p03) inherited the
-    // same garbage before the drawable gate suppressed them. Per-layer
-    // font/geometry state persists on the layer itself (configs are kept
-    // across scene clears), so positioned layers never depended on this.
-    // chgmsg selects/activates the layer and does NOT
-    // clear its page buffer — clearing is [rp]'s job (page_break). Every FPM
-    // overwrite/refresh site carries an explicit [rp] (ui_message/notify/
-    // playtime/name slots/adv_cls4), while temporary switch-away-and-back
-    // sites (uihelp centering, mw_time speed tweak, backlog mode toggles)
-    // rely on the content surviving.
     bump_revision();
 }
 
@@ -384,14 +339,6 @@ void TextEngine::pop_layer() {
 void TextEngine::apply_font(const std::map<std::string, std::string>& p) {
     MessageLayer& l = active_mut();
     // entirexscale / entireyscale: the framework's font rows are authored in an
-    // ENLARGED glyph space and ask the engine to fold that factor into the
-    // GLYPH metrics — iMel's mw font rows carry `entirexscale = 66 /
-    // entireyscale = 66` ("font resolution is 1.5x"), so `size` and the line
-    // spacings in that same row are 1.5x values. The placement keys
-    // (left/top/width/height) stay in stage units: they line the text up with
-    // the message-window plate, whose own position comes from the image csv
-    // (mw.csv 168,747). Scaling the box as well floated the body text above the
-    // window and pushed the name out of its plate.
     std::map<std::string, std::string> scaled = p;
     double sx = 100.0;
     double sy = 100.0;
@@ -410,11 +357,6 @@ void TextEngine::apply_font(const std::map<std::string, std::string>& p) {
         scale_key("size", sy);
         scale_key("kerning", sx);
         // width/height describe the TEXT BOX in the enlarged font space (the
-        // body row asks for 1600 wide at entire=66 -> 1056 on a 1920 stage;
-        // the name row 525 -> 346, which is exactly the width of its plate).
-        // left/top, on the other hand, are screen coordinates: scaling them
-        // floated the body text above the window and pushed the name to the
-        // right edge of its plate.
         scale_key("width", sx);
         scale_key("height", sy);
         scale_key("spacetop", sy);
@@ -430,11 +372,6 @@ void TextEngine::apply_font(const std::map<std::string, std::string>& p) {
     const bool stacked = sit == p_use.end() || sit->second == "1" || sit->second == "true";
     if (stacked) l.font_stack.push_back(l.font);
     l.font.merge_raw(p_use);
-    if (font_debug_enabled()) {
-        std::string dbg;
-        for (const auto& [k, v] : p_use) { dbg += k + "=" + v + " "; }
-        std::printf("[text] apply_font: %s\n", dbg.c_str());
-    }
     auto set_d = [&p_use](const char* key, double* dst) {
         const auto it = p_use.find(key);
         if (it == p_use.end()) return;
@@ -483,11 +420,6 @@ void TextEngine::font_close() {
 
 void TextEngine::font_default(const std::map<std::string, std::string>& p) {
     default_font_.merge_raw(p);
-    if (font_debug_enabled()) {
-        std::string dbg;
-        for (const auto& [k, v] : p) { dbg += k + "=" + v + " "; }
-        std::printf("[text] font_default: %s\n", dbg.c_str());
-    }
 }
 
 void TextEngine::push_text(const std::string& content) {
@@ -499,12 +431,6 @@ void TextEngine::push_text(const std::string& content) {
         l.reveal_index = 0;
     }
     // 内容内换行（LF）语义归一。push_text 把 content 按 '\n' 切成
-    // (Text 段 | Newline 单元) 序列：'\n' → PageUnit::Newline（与 [rt] 同一
-    // 单元语义）；CRLF 的 '\r' 在紧邻 '\n' 时丢弃。page_tags 同步切成
-    // Text/LineBreak 条目，backlog/页内再现标签天然成 [print…]/[rt]。
-    // char_count 不变：Newline 单元计 1 == 原 LF 码点计 1（recompute_char_count）。
-    // 孤立 '\r'（不邻 '\n'）保留为普通字符（与旧行为一致）。空内容保持旧
-    // 行为（单个空 Text 单元）。
     auto push_segment = [&](const std::string& data) {
         PageUnit u;
         u.kind = ruby_open_ ? PageUnit::Kind::RubyBase : PageUnit::Kind::Text;
@@ -665,7 +591,7 @@ void TextEngine::apply_scetween(const std::map<std::string, std::string>& p) {
 }
 
 void TextEngine::set_glyph_config(const std::map<std::string, std::string>& raw) {
-    glyph_icon_ = GlyphIconConfig::from_raw(raw);
+    glyph_icon_ = glyph_icon_from_raw(raw);
     bump_revision();
 }
 

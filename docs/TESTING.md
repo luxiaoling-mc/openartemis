@@ -1,214 +1,134 @@
 # openartemis 测试与运行指南 (TESTING)
 
-本文件是 openartemis 仓库的**测试/运行环境变量总表**与测试布局说明：
-两个 app 程序、tests/ 布局、以及全部 `OA_*` 环境变量（名称/作用/所属模块/示例/分类）。
-仓库内唯一权威清单——改动源码中 `getenv("OA_...")` 时请同步本表。
+本文件是 openartemis 的**测试布局**与**仍然生效的 `OA_*` 环境变量清单**。
+仓库内唯一权威清单：改动源码里的 `getenv("OA_...")` 时同步本表；删掉的开关
+不再保留历史说明（历史研究记录见 `docs/CORE_NOTES.md`）。
 
 ---
 
-## 1. 两个 app 程序
+## 1. app 程序
 
-同一份实现（`src/app/main.cpp`）编译两次：
+只有一个：`openartemis`（`src/app/main.cpp`）。ctest 不跑 app；app 层验证
+= 跑真包冒烟并 `--dump` 一帧。
 
-| 程序 | 源 | 内容 | 谁用 |
-|---|---|---|---|
-| `openartemis` | `src/app/main.cpp`（默认无宏） | **干净用户版**：正常 CLI（数据源、`--headless/--frames/--fps/--dump`、`OA_SAVE_ROOT`、Esc 退出、约 5s 状态行、--frames 结束统计）；**无** autodrive/探针/合成输入/OA_* 测试钩子 | 用户/真机验证 |
-| `openartemis_test` | `src/app/main_test.cpp`（`#define OA_TEST_BUILD 1` 后 include main.cpp，宿主内小钩子）+ `src/app/app_test_drive.cpp`（第二 TU：autodrive 实现，入口声明见 `app_host.h`） | 测试超集 = 用户版 + **全部测试设施**（下节 B/C） | AI/回归/验收（autodrive 流） |
-
-两份程序除测试设施外行为一致；ctest 不直接跑 app（app 层验证见 §3 验收流）。
-构建：`cmake --build build/default -j8` → `build/default/src/app/openartemis[_test]`。
-
-### 用户版 CLI（两程序相同）
+### CLI
 
 ```
 openartemis [options] [project.pfs]     # pfs 或解包目录（含 system.ini）
-  --frames N    跑 N 帧后打印结束统计并退出（无此参数则持续运行）
-  --fps N       窗口模式目标帧率
-  --headless    无窗口驱动（虚拟 16ms tick）；可配 --frames
-  --dump PATH   结束时把最后一帧写为 PPM
-  -h,--help
+  --frames N          跑 N 帧后退出（结束时写 --dump）
+  --dump PATH         把最后一帧写成 PPM
+  --headless          无窗口（固定 16ms tick）
+  --fixed-delta-ms N  确定性步长（窗口模式也可用）
+  --fps N             目标帧率（缺省按真实时钟）
+  --platform NAME     windows / android / wasm（缺省=构建平台）
+  --renderer NAME     sdl（默认）/ gles
+  --mute              静音
+  -h, --help
 ```
-窗口模式 Esc / 窗口关闭 / 游戏自身 exit 请求退出；默认存档根 = 游戏数据所在目录。
+
+窗口模式 Esc / 关窗 / 游戏自身 exit 退出；存档根默认 = 游戏数据所在目录
+（可用 `OA_SAVE_ROOT` 覆盖）。离屏/无人值守跑一律加 `--mute`：设备、解码、
+混音队列照旧，只把主音量置 0。
 
 ---
 
 ## 2. 测试布局
 
 - `tests/` — **通用引擎单测**（自含 fixture，不需要真实游戏包）：
-  compositor/layer_semantics/transform/event_tags/ini/dir_fs/pfs(小样本)/script/
-  interpreter/lua*/variable/asb/input_dispatch/render2/text_domain/text_reveal/
-  media_state/media_runtime/video_decode/save_domain/save_thumb_readback/
-  p1c2_control/backlog_var_bridge/misc_b 等。
-- `tests/fpm/` — **真实游戏回归测试**（判据：需要 `OA_TEST_FPM_PFS`（Madosoft《ハミダシクリエイティブ》中文版）或
-  `OA_TEST_NEKOMIKO_PFS`（NekoMiko，U6b）指向真实 Artemis 包 / 只对该游戏
-  有效；缺包时自跳 exit 77）：
-  folder_start/runtime_frames/boot_fpm/pfs_real/title_drain/p3b_body_probe/
-  text_layout_probe/ux_journey/ux_flow_controls/
-  qload_dock/save_load_ui/backlog_saveload/char_visual_probe/p1_chain_skip/
-  p3_select/u13_wheel/r10*/r38*/nekomiko_p0/
-  emote_static/emote_chain（P1，research/40-emote：PSB 统计 parity + 静态姿态光栅 +
-  真实 Lua 链 e:createEmoteLayer → 层绑定验收）/
-  emote_playback（P2/P3，research/40-emote：timeline/变量播放 + bezier 网格形变
-  状态机，呼吸/表情/口型帧差）/
-  font_face（P4U，research/40-emote：真实项目默认字形面解析——NekoMiko 自带 font/
-  回退；引擎默认字体为 FPM 资产）
-  （CMake：`add_subdirectory(fpm)`）。
-- 全量：`cd build/default && ctest`（自动探测 OA_TEST_FPM_PFS / OA_TEST_NEKOMIKO_PFS，
-  见下）。
+  compositor / layer_semantics / transform / render2 / text_domain / text_reveal /
+  media_state / media_runtime / video_decode / video_mask / decode_pool /
+  save_domain / save_compat / save_thumb_readback / p1c2_control /
+  backlog_var_bridge / misc_b / emote_track_sample / emote_warp 等。
+- `tests/fpm/` — **真实游戏回归**（缺包时自跳 exit 77）。只依赖 **4 个包**：
+  `OA_TEST_FPM_PFS`（ハミダシクリエイティブ 中文版，UI/剧情/文本主包）、
+  `OA_TEST_NEKOMIKO_PFS`（NekoMiko，emote / wmv / 字体）、
+  `OA_TEST_RR_PFS`（常轨脱离ReReCall，影片音频：OP 引擎级 + 启动链 +
+  driver idle-gap + 音频 bound/EOF flush）、
+  `OA_TEST_TG3_PFS`（甜蜜女友3，timeline 手势/循环语义）。
+- 全量：`ctest --test-dir build/windows -C Release`（**69 项**；真包测试需按
+  上文准备，缺包只是 skip 不是 fail）。
+
+包路径在 configure 期用 `-D` 或环境变量给（cache 优先于 env）；两个都没给时
+相关测试自跳。例：
+
+```sh
+cmake -S . -B build/windows -DOA_ENABLE_TESTS=ON \
+  -DOA_TEST_FPM_PFS=/games/fpm/root.pfs \
+  -DOA_TEST_NEKOMIKO_PFS=/games/nm/root.pfs \
+  -DOA_TEST_RR_PFS=/games/rr/root.pfs \
+  -DOA_TEST_TG3_PFS=/games/tg3/root.pfs
+```
 
 ---
 
-## 3. 环境变量总表
+## 3. 环境变量
 
-### A. 运行时宿主（用户版 openartemis 即生效）
+### A. 宿主 / app
 
-| 变量 | 作用 | 所属模块 | 示例 |
-|---|---|---|---|
-| `OA_PFS` | 无位置参数时的默认项目（数据源选择不再有本机硬编码默认；两者皆无则 usage 报错退出） | src/app/main.cpp | `OA_PFS=/x/root.pfs ./openartemis --frames 900` |
-| `OA_SAVE_ROOT` | 覆盖存档根目录（默认=平台默认：本机(desktop)=游戏数据所在目录；android=app 私有目录、wasm=IDBFS /save，经 oa::plat::default_save_root，research/79）。测试/autodrive 一律显式指向 /tmp（autodrive 未显式给根时兜底 OS 临时目录 oa_autodrive_save） | src/app/main.cpp（host_save_root → oa::plat，platform/Platform.h） | `OA_SAVE_ROOT=/tmp/s1 ./openartemis a.pfs` |
-| `OA_DUMP_FRAME` | `--dump` 的别名，路径取 OS 临时目录（$TMPDIR/%TEMP%）下 oa_frame.ppm（窗口有限运行结束写 PPM；不再固定 /tmp） | src/app/main.cpp | `OA_DUMP_FRAME=1 ./openartemis --frames 400 a.pfs` |
+| 变量 | 作用 | 示例 |
+|---|---|---|
+| `OA_PFS` | 无位置参数时的默认项目（没有本机硬编码默认值） | `OA_PFS=/x/root.pfs ./openartemis --frames 900` |
+| `OA_SAVE_ROOT` | 覆盖可写存档根目录（默认=平台默认：desktop 用游戏数据目录，android 用 app 私有目录，wasm 用 IDBFS `/save`） | `OA_SAVE_ROOT=/tmp/s1 ./openartemis a.pfs` |
+| `OA_RENDERER` | 默认渲染后端 `sdl`（默认）/ `gles`，等价于 `--renderer` | `OA_RENDERER=gles ./openartemis a.pfs` |
 
-### B. 回归门控（ctest）
+### B. 回归门控（configure 期）
 
-| 变量 | 作用 | 所属模块 | 示例 |
-|---|---|---|---|
-| `OA_TEST_FPM_PFS` | 指向真实 Artemis 包的路径；tests/fpm/ 全部测试 + 部分通用测试靠它工作。无本机自动探测：configure 时 `-D OA_TEST_FPM_PFS=<path>` 或环境变量 `OA_TEST_FPM_PFS` 提供（cache 优先于 env）；都无 = 空，相关测试 exit 77 自跳。**该包 = Madosoft《ハミダシクリエイティブ》(中文补丁版)**——判定/准备测试资产以该游戏为准；CMake 缓存变量 | 顶层 CMakeLists → tests{,/fpm}/CMakeLists | `cd build && OA_TEST_FPM_PFS=/x/root.pfs cmake -B . && ctest` |
-| `OA_TEST_NEKOMIKO_PFS` | 指向 NekoMiko root.pfs（U6b 资产；同 FPM 规则：-D 或 configure 时环境变量提供，无本机自动探测；CMake 缓存变量）。`nekomiko_p0`/`emote_static`/`emote_chain`/`emote_playback` 测试靠它工作 | 顶层 CMakeLists → tests/fpm/CMakeLists | `OA_TEST_NEKOMIKO_PFS=/x/root.pfs cmake -B build/default && ./build/default/tests/fpm/emote_chain_test` |
+| 变量 | 作用 |
+|---|---|
+| `OA_TEST_FPM_PFS` | 主回归包路径（ハミダシクリエイティブ 中文版）。`tests/fpm/` 大多数测试与部分通用测试（asb/ini/script/video_decode 等）靠它工作 |
+| `OA_TEST_NEKOMIKO_PFS` | NekoMiko 包：`nekomiko_p0` / `emote_static` / `emote_chain` / `emote_playback` / `font_face` / `wmv_decode` |
+| `OA_TEST_RR_PFS` | 影片音频包：`rr_movie_audio` / `tm_movie_gap` / `movie_audio_bound` |
+| `OA_TEST_TG3_PFS` | E-mote timeline 包：`emote_timeline` |
 
-### C. 测试二进制（openartemis_test）专用
+### C. 引擎诊断（core 内 env 门控，不设即零开销零输出）
 
-| 变量 | 作用 | 所属模块 | 示例 |
-|---|---|---|---|
-| `OA_AUTODRIVE` | 窗口化确定性旅程流：`exit`（退出像素流）`title`（回标题像素流）`help`（dock help 悬停探针）`conf`（config 页 hover/拖动探针，VERDICT ALIVE）`r10save`（save 屏 help 位置压力，800 交替）`r10t`（标题往返 2 轮）`r10blog`（backlog 翻页）`qld`（现象 C quickload dock 验证）`d38`（R38 dock 三问题探针）`scale`（U25/research/60 展示层梯子：固定离屏 stage 回读 + letterbox 呈现 + 真实 SDL 事件映射验证）`bt119cg`（research/119 btjy extra CG 鉴赏差分切换：标题语言选择→标题→Lua 桥强制解锁鉴赏→点 bt_extra→点缩略图→鉴赏器内连续点击并逐次 dump Lua 状态/600&700 层树/整帧哈希；旋钮 `OA_BT119_CG`（默认 cg03=ev_com_01，7 变体）`OA_BT119_CLICKS`（默认 6）`OA_BT119_AT`（中性点，默认 1310,880）`OA_BT119_THUMB=1`（首击落缩略图中心）`OA_BT119_FAKEKEYCODE=1`（A/B：点击前重写 flg.keycode））`fontscan`（research/120 现象 J 跨作正文边缘普查：可选首启语言页 → 标题 bt_start → 首个停驻的剧情页，dump 每个可见文本层的字表 raw + 冻结帧 PNG；整程与项目无关，任何 iMel 系包可直接跑；旋钮 `OA_FONTSCAN_PAGES=N`（默认 0，先点过 N 页再冻结，用来找亮背景页））`kdemote`（research/127 KukkoroDays 首启语言页 → 品牌 logo → 标题 bt_start → gamestart 名字对话（逻辑补全）+ Yes/No 选择 → 逐页走 00_共通1 到第一个真实 E-mote `[fg]` 场景（第 87 页，`:fg/cat/tca_a00.psb`）：到达后停驻并 dump 层清单/合成变量样本/CPU 姿态画布（不透明像素+bbox）与窗口 PNG，中段自动翻一页（首个 fg 带 `pass=1` → 框架 `skip()` 双槽结束是设计行为）以采「前景表情 + 通常待機 idle 真的在播」的姿态 revision 增长证据；旋钮 `OA_KDE_PAGES`（默认 400，推进点击上限）`OA_KDE_HOLD`（默认 240，emote 停驻帧数）`OA_KDE_GAP`（默认 10，两次推进点击间隔帧））`langidle`（research/131 首启语言页**停驻**旅程：等语言页出现后**不点**，纯待机 `OA_LANGIDLE_FRAMES` 帧并对每 `OA_LANGIDLE_BEAT` 帧打一条有界心跳（帧号/墙钟/最差单帧墙钟/wait/层数/处理器层数/活动 tween/transition/整帧 luma+hash/场景·文本·tween 事件计数），待机结束再点该语言行并判定"页面是否真的离开"（= 停驻后还点得动），随后标题 `bt_start` → 首个停驻剧情页；退出码 1 + `VERDICT FAIL` 表示"停驻后点击无效/行消失"。旋钮 `OA_LANGIDLE_FRAMES`（待机帧数，默认 1800）`OA_LANGIDLE_BEAT`（心跳间隔帧，默认 60）`OA_LANGIDLE_WALK`（剧情推进点击上限，默认 200）`OA_LANGIDLE_HOVER=1`（整个待机期把合成指针停在语言行中心 —— 真机"鼠标停在页面上"的情形，也是本缺陷的必要条件））`hover`（research/133 标题菜单**悬停**音频探针：首启语言页 → 标题，随后每 `OA_HOVER_STEP` 帧把合成指针移到下一个可点行（真机"鼠标在菜单上来回移动"），每约 1 s 打一行（墙钟/最差单帧墙钟/当前行/队内帧数/目标帧数/设备欠载），结束打 `summary`（均值·最小值·欠载次数）——用来量"悬停时 BGM 断断续续"：修复前 test3 标题 47 s 内 144 次设备欠载（每次换行 4-5 次，队列只有 2 个设备周期），修复后扫描期 0 次。旋钮 `OA_HOVER_FRAMES`（扫描帧数，默认 900）`OA_HOVER_STEP`（每行停留帧数，默认 24）`OA_HOVER_BEAT`（心跳间隔帧，默认 60）`OA_HOVER_MUTE=1`（主音量 0：混音与队列照旧，只是不外放））`slnywalk`（research/132 きら☆かの slny：首启语言页 → 品牌 logo → 标题 `bt_start` → **逐句推进剧情**，每停驻页对每个活着的 E-mote 层打一份**部件级**指纹：`collect_pose_parts` 的逐部件画布 bbox + 全姿态顶点 hash、同运行 CPU 姿态画布的轮廓指标（不透明像素/alpha bbox/8 连通域数/图内最大空行带）、以及合成变量域全量 + 前景槽列表(含时钟) + idle 槽 + rev；跑满 `OA_SLW_PAGES` 后打印**页表 / 变量漂移表（第 1 页 vs 各页逐 label）/ 部件漂移表（部件中心相对该页中位部件中心的位移，"哪个部件相对整体偏了多少 px、在第几页"）**，并逐页落 `slnywalk_sNN_canvas_*.png`（CPU 画布 1/2）与 `slnywalk_sNN_stage.png`（整帧）。旋钮 `OA_SLW_PAGES`（默认 24，指纹页上限）`OA_SLW_SETTLE`（默认 20，停驻后静止帧数再打"已停驻"指纹）`OA_SLW_EARLY`（默认 2，每句的**早期**指纹帧号——采表情入场/手势在飞的姿态）`OA_SLW_GAP`（默认 20，指纹后两次推进点击的间隔帧）`OA_SLW_CANVAS=0`（不打 PNG）`OA_SLW_BOOTCAP`（默认 40000，引导/未停驻的帧上限））；`eu13`（test13/穢翼のユースティア 的**剧情遍历**：该项目标题行的点击是 Lua 回调`exec=title_click`，**没有 `key=` 行**，所以所有按 `key=bt_start` 找按钮的旅程都进不去剧情——这里按 id `400.2.1`（csv.ui_title 的 bt_start，456,314 368x52）用「先移开指针→滑到行上（触发 rollover，框架的 title_click 读 btn_cursor）→下一帧按下」的方式点进去，过掉首次启动的使い方卡，之后每 `OA_EU_GAP` 帧取样并点击推进；每页打印 `1.1.0.20.*` 剧情贴图层（序章文字是烤成图片的 txNN）、消息层 chars/reveal/box/sample 与所有 alpha<1 的遮挡层，末尾静置 `OA_EU_QUIET` 帧再冻结整帧 PNG（转场中途的帧是暗的/带残影，看着像「没有文字」）。旋钮 `OA_EU_PAGES`（默认 6）`OA_EU_GAP`（默认 45）`OA_EU_QUIET`（默认 240）`OA_EU_START=1`（跳过标题点击））；`t3cg`（test3/アマカノ３ 的 **EXTRA → CG鑑賞差分切换**：标题 → Lua 桥按「实存文件」强开鉴赏 → `bt_extra` → `extra01`（CG鑑賞）→ 点缩略图进鉴赏器 → 连续点击并逐次 dump `flg.excgbuff`（count/max/差分名）/`t.check`/ui.asb 执行位置/600&700 层树/整帧哈希，用来验证「点开 CG 后再点直接退出」这类 cgviewer 循环回归；旋钮 `OA_T3_CG`（默认 cg01）`OA_T3_CLICKS`（默认 6）`OA_T3_AT`（中性点，默认 960,540）`OA_T3_RCLICK=N`（第 N 次点击改成右键边沿，负数=ESC；用来验证 exkey 停驻下的取消键退出）`OA_T3_TRACE=0`（关 Lua 追踪）） | src/app/main.cpp（OA_TEST_BUILD 段） | `OA_AUTODRIVE=title ./openartemis_test a.pfs` |
-| `OA_AUTOPLAY` | **自动推进**（测试版；headless 与窗口都可）：只在运行时真的停在点击等待上时按一次，指针在几个关键点之间轮转（正文区 / 标题开始 / 语言 OK / 语言中文），按下 1 帧、放开 1 帧、隔 4 帧再按。脚本进度由运行时状态决定、与帧号无关：headless 下可全速走完整段剧情，比旧的定时点击快一个数量级，也不会因节奏漂移漏拍 | src/app/main.cpp（OA_TEST_BUILD 段） | `OA_AUTOPLAY=1 OA_TEXTTRACE=1 ./openartemis_test --headless --frames 20000 a.pfs` |
-| `OA_WIN_W` / `OA_WIN_H` | 覆盖窗口创建尺寸（任意像素/比例；内容仍按项目 stage 逻辑分辨率离屏渲染并 letterbox 呈现——任意窗口尺寸的回读/呈现验证用，research/60）。缺省 = 项目 stage 尺寸 | src/app/main.cpp（OA_TEST_BUILD 段） | `OA_WIN_W=1024 OA_WIN_H=768 ./openartemis_test a.pfs` |
-| `OA_SCALE_SIZES` | `scale` 流的窗口梯子（逗号分隔 `WxH`；缺省 `1600x900,1024x768,720x1280`；需要可见窗口 `OA_AD_VISIBLE=1`） | 同上 | `OA_SCALE_SIZES=1920x1080,1024x768 OA_AD_VISIBLE=1 OA_AUTODRIVE=scale ./openartemis_test a.pfs` |
-| `OA_UI_OUT` | autodrive 流的证据输出目录（PNG/PPM/日志画面），自动创建 | 同上 | `OA_UI_OUT=/tmp/ev ./openartemis_test` |
-| `OA_VARDUMP` | headless 结束时按前缀导出引擎变量表（local/temp/global/system），offline 核对框架状态（`t.button`/`status`/`g.language`…）；`=""` 导出全部 | src/app/main.cpp | `OA_VARDUMP="t.button" ./openartemis_test --headless --frames 400 a.pfs` |
-| `OA_SCENEDUMP` | headless 结束时按 id 前缀转储场景节点（`id left top w h vis alpha eff file`）；前缀 `""` 转储全部。用于核对"某层到底有没有/位置对不对"（设置页滑块、标题按钮、立绘） | src/app/main.cpp | `OA_SCENEDUMP="100" ./openartemis_test --headless --frames 2400 a.pfs` |
-| `OA_TXTDUMP` | headless 结束时转储每个消息层（`chars/reveal/pending/hidden/positioned/page/alpha/vis/box/size/align/sample`）。用于"进了剧情但一个字都没有"：区分"文本没派发进来"（全层 `chars=0`）与"进了错的层/没定位"（某层 `chars>0` 但 `positioned=0` 或落到 `name` 之类）；`box/size/align` 用来核对名字/正文的排版盒（entirexscale 折叠、居中） | src/app/main.cpp | `OA_TXTDUMP=1 ./openartemis_test --headless --frames 4000 a.pfs` |
-| `OA_TEXTTRACE` | 文本域逐条轨迹：每条 `[print]` 落在哪一帧/哪一层（`f=… push active=… content=…`）、每次 `[chgmsg]`/`[/chgmsg]` 之后的 active 层。定位"文本进了 name 窗口/层栈没回退"这类问题 | src/core/runtime/runtime.cpp | `OA_TEXTTRACE=1 OA_TAGTRACE=1 ./openartemis_test --headless a.pfs` |
-| `OA_TEXTDBG` | 文本绘制诊断：每次 `draw_text_layer` 的进入态（`default_face`/已加载字体面数）与版面（`laid=` 字形数、`reveal=`、字体面）。定位"层里有字但屏幕上一个字没有" | src/core/render/font.cpp | `OA_TEXTDBG=1 ./openartemis_test a.pfs` |
-| `OA_TEXT_NO_LAZY_FACE` | **字体懒加载的 A/B 对照臂**：缺省（不设）= `draw_text_layer` 在开始画之前就地解析本层字体面（`face_for`）。修复前这里在"还没有任何字体面"时直接 `return 0`，而加载字体面的唯一入口就在同一函数下面 —— 死锁：只要本次运行还没有别的东西画过字，正文就永远一个字都画不出来（test13/穢翼のユースティア：标题全是图片、没有一处文字预热字体，进剧情的第一笔正文就撞在死锁上，整段剧情无文字）。`=1` 还原修复前的行为（同一画面应**一个字都没有**，用来复现/回归这条缺陷） | src/core/render/font.cpp | `OA_TEXT_NO_LAZY_FACE=1 OA_AUTODRIVE=eu13 ./openartemis_test a.pfs` |
-| `OA_TEXDBG` | 图片解析诊断：`[lyc2]` 的 `.lnq` 指针解析结果（原路径 → 目标路径 + 字节数）。定位"贴图 1x1/找不到"这类资源解析问题 | src/core/render/renderer.cpp | `OA_TEXDBG=1 ./openartemis_test a.pfs` |
-| `OA_SAVETRACE` | 存档时打印文本快照抓到几个消息层、活动层是谁（`[save] text layers=N active=…`）。定位"读档后窗口空白"：N=0 说明存档那一刻页本来就是空的 | src/core/runtime/runtime_save.cpp | `OA_SAVETRACE=1 ./openartemis_test --headless a.pfs` |
-| `OA_SCRIPT_DUMP` | 加载指定 ASB 时把解码后的文本写到进程 CWD 的 `oa_script_dump.txt`（定位二进制脚本的标签/参数） | src/core/runtime/runtime_iet.cpp | `OA_SCRIPT_DUMP="system/ui.asb" ./openartemis_test ...` |
-| `OA_R10_ALTER` | r10/r10save 交替次数（默认 800） | 同上 | `OA_R10_ALTER=100` |
-| `OA_R10_DWELL` | r10 每次悬停停留帧数（默认 1） | 同上 | `OA_R10_DWELL=3` |
-| `OA_R10_SEED` | r10 伪随机种子（默认 7） | 同上 | `OA_R10_SEED=1` |
-| `OA_R10_PNG` | r10 周期/异常帧 PNG（默认 1） | 同上 | `OA_R10_PNG=0` |
-| `OA_R10_PAIR` | r10 限定压力对 `"keyA,keyB"` | 同上 | `OA_R10_PAIR=bt_save,bt_load` |
-| `OA_R10_TRACE` | r10 逐帧 T 采样条数（默认 0） | 同上 | `OA_R10_TRACE=120` |
-| `OA_P1B_DEBUG` | 标题停驻探针日记（每 30 帧 hover/wait/trans/layers） | 同上 | `OA_P1B_DEBUG=1` |
-| `OA_STATE_LOG` | 每 120 帧状态心跳（wait/layers/glyphs；外部 Xvfb 驱动用） | 同上 | `OA_STATE_LOG=1` |
-| `OA_GLYPH_LOG` | 每 20 帧打印绘制字形数 | 同上 | `OA_GLYPH_LOG=1` |
-| `OA_VIDEO_DEMO` | 引导后自动全屏播放指定逻辑视频文件（U9 宿主演示，EOF 退出） | 同上 | `OA_VIDEO_DEMO=:movie/x.ogg` |
-| `OA_VIDEO_DEBUG` | 视频解码/上传诊断打印（main+core media/renderer 各处读取） | src/app/main.cpp、src/core/media/video.cpp、src/core/render/renderer.cpp | `OA_VIDEO_DEBUG=1` |
-| `OA_TAGTRACE` | 逐条标签轨迹：`[tag] 名称 参数 @脚本:指令`（含 `[ret] -> 脚本:行 (depth)` 返回落点）。定位脚本流（跳转/宏展开/return 栈）时用 | src/core/runtime/runtime_iet.cpp | `OA_TAGTRACE=1 ./openartemis_test --headless --frames 400 a.pfs` |
-| `OA_POINTERDBG` | 指针派发轨迹：命中层列表、可交互层数、光标下可点击层几何（left/top/w/h/可见性/handler 数）、每一行的 handler 类型 | src/core/runtime/runtime.cpp | `OA_POINTERDBG=1 OA_AUTOPLAY=1 ./openartemis_test --headless a.pfs` |
+| 变量 | 作用 | 模块 |
+|---|---|---|
+| `OA_SCENEDUMP` | 按 id 前缀转储场景节点（`id left top w h vis alpha eff file`），`""` = 全部。核对"某层到底在不在/位置对不对" | `src/core/runtime/runtime.cpp` |
+| `OA_VARDUMP` | 结束前按前缀导出引擎变量表（local/temp/global/system），`""` = 全部 | 同上 |
+| `OA_TXTDUMP` | 转储每个消息层（`chars/reveal/pending/hidden/positioned/page/alpha/vis/box/size/align/sample`）。区分"文本没派发进来"（全层 `chars=0`）与"进了错的层/没定位" | 同上 |
+| `OA_PLAN_REUSE` | 帧计划复用开关（默认开）。计划按"层容器版本 + 文本版本 + 全局淡出 + stage 尺寸"缓存；宿主供帧不失效计划。`=0` 强制每帧重建，用于定位"复用门漏失效信号"（A/B：同帧开/关比像素与 `[scene]`） | `src/core/render/renderer.cpp` |
 
-### D. 引擎诊断（core 内 env 门控；两份二进制都编译在内，**不设即零开销零输出**）
+### D. 探针 / 工具的旋钮（非 ctest，report-only）
 
-| 变量 | 作用 | 所属模块 | 示例 |
-|---|---|---|---|
-| `OA_DEBUG_VAR` | e:var 度量/同步变量解析轨迹 | src/core/runtime/runtime_iet.cpp、src/core/render/renderer.cpp | `OA_DEBUG_VAR=1 ./openartemis_test` |
-| `OA_DEBUG_FONT` | FreeType 字体/字形度量诊断 | src/core/render/font.cpp、text.cpp | `OA_DEBUG_FONT=1` |
-| `OA_FONT_OUTLINE` | 文字描边编码（research/126）：`stroke`（默认，FT_Stroker 连续描边层）`dilate`（圆盘膨胀退路）`legacy`（前 120 的 4 对角副本，仅 PRE 像素对照/回退用） | src/core/render/font.cpp | `OA_FONT_OUTLINE=legacy ./openartemis_test` |
-| `OA_DEBUG_LYTW` | [lytween]/[lytweendel] 请求流（id/param/from/to/time） | src/core/runtime/runtime.cpp | `OA_DEBUG_LYTW=1` |
-| `OA_DEBUG_HOVQ` | 指针 hover 命中序/hovered 集合逐帧轨迹（dock 区域） | src/core/runtime/runtime.cpp | `OA_DEBUG_HOVQ=1` |
-| `OA_DEBUG_RESET` | Lua e:tag{"reset"} 来源栈打印 | src/core/runtime/runtime_iet.cpp | `OA_DEBUG_RESET=1` |
-| `OA_DEBUG_TRANSQ` | Lua e:tag{"trans"} 来源 Lua 栈打印 | src/core/runtime/runtime_iet.cpp | `OA_DEBUG_TRANSQ=1` |
-| `OA_LUA_DEBUG` | Lua 运行/调用诊断（run_code/错误上下文） | src/core/runtime/runtime_lua.cpp | `OA_LUA_DEBUG=1` |
-| `OA_LUA_STRICT` | **引擎→游戏 Lua 的错误策略**（research/130）：默认"记日志后继续"（游戏 Lua 抛错只放弃该次调用，不退出进程 ，见 `LuaBridge::report_dispatch_error`）；`=1` 恢复 130 之前的 fail-fast（错误照旧走 `[app] tick error` + 退出）。排障/回归想抓"nil 崩溃面"时建议显式打开 | src/core/runtime/runtime_lua.cpp | `OA_LUA_STRICT=1 OA_AUTODRIVE=kdemote ./openartemis_test a.pfs` |
-| `OA_LUA_STDLIB` | **标准库屏蔽清单的 A/B 臂**（research/134）：缺省=屏蔽生效 —— `os.date`/`os.clock`/`os.time`/`os.getenv`、`io.open`/`io.close` 及句柄读写保留可用，`os.execute`/`os.system`/`os.exit`/`os.remove`/`os.rename`/`os.setlocale`/`os.tmpname`/`io.popen`/`io.tmpfile`/`io.input`/`io.output`、`dofile`/`loadfile`/`loadstring`/`load`/`package.loadlib` 被移除；`=stock` 交回**未屏蔽**的标准库面 | src/core/runtime/runtime_lua.cpp | `OA_LUA_STDLIB=stock` |
-| `OA_ANDROID_FULLSCREEN` | **Android 沉浸式全屏开关**（缺省 1=开）：Android 上真正进全屏的只有 `SDL_SetWindowFullscreen`（建窗的 `SDL_WINDOW_FULLSCREEN` flag 在 Android 后端**不生效**，`Android_CreateWindow` 不碰窗口样式）。`=0` 完全不进全屏，用于把"黑屏"问题从全屏这条链上摘出去：`OA_ANDROID_FULLSCREEN=0` 还黑，就与全屏无关 | src/app/main.cpp | `OA_ANDROID_FULLSCREEN=0` |
-| `OA_NO_VSYNC` | 关闭每帧 Lua `onEnterFrame` 事件（无 vsync 的确定性窗口测试用） | src/core/runtime/runtime.cpp | `OA_NO_VSYNC=1` |
-| `OA_FRAME_STATS` | 逐帧耗时探针（诊断，无行为改变）：每个 `SDL_AppIterate` 记循环间隔 / 引擎 tick / 宿主帧泵 / draw / present，退出时打 p50·p90·p99·max、`>33ms` 占比与最慢 8 帧的分段；`=2` 额外即时打印 `interval>25ms` 的帧（带帧号）。窗口无 vsync + `SDL_Delay` 自节流，只看 fps 看不出“卡”，要看间隔分布 | src/app/main.cpp | `OA_FRAME_STATS=1 OA_AUTODRIVE=hover ./openartemis_test --fps 60 a.pfs` |
-| `OA_BAKE_LOG` | 中间组（`intermediate_render`）离屏烘焙打点：每次真烘焙打印组 id、stage 尺寸、readback+CPU 复合耗时、上传耗时、plan（mask/颜色/alpha/blend/clip）。恒等组合已直绘（见 `OA_NO_GROUP_INLINE`），这里只应看到确实需要裁剪/蒙版/颜色运算的组 | src/core/render/renderer.cpp | `OA_BAKE_LOG=1 OA_AUTODRIVE=hover ./openartemis_test --fps 60 a.pfs` |
-| `OA_NO_GROUP_INLINE` | A/B 负向开关：恒等中间组仍走旧的离屏烘焙（GPU 回读 + 全屏 CPU 复合 + 8 MB 上传），用来逐像素对比两条绘制路径。2026-10-18 实测 test2 标题两路逐字节相同、test3 标题仅 ±1 LSB（旧路径多一次预乘往返量化） | src/core/render/renderer.cpp | `OA_NO_GROUP_INLINE=1 OA_FRAME_STATS=1 OA_AUTODRIVE=hover ./openartemis_test --fps 60 a.pfs` |
-| `--mute` / `OA_AUDIO_MUTE=1` | 无人值守跑（离屏验证、截图、探针）**必须**带上：设备、解码、混音队列全都照旧，只把主音量置 0，所以不会外放，声音相关统计（欠载/水位/信号面）仍然可用 | src/app/main.cpp | `OA_AUDIO_MUTE=1 ./openartemis_test --fps 60 a.pfs` |
-| `OA_VSYNC` | 呈现节流覆盖：默认（不带 `--fps`、不是 autodrive）开 vsync 并按 **项目 fps** 封顶（实测 test3：呈现间隔 p50 16.64 ms = 60.1 fps，面板 165 Hz 也不会把 60 fps 的剧本渲成 165 帧）；`OA_VSYNC=0` 回到旧的 `SDL_Delay(8)`（≈114 fps）；`=1` 强制开。带 `--fps N` 或 autodrive 时故意关掉 vsync ——像素基线是按帧↔时间对应录的。vsync 被合成器忽略（窗口被遮挡/远程桌面）时按呈现间隔自动回退到定时延时 | src/app/main.cpp、src/core/render/backend_sdl.cpp | `OA_VSYNC=0 OA_FRAME_STATS=1 ./openartemis a.pfs` |
-| `OA_TEXT_STATS` | 文本绘制分段：每 120 次 `draw_text_layer` 打一行，含平均排版耗时（`layout=`）、字形绘制耗时（`draw=`）与该层字形数（`last=`）。排版已按层缓存（同样的页只做一次哈希），`layout=` 应只剩几 µs | src/core/render/font.cpp | `OA_TEXT_STATS=1 OA_AUTODRIVE=fontscan ./openartemis_test --fps 60 a.pfs` |
-| `OA_NO_TEXT_CACHE` | A/B 负向开关：每次绘制都重新 `layout_page`（缓存前的行为）。2026-10-18 实测 300 字形合成页两条路径逐字节相同 | src/core/render/font.cpp | `OA_NO_TEXT_CACHE=1 OA_TEXT_STATS=1 ./openartemis_test --fps 60 a.pfs` |
-| `OA_TEXT_BENCH` | 合成文本页基准：在渲染 pass 里用真实字形路径画一张 N 字形的页（`@text_bench`），配合 `OA_FRAME_STATS` 可把「每字形绘制成本」从整帧里剥出来（实测 test2 标题基线 0.87 ms；+100 字 1.63 ms、+400 字 2.91 ms、+1200 字 4.49 ms ≈ 2.6 µs/字形） | src/app/main.cpp（OA_TEST_BUILD） | `OA_TEXT_BENCH=400 OA_FRAME_STATS=1 OA_AUTODRIVE=hover OA_HOVER_PARK=3 ./openartemis_test --fps 60 a.pfs` |
-| `OA_TRANSDBG` | [trans] 捕获路径打点：每次捕获打印 GPU 拷贝（旧场景来自离屏 stage target，零 ReadPixels） | src/app/main.cpp、src/core/render/renderer.cpp | `OA_TRANSDBG=1 OA_AUTODRIVE=exit ./openartemis_test a.pfs` |
-| `OA_SELTRACE` | select_exit 链入口引擎/脚本状态探针（研究/53 E15：482 二路径用户复现用；runtime/interpreter/lua 各处） | src/core/runtime/runtime.cpp、src/core/runtime/runtime_iet.cpp、src/core/runtime/runtime_lua.cpp | `OA_SELTRACE=1 ./openartemis_test a.pfs` |
-| `OA_EXSKIPDBG` | e:debugSkip 快进起始/边界释放打点（研究/56 §5 复现） | src/core/runtime/runtime.cpp | `OA_EXSKIPDBG=1` |
-| `OA_STORYDBG` | 等待装载/释放来源打点（`arm kind/ms/input` + `release by clock|click|decide|skip`），定位"剧情自己往下跑" | src/core/runtime/runtime.cpp | `OA_STORYDBG=1 ./openartemis a.pfs` |
-| `OA_DEBUG_ICON` | emote 形变链图标 warp 起点打点（研究/48 P4U3 探针） | src/core/emote/emote_render.cpp | `OA_DEBUG_ICON=<icon path> OA_DEBUG_EVAL=1` |
-| `OA_DEBUG_EVAL` | emote 逐节点帧选择/世界包围盒/条目统计（研究/48 P4U3 探针；=debugPath 填充开关） | src/core/emote/emote_render.cpp | `OA_DEBUG_EVAL=1` |
+这些只被对应探针/工具读取，**不进 ctest**；每个文件头部注释就是它的完整文档：
 
-### E. 测试内部
+| 变量族 | 归属 |
+|---|---|
+| `OA_BT91_*`（`PAGES` / `PRE` / `KEY` / `LOAD` / `LUABLOG` / `F8TICKS` / `SAVE` / `PFS` / `NOF8` / `DBGKEYS` / `LUABLOG_IMMED`） | `tests/fpm/bt91_backlog_face_probe.cpp`（backlog 行头像几何/世界 AABB） |
+| `OA_SELDEEP` / `OA_P2DEEP` / `OA_P2TRACE` / `OA_SELBACK*` / `OA_SELDBL*` / `OA_LOG_ALL_PAGES` / `OA_DUMP_EMOTE_PAGE` / `OA_DUMP_EMOTE_LATE` / `OA_TEST_STORE_DIR` | `tests/fpm/nekomiko_p0_test.cpp`（深跑/选择支/表情帧导出） |
+| `OA_PERF_DUMP` | `tests/fpm/emote_perf_probe.cpp` |
+| `OA_MEM_NOPUMP` / `OA_MEM_GPU` | `tests/fpm/mem_churn_probe.cpp` |
+| `OA_VPROBE_FRAMES` | `tests/fpm/video_perf_probe.cpp` |
+| `OA_ES_PAGES` / `OA_ES_SAVE` | `tests/fpm/emote_state_probe.cpp` |
+| `OA_SO_PAGES` / `OA_SO_LOAD` / `OA_SO_SAVEDIR` / `OA_TEST_SO_PFS` | `tests/fpm/so90_face_probe.cpp` |
+| `OA_HCT_PROBE_*` / `OA_TEST_HCT_PFS` | `tests/fpm/hct_journey_probe.cpp` |
+| `OA_SN101_CLICKDURING` / `OA_SN101_SAVESRC` / `OA_TEST_SNLL_PFS` | `tests/fpm/sn101_montage_probe.cpp` |
+| `OA_SAKURA_PROBE_*` | `tests/fpm/sakura_mask_probe.cpp` |
+| `OA_LAT_ARM` / `OA_LAT_LOAD` / `OA_LAT_RUNS` / `OA_LAT_SEED` | `tests/fpm/audio_latency_dist_probe.cpp` |
+| `OA_AM_PROBE_PAGES` | `tests/fpm/automode_probe.cpp` |
+| `OA_WMV_DUMP` | `tests/fpm/wmv_decode_test.cpp` |
+| `OA_FRAMES` / `OA_SAMPLE_ALL` / `OA_SAMPLE_LEGACY` | `tools/psb.cpp` |
+| `OA_UX_TRACE` | `tests/fpm/ux_journey_test.cpp` |
+| `OA_TEST_OFFICIAL_SAVE_DIR` | `tests/official_save_test.cpp` |
 
-| 变量 | 作用 | 所属模块 | 示例 |
-|---|---|---|---|
-| `OA_UX_TRACE` | ux_journey_test 内部步骤轨迹 | tests/fpm/ux_journey_test.cpp | `OA_UX_TRACE=1` |
-| `OA_DIRTY_AB` | layer-model S2 统一 invalidate 簿记的同进程 A/B（research/105）：每帧按"现状判据"与"簿记集合"各产出去重集合并逐帧比对；=1 只报（失配帧 + 退出汇总），=2 在首个会翻转消费者等价布尔（重绘门/烘焙失效）的帧 exit(2)。渲染门不受影响（双轨并存,输出未接） | src/app/main.cpp | `OA_DIRTY_AB=1 OA_AUTODRIVE=title ./openartemis_test a.pfs` |
-| `OA_P2DEEP` | nekomiko_p0 深跑：翻页推进到真实 fg 立绘场景并测 idle 呼吸 rev 增长 | tests/fpm/nekomiko_p0_test.cpp | `OA_P2DEEP=1` |
-| `OA_P2TRACE` | nekomiko_p0 翻页步进/等待轨迹（诊断） | tests/fpm/nekomiko_p0_test.cpp | `OA_P2TRACE=1` |
-| `OA_EMOTE_FPS` | EmotePlayer 姿态重渲染帧率覆盖：CPU 光栅路径节流（<8fps 用 1000/v，≥8fps 125ms 保底）；GPU 合成路径（external-pose）默认 30fps、该变量可到 60fps（research/40-emote） | src/core/emote/emote_player.cpp | `OA_EMOTE_FPS=60` |
-| `OA_AD_VISIBLE` | autodrive 可见窗口（缺省 hidden；像素自动化的 WM-less 注意见 research/40-emote） | src/app/main.cpp | `OA_AD_VISIBLE=1` |
-| `OA_AD_MOUSE_ASSERT` | exit/title autodrive 旅程在确认框落定后硬断言鼠标自动落点：warp 请求 ≥10 且引擎指针落在最后一次 `[mouse]` 请求目标（±1px；隐藏窗口/headless 由运行时仿真推进指针）。注：nene 退出确认框存在脚本 csv 目标与引擎 clip 命中区的既有几何偏差（≈+270,+277），见 research/57 | src/app/main.cpp | `OA_AD_MOUSE_ASSERT=1 OA_AUTODRIVE=exit ./openartemis_test a.pfs` |
-| `OA_NM_DIAG` | nmfg 旅程诊断：窗口 PNG + 消息层几何/字形计数 | src/app/main.cpp | `OA_NM_DIAG=1` |
-| `OA_NM_ASSERT` | nmfg 旅程窗口像素文本断言（字形>0 且消息窗区暗像素≥800）+ 立绘断言（P4U2/P4U3 重校，research/40-emote：隐藏-立绘 diff rows60-900>15万 / feet>4万 / rows0-50<1.5万 且头顶≥30 行 / 呼吸窗 diff>4万；hidden 窗口强制，失败 exit 1） | src/app/main.cpp | `OA_NM_ASSERT=1` |
-| `OA_NM_SELTEST` | nmfg 旅程 stage-3 续进到 fg 立绘场景（研究/49 双击崩溃深跑；OA_NM_SELGAP 设点击间隔帧） | src/app/main.cpp | `OA_NM_SELTEST=1` |
-| `OA_NM_SELGAP` | nmfg stage-3 选择支点击间隔帧（默认 ~6 = ~200ms；研究/49） | src/app/main.cpp | `OA_NM_SELGAP=3` |
-| `OA_NM_SELDBG` | 选择支 select_* Lua 调用/引擎点击链诊断（研究/49） | src/core/runtime/runtime_lua.cpp、src/core/runtime/runtime.cpp | `OA_NM_SELDBG=1` |
-| `OA_EMOTE_HALFRES` | EmotePlayer 半分辨率回退（P4U3/research/40-emote 起默认全分辨率；弱机/调试用） | src/core/emote/emote_player.cpp | `OA_EMOTE_HALFRES=1` |
-| `OA_EMOTE_FULLRES` | 显式强制 1:1（现为默认；保留兼容） | src/core/emote/emote_player.cpp | `OA_EMOTE_FULLRES=1` |
-| `OA_EMOTE_THREADS` | 全分辨率 CPU 光栅行带并行线程数与图集解码线程数（默认 min(硬件并发,16)） | src/core/emote/emote_render.cpp、emote_file.cpp、psb_reader.cpp | `OA_EMOTE_THREADS=4` |
-| `OA_EMOTE_GPU` | GPU 贴图合成开关（默认开：SDL_RenderGeometry 画离屏画布；=0 回退 CPU 光栅+上传，research/40-emote）。开启且渲染器创建成功时，宿主锁存 `emote_set_default_external_pose(true)`——新加载的 EmotePlayer 跳过 load() 内的整幅 CPU 初始姿态光栅（大 PSB 曾一次性付出 40+ms），首个泵由宿主按几何合成 | src/app/main.cpp、src/core/emote/emote_player.cpp | `OA_EMOTE_GPU=0` |
-| `OA_EMOTE_DEBUG` | emote 层创建/方法/渲染诊断 | src/core/runtime/runtime_media.cpp | `OA_EMOTE_DEBUG=1` |
-| `OA_EMOTE_STENCIL` | type-12 stencil 合成开关（默认开）。眼睛蒙版：瞳孔按 `stencilCompositeMaskLayerList` 引用的形状（眼白 `shirome`）裁剪，闭眼时该形状被网格压扁→瞳孔被裁掉。**掩码形状本身也是美术**（眼白/脸的轮廓），参考实现把它既画进 mask target 又照常绘到画布上，只喂 stencil 不绘制会让瞳孔直接浮在皮肤上（“眼珠飘出去”）。掩码形状解析两条规则，按优先级：①**祖先链**（stencil 自己的祖先链是本节点链的前缀；跨子 motion 有效，`目L`/`目R` 同名标签按分支消歧，取最深作用域）；②①没命中时退回**同一个 EmoteMotion 内**解析 —— 掩码表可以点名**表亲分支**的形状，头部组的 `['■輪郭','■耳L','■耳R']` 里 `■輪郭` 就在 `輪郭_le` 分支（与 stencil 的 `face_LR` 同级），只有①时该组一个形状都解析不出来，而空掩码＝内容不可见，于是两个角色的 **`頬` 腮红整块消失**；②仍然按 motion 分开左右眼（`目L`/`目R` 是两个 motion），眨眼绑定不变。组内确实没有任何掩码形状时按空掩码合成＝内容不可见，**不做**“空掩码就照常画”的回退（那会让 test3 的瞳孔跑出眼白）。CPU 光栅的组掩码在绘制前**统一预栅格化**（与 GPU 侧“掩码先收齐”一致）：绘制表按 z 排序，掩码形状可能排在它裁剪的内容之后（眨眼某些姿态的眼睑、转头某些角度的脸部轮廓），边画边累积会让内容撞上半成品掩码被擦掉。GPU 合成侧的算术：离屏 target 用 src-over 填充后里面是**预乘 rgb**，所以 (a) 掩码步骤要连 rgb 一起乘（`BlendMode::AlphaMultiply` = RGBA×srcA，只乘 alpha 会把颜色留得太亮），(b) 把 scratch 贴回画布必须用**预乘 over**（`BlendMode::BlendPremult` = src + dst(1-srcA)）；用普通 Blend 等于二次乘 alpha，柔边内容整块变脏灰——只有腮红是这种柔边，眨眼/眼白这类不透明内容看不出差别 | src/core/emote/emote_render.cpp、emote_file.cpp、renderer.cpp、backend*.{h,cpp} | `OA_EMOTE_STENCIL=0` |
-| `OA_EMOTE_ATLAS_KEY` | E-mote 图集纹理缓存键（research/132）：默认把 **PSB 身份**（`EmoteFile::uid()`）并入键 `{层画布键, source, uid}`，并在每层下次绘制时销毁属于**另一份 PSB** 的陈旧图集纹理。`=legacy` 回到修复前的"仅按层键"缓存（A/B 对照臂；游戏在同一层 id 下换 `file=` 时 GPU 会用上一份 PSB 的图集按新图的图标矩形采样 ⇒ 立绘"零件错乱"） | src/core/render/renderer.{h,cpp} | `OA_EMOTE_ATLAS_KEY=legacy OA_EMOTE_DEBUG=1 ./openartemis_test a.pfs` |
-| `OA_DUMP_EMOTE_PAGE` / `OA_DUMP_EMOTE_LATE` | 立绘帧导出（表情 A/B）：第 N 次翻页把每个 emote 层画布写 `page<N>_<layer>.ppm`；`_LATE=<frames>` 再空转该帧数补写 `page<N>_late_...ppm` —— `delay` 链（悲しみ→呆れ…）在语音 sli 之后才切表情，取"整句的表情"必须用 LATE | tests/fpm/nekomiko_p0_test.cpp | `OA_SELDEEP=1 OA_DUMP_EMOTE_PAGE=57 OA_DUMP_EMOTE_LATE=90` |
-| `OA_SKIP_WARP=<i[,j]|all>` / `OA_SKIP_WARP_LABEL=<子串>` | 变形链二分：前者按**链序号**丢掉某条 morph 载体（序号即 `OA_DEBUG_WARP` 的打印顺序，root→leaf；注意每个条目链长不同），后者按**节点名子串**丢掉该节点的变形，跨条目一致，是"这个节点到底该不该变形"的正确开关 | src/core/emote/emote_render.cpp | `OA_SKIP_WARP_LABEL=face_UD` |
-| `OA_WARP_RIGID=<spec>` | blank 形变载体（区域帧）的补丁语义：`sync1`（默认）= 节点 `meshSyncChildMask==0x1` 时按**区域中心 (u,v)=(0.5,0.5)** 求值并作为整棵子树的**刚性平移**，其余载体仍逐顶点；`0` = 全部逐顶点（旧行为）；`all` = 全部刚性；也可给`<节点名子串>[,reg:WxH][,mc0]` 精确选择 | src/core/emote/emote_render.cpp | `OA_WARP_RIGID=0` |
-| `OA_WARP_REG_W` / `OA_WARP_REG_H` | 诊断：把载体的区域尺寸乘一个系数（1.0 = 授权值）。用于验证「官方是否用另一个 span 归一化」 | src/core/emote/emote_render.cpp | `OA_WARP_REG_H=1.5` |
-| `psb physics <psb>` | 打印 `metadata.bustControl/hairControl/partsControl` 的解析结果：baseLayer、写入的变量（`hair_LR_front` 等）、弹簧/阻尼系数与链段长度 | tools/psb.cpp | `psb physics tka_0.psb` |
-| `psb sample-loop <psb> <timeline> <t0> <t1> <step> [label]` | 按参考实现的目标模型扫一条循环时间线的取样值，用于和 `timelineValue()` 的逐行转写做对拍（实测 7 条轨道 × 600 个半帧采样零差异）。`OA_FRAMES=1` 先打印该轨道解析出的关键帧（时间/type/hasContent/easing/value），排查「数据本身恒等」或缓动方向 | tools/psb.cpp | `psb sample-loop aya.psb "#0" 0 300 0.5 head_slant` |
-| `psb nodeframes <psb> <node-label>` | 打印该节点每个关键帧的时间/坐标/角度/缩放，以及 `mesh.bp` 是否存在与取值范围 —— 判断某条物理轴是不是「数据本身就是恒等」（那样参数怎么变画面都不动） | tools/psb.cpp | `psb nodeframes tka_0.psb QLR` |
-| `psb nodetree <psb> [motion] [label|#idx]` | 打印节点树：子节点下标、mesh 参数、region 与 `parameterize` 轴 —— 确认某条链挂在哪个节点/哪条运动上 | tools/psb.cpp | `psb nodetree tka_0.psb "" face_UD` |
-| `psb patch-int <in> <out> <label|#idx> <member> <value> [nth]` | 数值成员同宽度原位改写（如 `meshSyncChildMask`、物理规则的 `enabled`）；`#idx` 走字符串池下标，绕开非 ASCII 命令行 | tools/psb.cpp | `psb patch-int tka_0.psb t.psb face_LR meshSyncChildMask 8` |
-| `OA_EMOTE_IDLE_TARGET` | 待機（唯一循环时间线）取样模型。默认**开** = 参考实现的「目标插值」：关键帧的值是**到下一个关键帧之前要达到的目标**，即 `prev→own` 在 `[key, nextKey-1]` 上走完，`prev` 由时间线的 initialVariables 起算（diff 时间线为 0）。三个必须照抄的细节：① `next` 即使是**空关键帧**（t=300 的时长标记）也要拿它的时间当段末；② `tick == key.time` 时 r=0，取样值是 `prev` 而不是本键值；③ 循环在 `local >= loopEnd` 就回绕，时长标记本身不可见。关掉回到旧的「在关键帧时刻保持该值」模型（A/B 臂） | src/core/emote/emote_player.cpp | `OA_EMOTE_IDLE_TARGET=0` |
-| `OA_DEBUG_IDLE` | 打印待機轨道取样：时间码、采样值、域值 | src/core/emote/emote_player.cpp | `OA_DEBUG_IDLE=1` |
-| `OA_EMOTE_PHYS` | E-mote 物理（`metadata.bustControl/hairControl/partsControl`）总开关，默认**开**；`=0` 关掉整支积分器（A/B 对照臂） | src/core/emote/emote_physics.cpp、emote_player.cpp | `OA_EMOTE_PHYS=0` |
-| `OA_DEBUG_PHYS` | 物理诊断：每 30 tick 打印 dt、采到的锚点数量与各 `baseLayer` 节点的模型坐标 | src/core/emote/emote_player.cpp | `OA_DEBUG_PHYS=1` |
-| `psb patch-identity <in> <out> [keep]` | 把**所有** `mesh.bp` 改成单位网格（`keep` 可保留某节点/区域），整个 PSB 就不再有形变 —— 差分时用来把「变形」与「合成/变换」彻底分开 | tools/psb.cpp | `psb patch-identity tka_0.psb nm.psb "reg:183:136"` |
-| `OA_WARP_GAIN=<k>` | 变形位移整体增益（1.0 = 授权值）。用来区分"场错了"还是"幅值错了"：扫描 k 看极小值是否在 1.0 | src/core/emote/emote_render.cpp | `OA_WARP_GAIN=0.9` |
-| `OA_WARP_TEX` | 带网格补丁的**贴图节点**也把补丁传给子树（参考实现把一条链上的所有贝塞尔曲面依次作用到同一个点上）。默认**开**：关掉时眼睛半闭状态的眼睑/眼白不会跟着压缩，瞳孔露在眼睑外面（眨眼"眼珠飘出去"）。`=0` 回到旧的"只变形自己图标"行为 | src/core/emote/emote_render.cpp | `OA_WARP_TEX=0` |
-| `OA_DEBUG_WARP=<子串>` | 变形链诊断：对路径含该子串的绘制条目打印每条 morph 载体的区域框、采样点 (u,v) 与该点实际位移 —— 用来判断"某块少走/多走多少变形"。配合 `OA_DEBUG_EVAL=1` 才有路径；非 ASCII 子串受进程代码页限制，可用 `shirome` 等 ASCII 片段 | src/core/emote/emote_render.cpp | `OA_DEBUG_EVAL=1 OA_DEBUG_WARP=shirome` |
-| `OA_DUMP_ALL` | 官方驱动探针（emote_official）打印**全部**变量域（默认只打 face_/head_/body_/act_/arm_type/move_/hair_）——排查"某个未打印的轴仍影响画面"时用 | tools/emote_official.cpp | `OA_DUMP_ALL=1 emote_official … --seq` |
-| `OA_SKIP_PART` / `OA_SKIP_ICON` / `OA_SKIP_SRC` | 绘制条目二分（定位"这块是谁画的"）：按节点路径子串 / `<源下标>:<图标下标>` / 源下标丢弃条目。路径需 `OA_EMOTE_MESHDBG=1`；非 ASCII 子串受进程代码页限制，优先用后两个 | src/core/emote/emote_render.cpp | `OA_SKIP_ICON=5:3 OA_EMOTE_MESHDBG=1` |
-| `OA_WAITDBG` | 运行时等待解析/揭示阻塞诊断 | src/core/runtime/runtime.cpp | `OA_WAITDBG=1` |
-| `OA_PERF_PSB` / `OA_PERF_GPU` / `OA_PERF_DUMP` | 无头 emote 性能探针（report-only，非 ctest）：`emote_perf_probe <root.pfs> [psb子串]` 经游戏自身 Lua 桥注入 `e:createEmoteLayer`，播放该 PSB 自己的 idle/表情时间线，测运行时 tick / advance_ms / collect_pose_parts / CPU 光栅 / 加载分解（psb 解析·图集解码·初始姿态）。`OA_PERF_GPU=1` 另建隐藏窗口测全帧路径（泵+合成+场景绘制+present）；`OA_PERF_DUMP=<目录>` 把当前姿态画布落 PPM（像素对比基线用）；`OA_PERF_STEADY`/`OA_PERF_GPU_FRAMES` 调采样帧数 | tests/fpm/emote_perf_probe.cpp | `emote_perf_probe game/root.pfs jsa_6` |
-| `OA_VPROBE_FRAMES` | 无头视频性能探针（report-only，非 ctest）：`video_perf_probe <root.pfs> <视频名子串>` 分级实测 主流解码+YCbCr→RGBA / `_m` 蒙版流解码+alpha 烘焙 / 引擎频道实时循环（decode pool + 驱动节拍，报告达成 fps vs 片源 fps）。mp4/wmv 走 ffmpeg 后端仅测引擎循环。蒙版合成已由驱动线程移入解码池 worker（锁相烘焙；worker 退出交还解码器位，同步回退零追赶），驱动线程每 tick 只剩 memcpy | tests/fpm/video_perf_probe.cpp | `video_perf_probe game/root.pfs sakura` |
-| `OA_DRAINSKIP` | 停驻期标签队列排水诊断（research/119）：排队来源的**点击型等待**扣留队列时打印 `[drainskip] hold kind=… queued=…`（含队首标签样本），队列排水命中暂停时打印 `paused remain=…` | src/core/runtime/runtime.cpp | `OA_DRAINSKIP=1 OA_AUTODRIVE=bt119cg ./openartemis_test a.pfs` |
-| `OA_DECODED_CACHE_MB` | 解码像素缓存字节上限（LRU 淘汰；默认 1024MB，0 = 不设限）。命中/新增刷新使用戳；淘汰时同步销毁镜像的 GPU 纹理（裸资产纹理 + 其蒙版合成），再次显示时按需重解码。长流程资产繁多的游戏此前每张 CG/BG 的像素缓冲进程存活期常驻 = 无界增长 | src/core/render/renderer.cpp | `OA_DECODED_CACHE_MB=512` |
-| `OA_MEM_NOPUMP` / `OA_MEM_GPU` | 内存震荡探针（report-only，非 ctest）：`mem_churn_probe <root.pfs> <视频A> <视频B> <psb子串>` 逐周期创建/销毁视频频道（masked+keyed 两条上传路径）与 emote 层（Lua 注入 createEmoteLayer + lydel），采样 RSS + 渲染器缓存计数（textures/decoded/canvases/atlases/players）。`OA_MEM_NOPUMP=1` 跳过泵（区分解码侧/上传侧），`OA_MEM_GPU=1` 锁存 GPU 合成路径。注意探针逐 tick present——SDL D3D11 的纹理销毁延迟到 present，不 present 会把自家延迟队列误读成泄漏 | tests/fpm/mem_churn_probe.cpp | `mem_churn_probe game/root.pfs "movie\sakura.ogv" "movie\m45_02d.ogv" jsa_6` |
-
-> 注意：`tests/fpm/` 之外还有少量通用测试的 CMake 条目带着
-> `OA_TEST_FPM_PFS` 环境属性（asb/transition/input_dispatch/render2/text_*/
-> media_runtime/save_domain/save_thumb/p1c2/misc_b/ini 等）——属历史遗留的
-> 无害环境注入（测试代码不读取它），保持原样以零改动。
+> `OA_TEST_FPM_PFS` 也被少量通用测试的 CMake 条目注入（asb/ini/script/
+> video_decode 等）——它们确实读这个变量，不再是历史遗留。
 
 ---
 
 ## 4. 快速验证
 
 ```sh
-cmake -B build/default -DCMAKE_BUILD_TYPE=Debug   # 或 Release
-cmake --build build/default -j8
-cd build/default && ctest                            # 61 项（含 tests/fpm；真包测试需按上文准备）
-# 用户版冒烟（headless 900 基线）
-OA_SAVE_ROOT=/tmp/s ./src/app/openartemis --headless --frames 900 /path/root.pfs
-# 窗口化回归流（测试版）
-Xvfb :97 &  # 无显示环境时
-OA_SAVE_ROOT=/tmp/s OA_AUTODRIVE=title ./src/app/openartemis_test /path/root.pfs
-# P3 NekoMiko 窗口证据（翻页 → fg 立绘场景 → 呼吸像素捕获，research/40-emote）
-DISPLAY=:97 OA_SAVE_ROOT=/tmp/nm OA_AUTODRIVE=nmfg OA_UI_OUT=/tmp/nm_out \
-  ./src/app/openartemis_test /path/to/NekoMiko/root.pfs
-# P4U2 立绘窗口回归（文本+立绘区像素断言，research/40-emote；失败 exit 1）
-DISPLAY=:97 OA_SAVE_ROOT=/tmp/nm OA_AUTODRIVE=nmfg OA_NM_ASSERT=1 \
-  OA_UI_OUT=/tmp/nm_out ./src/app/openartemis_test /path/to/NekoMiko/root.pfs
+cmake -S . -B build/windows -DOA_ENABLE_TESTS=ON   # 或 --preset
+cmake --build build/windows --config Release
+ctest --test-dir build/windows -C Release          # 69 项
+
+# app 冒烟（离屏 + 一帧 PPM）
+OA_SAVE_ROOT=/tmp/s ./build/windows/src/app/Release/openartemis \
+  --frames 300 --mute --fps 60 --dump /tmp/frame.ppm /path/root.pfs
+
+# 视觉核对某层/某段文本（结束前转储）
+OA_SCENEDUMP="500" OA_TXTDUMP=1 OA_SAVE_ROOT=/tmp/s \
+  ./build/windows/src/app/Release/openartemis --headless --frames 600 /path/root.pfs
 ```

@@ -84,17 +84,6 @@ struct EmoteNode {
     uint32_t inheritMask = 0x20007FC;
     int meshCombine = 0, meshDivision = 0, meshTransform = 0;
     /// Mesh-sync selector. Measured against emotedriver with single-byte
-    /// patches on one node (see docs/TESTING.md "meshSyncChildMask"): only
-    /// bits 0 and 3 change the output; bits 1..2 are inert on their own and
-    /// bits 4..7 are ignored. In this work only 0x0 / 0x1 / 0x8 occur:
-    ///   0x8  -> the node's patch deforms its subtree PER VERTEX (mesh sync)
-    ///   0x1  -> the subtree is NOT mesh-warped; the patch acts as one rigid
-    ///           offset read at the region centre (face_UD/face_LR)
-    ///   0x0  -> a third, distinct behaviour (verified different from both),
-    ///           only on ■腕RC here; its patch is identity in every pose we
-    ///           could drive, so the engine currently treats it as 0x8.
-    /// Combinations (0x3/0x5/0x9/0x9..0xF) each render differently, so the
-    /// field is NOT a plain child bitmask despite its name.
     uint32_t meshSyncChildMask = 0;
     bool removed = false;
     bool isMaskNode = false; // type 12 (stencil composite)
@@ -175,14 +164,7 @@ struct EmoteSource {
     bool rgbaDecoded = false;
 };
 
-/// The ONE atlas mapping shared by both raster paths:
-/// the icon rect [left,top,width,height] is sampled **in place**:
-///     tu = (left + u*width) / texW      tv = (top + v*height) / texH
-/// The format carries no crop/offset/padding
-/// field (49 real PSBs / 8461 icons: exactly 8 icon keys, 0 `clip`, 0
-/// overlaps, 0 out-of-atlas rects), so this deliberately has **no trim
-/// compensation term**. `emote_axis_dump mesh` asserts this formula verbatim
-/// as a regression guard against ever adding one.
+/// The ONE atlas mapping shared by both raster paths: the icon rect [left,top,width,height] is sampled **in place**: tu = (left + u*width) /...
 inline void emote_icon_uv_to_atlas(const EmoteIcon& ic, int texW, int texH, double u,
                                    double v, double* tu, double* tv) {
     *tu = (ic.left + u * ic.width) / double(texW);
@@ -263,13 +245,6 @@ public:
     bool load(const std::vector<uint8_t>& data, std::string* err = nullptr);
 
     /// Identity of this parsed PSB, assigned on every successful load.
-    /// Renderer-side caches that OUTLIVE one EmotePlayer must key on it: a
-    /// game reuses one layer id while swapping the character's file
-    /// ([fg] file="mit_0" -> "mit_1", costume changes run_0 -> run_1), so a
-    /// cache keyed on the layer alone hands the GPU the PREVIOUS file's atlas
-    /// to sample under the NEW file's icon rectangles — the on-screen portrait
-    /// then shows another file's pixels at this file's part positions
-    /// ("parts scrambled"; research/132). 0 = not loaded.
     uint64_t uid() const { return uid_; }
 
     SpecKind spec = SpecKind::Unknown;
@@ -330,12 +305,7 @@ private:
     uint64_t uid_ = 0; // assigned by load(); see uid()
 };
 
-// ---------------------------------------------------------------------------
-// static (tick-0) render to an RGBA canvas.
-// `vars` overrides variable defaults (face_talk etc.); `scale` multiplies
-// the whole drawing, `dy`/`dx` shift it in canvas pixels. The canvas is
-// w x h RGBA, cleared to transparent. Returns false on structural errors.
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------- static (tick-0) render to an RGBA canvas.
 struct StaticRenderOptions {
     double scale = 1.0;
     double dx = 0, dy = 0;
@@ -343,22 +313,10 @@ struct StaticRenderOptions {
                              // the whole figure into the canvas before scale
     double headMargin = 0;   // extra canvas px below the top after fitting
 };
-/// Timeline track sample at `t` authored frames. A content-less (type 0) frame
-/// only marks the END of a segment, so the sample walks back to the previous
-/// content key and holds it — a fractional clock must not lose a short content
-/// window (NekoMiko's 照れ keeps arm_type=1 only in frames [3,4)). Between two
-/// content keys the value interpolates under the reference's type-2 rule
-/// (`legacy` restores the pre-alignment predicate, OA_EMOTE_S2_LEGACY=1).
-/// Returns false when no content key exists at or before `t`.
-bool emote_sample_track(const TimeVar& track, double t, bool legacy, double* out);
+/// Timeline track sample at `t` authored frames. A content-less (type 0) frame only marks the END of a segment, so the sample walks back to...
+bool emote_sample_track(const TimeVar& track, double t, double* out);
 
-/// Loop-timeline sample (待機 idles): the reference model, where a key's value
-/// is the TARGET to reach just before the next key (`prev -> cur` over
-/// [cur.time, next.time-1]), not a value held at its own time. With the
-/// hold model a loop whose last key sits at t=204 holds that value through the
-/// 300-frame tail and then snaps to the t=0 key, which reads as
-/// "swing left, swing right, pause, jump". `initial` is the value before the
-/// first key (the reference's initialVariables entry, 0 for a delta layer).
+/// Loop-timeline sample (待機 idles): the reference model, where a key's value is the TARGET to reach just before the next key (`prev -> cur`...
 bool emote_sample_track_loop(const TimeVar& track, double t, double initial, double* out);
 
 bool render_static_frame(const EmoteFile& file, const std::map<std::string, double>& vars,
@@ -388,12 +346,7 @@ bool static_content_bounds(const EmoteFile& file,
                            const std::map<std::string, double>& vars, double* minX,
                            double* minY, double* maxX, double* maxY);
 
-// ---------------------------------------------------------------------------
-// GPU compositing path. The host rasterises the pose
-// with SDL_RenderGeometry instead of the CPU pixel fill: the CPU side only
-// evaluates the pose and subdivides the bezier-mesh icons into triangles
-// (light). One part = one textured triangle soup of one atlas icon.
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------- GPU compositing path. The host rasterises the pose with SDL_R...
 struct EmotePartVertex {
     double x = 0, y = 0; // canvas px (surface mapping applied)
     double u = 0, v = 0; // normalized *icon* uv (0..1 across the icon rect)
@@ -403,11 +356,6 @@ struct EmoteDrawPart {
     int icon = -1;   // index into source->icons
     double alpha = 1.0; // part opacity (frame opa * chain opa)
     // mesh diagnostics. `authoredMeshDivision` is the icon
-    // node's raw meshDivision (0 = key absent in the PSB); `meshDivision` is
-    // the cell count this geometry was actually built with (1 = affine quad
-    // path, i.e. no mesh anywhere in the chain — krkr's buildRectMesh).
-    // Exposed so the mesh dump can assert "div == node.meshDivision" without
-    // re-walking the motion tree.
     int authoredMeshDivision = 0;
     int meshDivision = 1;
     // how many type-12 stencil-composite nodes sit
@@ -437,49 +385,12 @@ bool emote_collect_parts(const EmoteFile& file,
                          std::vector<EmoteDrawPart>* parts, std::string* err = nullptr);
 
 // ---------------------------------------------------------------------------
-// mesh subdivision policy. krkr takes the subdivision straight from the icon
-// node (E:emoterunner.cpp:853-854):  div = node->meshDivision; if (div < 2) div = 8;
-// and only subdivides when the render chain actually carries a mesh (else
-// buildRectMesh = our affine quad path). The data authorises 16/20; the
-// engine used to apply a per-icon adaptive clamp(round(diag/90), 6, 18) on
-// both raster paths.
-//
-// The DEFAULT is the hybrid `node-adaptive` rule.
-// krkr's `<2 -> 8` fallback is real data (13/129 icon nodes in NekoMiko tay_0,
-// 33/110 in slny kir_2 carry no meshDivision key) but 8 is COARSER than the
-// adaptive grid those nodes used to get (adaptive picks 13..18 for the
-// large icons involved), so a strict krkr fallback made those parts less
-// faithful (worst part 112px vs 57px, 90/1303 pose-parts). The hybrid keeps
-// the authored value where the data has one and falls back to the adaptive
-// rule where it does not, so no part is ever coarser than the adaptive grid
-// would have been. `node` (strict krkr) stays reachable.
-//
-//   OA_EMOTE_MESHDIV               unset / "node-adaptive" -> hybrid (DEFAULT)
-//   OA_EMOTE_MESHDIV=node          -> strict krkr: authored, <2 -> 8
-//   OA_EMOTE_MESHDIV=adaptive      -> adaptive clamp(round(diag/90),6,18)
-//   OA_EMOTE_MESHDIV=<n>           -> fixed n cells for every warped part
-//                                     (clamped to kMin..kMax below)
-// The policy is latched from the environment at first use and can be
-// re-pointed in-process (same-process REF/NEW A/B, tests; mode < 0 restores
-// the environment latch).
-enum EmoteMeshDivMode {
-    kEmoteMeshDivNode = 0,     // node.meshDivision (<2 -> 8), krkr parity
-    kEmoteMeshDivAdaptive = 1, // adaptive clamp(round(diag/90),6,18)
-    kEmoteMeshDivFixed = 2,    // one fixed cell count for every warped part
-    kEmoteMeshDivNodeAdaptive = 3, // authored value, missing key -> adaptive
-};
+// 网格细分（唯一规则 = node-adaptive 混合）
+// ---------------------------------------------------------------------------
 constexpr int kEmoteMeshDivMin = 2;
 constexpr int kEmoteMeshDivMax = 64; // safety bound (data max is 20)
 constexpr int kEmoteMeshDivFallback = 8; // krkr default when meshDivision < 2
 
-struct EmoteMeshDivPolicy {
-    int mode = kEmoteMeshDivNodeAdaptive; // default: the hybrid rule
-    int fixed = 0;
-};
-/// Active policy (env-latched unless overridden by emote_set_mesh_div_policy).
-EmoteMeshDivPolicy emote_mesh_div_policy();
-/// mode < 0 restores the environment-latched policy.
-void emote_set_mesh_div_policy(int mode, int fixed = 0);
 /// krkr rule: authored < 2 -> 8, clamped to [kEmoteMeshDivMin, kEmoteMeshDivMax].
 int emote_node_mesh_division(int authored);
 /// adaptive rule: clamp(round(hypot(iconW,iconH)/90), 6, 18).
@@ -490,34 +401,5 @@ int emote_adaptive_mesh_division(double iconW, double iconH);
 int emote_effective_mesh_division(int authored, double iconW, double iconH);
 /// OA_EMOTE_MESHDBG=1: fill EmoteDrawPart::nodePath (diagnostics only).
 bool emote_mesh_debug();
-
-// ---------------------------------------------------------------------------
-// numeric-robustness switches — see emote_render.cpp for
-// the exact reference rules and the default rationale.
-//   angleWrap        +-180 degree interpolation wrap (reference
-//                    E:emoterunner.cpp:604-620). Default ON (reference).
-//   tailFallback     a content-less LAST frame falls back to the last
-//                    content frame (E:emoterunner.cpp:355-374). Default OFF.
-//   paramOobSkip     a parameter node whose parameterIndex is out of range
-//                    is not drawn (E:emoterunner.cpp:1004-1005, 530-534).
-//                    Default OFF.
-//   nonfiniteGuard   NaN/Inf frame values are repaired instead of
-//                    propagating (E:emoterunner.cpp:559-583). Default ON.
-// ---------------------------------------------------------------------------
-struct EmoteS2Policy {
-    bool angleWrap = true;
-    bool tailFallback = false;
-    bool paramOobSkip = false;
-    bool nonfiniteGuard = true;
-};
-/// Active policy (env-latched unless overridden by emote_set_s2_policy).
-EmoteS2Policy emote_s2_policy();
-/// Each argument: -1 restores the environment latch, 0/1 forces off/on.
-void emote_set_s2_policy(int angleWrap, int tailFallback, int paramOobSkip,
-                         int nonfiniteGuard);
-/// Stencil-composite (type-12 eye mask) A/B arm: -1 restores the environment
-/// latch (OA_EMOTE_STENCIL, default on), 0/1 forces off/on.
-bool emote_stencil_enabled();
-void emote_set_stencil_enabled(int on);
 
 } // namespace oa::emote

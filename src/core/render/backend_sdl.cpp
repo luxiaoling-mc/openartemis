@@ -50,8 +50,7 @@ SDL_TextureAccess to_sdl_access(TextureAccess a) {
 }
 
 /// Shared ReadPixels→RGBA32 copy（当前渲染 target → 紧排行 RGBA 向量）。
-/// 行 pitch 总是处理；语义 = snapshot 面与 frame_luma/read_target_pixels
-/// 各自内联的同一段代码。
+/// 行 pitch 总是处理；snapshot / read_target_pixels 共用这一段。
 bool read_current_target(SDL_Renderer* renderer, int* out_w, int* out_h,
                          std::vector<uint8_t>* out) {
     if (!renderer) return false;

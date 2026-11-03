@@ -1,22 +1,6 @@
 #pragma once
-// render_internal.h —— render 的**内部实现面**。
-//
-// 分层（每层只 include 上一层）：
-//   renderer.h / layer.h    对外契约：宿主渲染接口 + 场景层树。调用方只 include 它们。
-//   render_internal.h       实现面：anim（缓动 + [lytween] 时间线 + [anime] 帧
-//                           动画）与 transition（[trans] 语义机）的全部类型。
-//                           只有 render/runtime 的 .cpp 与专门测这两个语义机的
-//                           测试（tests/transition_test.cpp）允许 include。
-//   layer.cpp               §8 = anim/tween/[anime]/[trans] 的语义核实现
-//                           （与其状态所有者 Compositor 同 TU；见 §8 banner）。
-//
-// 这两个模块的类型只有实现面需要**定义**，外部调用方从不依赖：
-//   - [trans] 的观察面收为 oa::runtime::TransitionStatus 只读投影（runtime.h），
-//     写入口（start/clear/mark_captured/skip_by_input）留在 runtime 实现面；
-//   - Compositor 的 tween/anime 方法只有 std::vector<TweenDone> 返回值需要这个
-//     名字，layer.h 前向声明即可（定义只在 render/runtime 的 .cpp 里用）。
-// 因此本头接管两份声明面，公开头（renderer.h / layer.h / runtime.h）不再
-// include anim/transition。
+// render 内部实现面：tween / anime / transition 状态机。只有 render/*.cpp 与
+// runtime_internal.h（需要 TweenDone 的完整定义）include 它。
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -25,7 +9,6 @@
 #include <vector>
 
 namespace oa::render {
-
 
 /// 30 standard Artemis easings (10 families x in/out/inout) + Linear.
 /// Formulas are the canonical Robert Penner equations (public domain),
@@ -129,8 +112,6 @@ struct AnimeState {
     uint64_t start_ms = 0;          // set at mode=end (current clock)
     uint64_t total_duration_ms = 0; // set at mode=end (time param)
 };
-
-
 
 class Transition {
 public:

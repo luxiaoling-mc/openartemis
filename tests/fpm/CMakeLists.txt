@@ -55,27 +55,15 @@ add_test(NAME rr_movie_audio COMMAND rr_movie_audio_test)
 set_tests_properties(rr_movie_audio PROPERTIES
   ENVIRONMENT "OA_TEST_RR_PFS=${OA_TEST_RR_PFS}" SKIP_RETURN_CODE 77 ${_OA_RS})
 
-# research/87: real HCT (灵感满溢的甜蜜创想凸) movie-audio acceptance — the
-# stutter-report title. Engine-level pump over the OP movie_bai/o4p6jwsag.mp4
-# (init.movie.op, HEVC 29.97 fps + AAC 44.1 kHz stereo) plus a boot journey
-# through the movie_bai/logo.mp4 silent-track park. OA_TEST_HCT_PFS points at
-# the game's root.pfs FILE (its real parent directory supplies the loose
-# movie_bai/ files). Skips (77) when unset.
-add_executable(tm_movie_audio_test tm_movie_audio_test.cpp)
-target_link_libraries(tm_movie_audio_test PRIVATE libopenartemis)
-add_test(NAME tm_movie_audio COMMAND tm_movie_audio_test)
-set_tests_properties(tm_movie_audio PROPERTIES
-  ENVIRONMENT "OA_TEST_HCT_PFS=${OA_TEST_HCT_PFS}" SKIP_RETURN_CODE 77 ${_OA_RS})
-
 # research/88: the wall-clock video driver must not credit idle time into a
 # later channel's clocks (real-machine story-head movie started ~16 s in).
-# Real-time (driver + decode pool) two-play geometry; skips 77 without the
-# archive. Registered after tm_movie_audio, same HCT asset convention.
+# Real-time (driver + decode pool) two-play geometry over the rr archive's
+# short silent logo.mp4; skips 77 without it.
 add_executable(tm_movie_gap_test tm_movie_gap_test.cpp)
 target_link_libraries(tm_movie_gap_test PRIVATE libopenartemis)
 add_test(NAME tm_movie_gap COMMAND tm_movie_gap_test)
 set_tests_properties(tm_movie_gap PROPERTIES
-  ENVIRONMENT "OA_TEST_HCT_PFS=${OA_TEST_HCT_PFS}" SKIP_RETURN_CODE 77 ${_OA_RS})
+  ENVIRONMENT "OA_TEST_RR_PFS=${OA_TEST_RR_PFS}" SKIP_RETURN_CODE 77 ${_OA_RS})
 
 # research/54: real WMV decode over the NekoMiko boot asset
 # movie/logo_emote.wmv (ASF/WMV3) through the optional FFmpeg backend
@@ -142,13 +130,11 @@ if(OA_TEST_SERIALIZE_HEAVY)
   set_tests_properties(emote_timeline PROPERTIES RUN_SERIAL TRUE)
 endif()
 set_tests_properties(emote_timeline PROPERTIES
-  ENVIRONMENT "OA_TEST_TG3_PFS=${OA_TEST_TG3_PFS};OA_TEST_SLNY_PFS=${OA_TEST_SLNY_PFS}"
+  ENVIRONMENT "OA_TEST_TG3_PFS=${OA_TEST_TG3_PFS}"
   SKIP_RETURN_CODE 77 ${_OA_RS})
 
 # E9 diagnostic: dumps slant/UD axis keyframes + idle-entry head/body geometry
 # (report-only executable; not registered as a ctest).
-add_executable(emote_axis_dump emote_axis_dump.cpp)
-target_link_libraries(emote_axis_dump PRIVATE libopenartemis)
 
 # Headless emote performance probe (report-only, not a ctest): walks a real
 # game archive to an E-mote scene and measures tick/player-level costs.
@@ -166,8 +152,6 @@ add_executable(hct_journey_probe hct_journey_probe.cpp)
 target_link_libraries(hct_journey_probe PRIVATE libopenartemis)
 
 # research/88 diagnostic: HCT movie real-device audio probe (report-only).
-add_executable(hct_av_probe hct_av_probe.cpp)
-target_link_libraries(hct_av_probe PRIVATE libopenartemis)
 
 # research/118 diagnostic: audio latency distribution probe (report-only; not
 # a ctest). Real-time dummy/real device, app-like tick cadence with a "video
@@ -429,7 +413,7 @@ set_tests_properties(r38p3_tablet_toggle_test PROPERTIES ENVIRONMENT "OA_TEST_FP
 add_executable(movie_audio_bound_test movie_audio_bound_test.cpp)
 target_link_libraries(movie_audio_bound_test PRIVATE libopenartemis)
 add_test(NAME movie_audio_bound COMMAND movie_audio_bound_test)
-set_tests_properties(movie_audio_bound PROPERTIES ENVIRONMENT "OA_TEST_HCT_PFS=${OA_TEST_HCT_PFS}" SKIP_RETURN_CODE 77 ${_OA_RS})
+set_tests_properties(movie_audio_bound PROPERTIES ENVIRONMENT "OA_TEST_RR_PFS=${OA_TEST_RR_PFS}" SKIP_RETURN_CODE 77 ${_OA_RS})
 
 # Headless video performance probe (report-only, not a ctest).
 add_executable(video_perf_probe video_perf_probe.cpp)
@@ -443,8 +427,6 @@ if(WIN32)
 endif()
 
 # E-mote stencil/mask structure survey (report-only).
-add_executable(emote_mask_dump emote_mask_dump.cpp)
-target_link_libraries(emote_mask_dump PRIVATE libopenartemis)
 
 # Selector / timeline variable survey (report-only).
 add_executable(emote_vars_dump emote_vars_dump.cpp)

@@ -15,7 +15,7 @@
 // the second play starts at ~0 and runs its full duration. The engine
 // counters (position_ms / audio_frames) prove it without any audio device.
 //
-// Env: OA_TEST_HCT_PFS (movie_bai/logo.mp4, ~5.06 s digitally silent AAC
+// Env: OA_TEST_RR_PFS (movie/logo.mp4, ~5 s digitally silent AAC
 // track). Skip 77 when unset. Real-time run (~16 s wall).
 #include <chrono>
 #include <cstdarg>
@@ -107,15 +107,15 @@ uint64_t channel_position_ms(oa::media::VideoEngine& v) {
 
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
-    const char* pfs_path = std::getenv("OA_TEST_HCT_PFS");
+    const char* pfs_path = std::getenv("OA_TEST_RR_PFS");
     if (!pfs_path || !*pfs_path) {
-        std::printf("OA_TEST_HCT_PFS unset; skipping\n");
+        std::printf("OA_TEST_RR_PFS unset; skipping\n");
         return 77;
     }
     auto fs = std::make_shared<oa::fs::PhysFileSystem>(pfs_path, true);
-    const std::string file = "movie_bai/logo.mp4"; // ~5.06 s, silent AAC track
+    const std::string file = "movie/logo.mp4"; // ~5 s, silent AAC track
     if (!fs->exists(file)) {
-        std::fprintf(stderr, "%s missing (loose movie_bai dir not mounted?)\n",
+        std::fprintf(stderr, "%s missing (loose movie dir not mounted?)\n",
                      file.c_str());
         return 1;
     }

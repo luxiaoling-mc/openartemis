@@ -1,25 +1,4 @@
-// video domain — ONE translation unit.
-//
-// "Small interface, big file": the public contract is core/media/video.h
-// (VideoEngine + the video channel/config/finish types); the decode backends
-// live here. This file merges three parts:
-//
-//   the video channel engine, decode pump, mask partner,
-//   movie-audio pump and self-driving clock;
-//   the always-compiled Ogg/Theora decode source;
-//   the optional FFmpeg backend (FfmpegSource +
-//   FfmpegAudioSource), compiled only when CMake detects
-//   FFmpeg; the WHOLE section keeps its original
-//   `#if defined(OA_HAVE_FFMPEG)` gate, so a build without
-//   FFmpeg still gets the Theora-only surface.
-//
-// The declarations of the backend classes live in the internal header
-// core/media/media_internal.h
-// (video.h itself keeps only the public contract and forward-declares the
-// backend types it holds by pointer).
-//
-// Partitions: §1 video engine, §2 theora decode source, §3 ffmpeg decode
-// sources (OA_HAVE_FFMPEG).
+// video domain — ONE translation unit. "Small interface, big file": the public contract is core/media/video.h (VideoEngine + the video chan...
 #include "core/media/video.h"
 
 #include <algorithm>
@@ -34,6 +13,7 @@
 
 #include "core/media/decode_pool.h"
 #include "core/media/media_internal.h"
+#include "core/render/backend.h" // HostTexture（源持有、update）
 
 namespace oa::media {
 
@@ -73,15 +53,7 @@ std::string mask_sibling_name(const std::string& file) {
     return file + "_m";
 }
 
-/// per-pixel composite bake, the video-domain equivalent of
-/// the engine's image-mask convention (RenderEngine::texture_for_masked:
-/// out.a = file.a * mask-gray / 255, gray = the R channel of the grey mask
-/// image; the file's RGB is drawn verbatim). For canvas-strip videos the
-/// "file alpha" of the main picture is its luma-key alpha (the same
-/// layer_video_key_alpha map the layer upload host applies),
-/// and the `_m` partner modulates that visibility. The main RGB is never
-/// touched: the mask only gates how much of the (luma-keyed) main picture
-/// shows, and it never contributes color.
+/// per-pixel composite bake, the video-domain equivalent of the engine's image-mask convention (RenderEngine::texture_for_masked: out.a = fi...
 void bake_video_mask_alpha(uint8_t* rgba, int w, int h, const uint8_t* mask_rgba) {
     const size_t n = size_t(w) * size_t(h);
     for (size_t i = 0; i < n; ++i) {
@@ -110,6 +82,9 @@ std::unique_ptr<VideoSource> open_any_source(const std::vector<uint8_t>& bytes);
 void VideoEngine::release_channel_frames(const std::string& key) {
     frame_staging_.erase(key);
     revision_staging_.erase(key);
+    // 通道销毁即释放它持有的视频纹理（层里若还挂着同一句柄则由层决定，
+    // 解绑/删层时随之释放）。
+    textures_.erase(key);
 }
 
 void VideoEngine::cancel_pipe(DecodeState& ds) {
@@ -128,20 +103,7 @@ void VideoEngine::cancel_pipe(DecodeState& ds) {
     ds.pipe.reset();
 }
 
-/// Spawn one pool worker that decodes `file` from frame 1 onward into the
-/// double-buffered pipe (frame 0 is decoded synchronously at start_decode).
-/// The worker restarts loops exactly like the synchronous pump does, so the
-/// delivered frame sequence is deterministic and identical to decoding on
-/// the caller's thread.
-/// `mask` (may be null) is the channel's `_m` mask partner decoder — its
-/// frame-0 read already happened on the attaching thread. The worker steps
-/// it in lockstep with the main stream (one mask frame per produced main
-/// frame, the same rule step_mask applies on the caller side) and bakes the
-/// composite into the delivered slots, so the driver thread never pays the
-/// mask decode + full-frame alpha bake per frame. On exit it hands the main
-/// and mask decoders back through the pipe; the retirement path adopts them
-/// at their exact stream positions, keeping the sync fallback phase-locked
-/// with zero discard.
+/// Spawn one pool worker that decodes `file` from frame 1 onward into the double-buffered pipe (frame 0 is decoded synchronously at start_de...
 void VideoEngine::start_pipe(DecodeState& ds, const std::string& file, bool loop_play,
                              const std::shared_ptr<VideoSource>& mask) {
     if (!pool_ || pool_->threads() <= 0 || !loader_) return;
@@ -200,14 +162,6 @@ void VideoEngine::start_pipe(DecodeState& ds, const std::string& file, bool loop
             pf->w = src->width();
             pf->h = src->height();
             // Mask step + composite bake, the worker-side twin of
-            // step_mask: one mask frame per delivered main frame, freezing
-            // at the mask's own EOF, dropping on a dims mismatch. The mask
-            // decoder is shared with the attaching thread's MaskPartner,
-            // which consumed mask frame 0 for the attach composite — so
-            // seq 1 (main stream frame 0) bakes with the CURRENT mask
-            // frame, and every seq >= 2 steps the mask first, exactly the
-            // pairing the caller-side step_mask produced. A later sync
-            // fallback resumes at the exact next frame.
             if (mask_local && !mask_frozen) {
                 if (seq > 1) {
                     bool ok2 = mask_local->read_frame();
@@ -247,24 +201,13 @@ namespace {
 std::unique_ptr<VideoSource> open_any_source(const std::vector<uint8_t>& bytes) {
     if (auto s = TheoraSource::open(bytes)) return s;
 #if defined(OA_HAVE_FFMPEG) && OA_HAVE_FFMPEG
-    if (std::getenv("OA_VIDEO_DEBUG")) {
-        std::fprintf(stderr, "[video] not ogg/theora; trying ffmpeg backend (bytes=%zu)\n",
-                     bytes.size());
-    }
     if (auto s = FfmpegSource::open(bytes)) return s;
 #endif
     return nullptr;
 }
 } // namespace
 
-// -- self-driving clock -------------------------------------------------------
-//
-// ONE resident driver thread serves every video channel (overlay + layers):
-// it is spawned lazily on the first play and lives until the engine is
-// destroyed. While anything plays it advances positions by wall time and
-// pumps due frames every ~1 ms; when idle it sleeps (10 ms poll) instead of
-// being destroyed - play/stop never join the worker (joining from a caller
-// holding engine_mutex_ would deadlock against the worker's own lock wait).
+// -- self-driving clock ------------------------------------------------------- ONE resident driver thread serves every video channel (over...
 
 void VideoEngine::start_driver() {
     if (driver_thread_.joinable()) return; // resident: start exactly once
@@ -286,12 +229,6 @@ void VideoEngine::stop_driver() {
 void VideoEngine::driver_loop() {
     driver_running_.store(true);
     // integer-ms truncation of every measured wall interval
-    // systematically under-drives the clocks (a ~0.5 ms average per
-    // iteration at sub-2 ms cadence cost the audio pump ~7 % of real time —
-    // with the movie audio on its own device stream that deficit became
-    // periodic underruns). Sub-millisecond wall time is carried across
-    // iterations so the deltas feeding position_ms / audio_frac sum to the
-    // exact elapsed wall time.
     uint64_t clock_carry_us = 0;
     while (!driver_stop_.load()) {
         std::unique_lock<std::mutex> lk(engine_mutex_);
@@ -301,13 +238,6 @@ void VideoEngine::driver_loop() {
                         [](const auto& p) { return p.second.playing; });
         if (!any_playing) {
             // Idle: stay alive, wake on activity or stop. The tick base is
-            // refreshed on every idle pass: wall time spent with nothing
-            // playing must never be credited into a later channel's clocks
-            // (the first active delta after a title gap used to
-            // equal the WHOLE gap — the movie jumped ~16 s at once: its head
-            // frames were skipped, the audio pump burst ~16 s into the SDL
-            // movie stream (which paced it into a ~2.75 s standing backlog),
-            // and that backlog kept playing after the movie EOF).
             driver_last_tick_ = std::chrono::steady_clock::now();
             driver_cv_.wait_for(lk, std::chrono::milliseconds(10));
             continue;
@@ -342,6 +272,16 @@ void VideoEngine::driver_loop() {
                 }
             }
         }
+        // driver 线程也是"源自己推"：新解码帧必须在这里推到渲染槽，
+        // 否则真实 app（driver 模式，update 直接 return）永远没有画面。
+        std::vector<std::pair<std::string, bool>> fresh;
+        collect_fresh_locked(&fresh);
+        if (!fresh.empty()) {
+            lk.unlock(); // push_frames -> video_frame() 会再次取锁
+            push_frames(fresh);
+            lk.lock();
+        }
+
         driver_cv_.wait_for(lk, std::chrono::milliseconds(1));
     }
     driver_running_.store(false);
@@ -368,26 +308,14 @@ VideoEngine::State VideoEngine::state() const {
 /// documented immediate-finish fallback for non-loop videos).
 bool VideoEngine::start_decode(VideoChannel& channel, DecodeState& ds) {
     if (!loader_ || channel.file.empty()) {
-        if (std::getenv("OA_VIDEO_DEBUG")) {
-            std::fprintf(stderr, "[video] no loader wired (file='%s')\n",
-                         channel.file.c_str());
-        }
         return false;
     }
     const auto bytes = loader_(channel.file);
     if (!bytes || bytes->empty()) {
-        if (std::getenv("OA_VIDEO_DEBUG")) {
-            std::fprintf(stderr, "[video] loader returned no bytes for '%s'\n",
-                         channel.file.c_str());
-        }
         return false;
     }
     auto src = open_any_source(*bytes);
     if (!src || !src->read_frame()) {
-        if (std::getenv("OA_VIDEO_DEBUG")) {
-            std::fprintf(stderr, "[video] decode attach failed: loader bytes=%zu\n",
-                         bytes->size());
-        }
         return false;
     }
     const double fps = src->frame_rate();
@@ -412,12 +340,6 @@ bool VideoEngine::start_decode(VideoChannel& channel, DecodeState& ds) {
         if (audio) {
             ds.audio = std::move(audio);
             channel.audio_on = true;
-            if (std::getenv("OA_VIDEO_DEBUG")) {
-                std::fprintf(stderr,
-                             "[video] movie audio attached '%s' %ldHz %dch\n",
-                             channel.file.c_str(), ds.audio->rate(),
-                             ds.audio->channels());
-            }
         }
     }
 #endif
@@ -427,59 +349,25 @@ bool VideoEngine::start_decode(VideoChannel& channel, DecodeState& ds) {
     // to the unmasked pipeline.
     attach_mask(channel, ds);
     // Optional decode-pool worker: decodes frame 1+ ahead (frame 0 is
-    // current) and, for a masked channel, steps the mask partner in
-    // lockstep and bakes the composite (the mask decode + full-frame bake
-    // never run on the driver thread). Falls back to the sync decoder on
-    // lag/cancel; the sync path keeps stepping the mask itself, and the
-    // worker hands its decoder positions back on exit so the fallback
-    // resumes phase-locked. The worker only ever decodes the MAIN stream
-    // picture into the pipe slots.
     start_pipe(ds, channel.file, channel.loop_play,
                ds.mask ? ds.mask->src : nullptr);
-    if (std::getenv("OA_VIDEO_DEBUG")) {
-        std::fprintf(stderr, "[video] source attached '%s' %dx%d @%.2ffps\n",
-                     channel.file.c_str(), ds.width, ds.height,
-                     ds.frame_interval_ms > 0.0 ? 1000.0 / ds.frame_interval_ms : 0.0);
-    }
     return true;
 }
 
-// probe the `<stem>_m` sibling of the playing file through the
-// loader's magic-path face and attach it as the mask partner. The mask must
-// decode (same Theora/FFmpeg open chain as the main) and its frame
-// dimensions must match the main picture — mirroring the image-mask
-// convention, a missing / undecodable / size-mismatched mask is ignored and
-// the channel behaves exactly as before. On success the frame-0 composite is
-// baked right here, so the first video_frame of the channel already carries
-// the masked picture.
+// probe the `<stem>_m` sibling of the playing file through the loader's magic-path face and attach it as the mask partner. The mask must de...
 bool VideoEngine::attach_mask(VideoChannel& channel, DecodeState& ds) {
     if (!loader_ || channel.file.empty()) return false;
     const std::string sibling = mask_sibling_name(channel.file);
     if (sibling == channel.file) return false;
     const auto bytes = loader_(sibling);
     if (!bytes || bytes->empty()) {
-        if (std::getenv("OA_VIDEO_DEBUG")) {
-            std::fprintf(stderr, "[video] no _m sibling for '%s' (probed '%s')\n",
-                         channel.file.c_str(), sibling.c_str());
-        }
         return false;
     }
     auto src = open_any_source(*bytes);
     if (!src || !src->read_frame()) {
-        if (std::getenv("OA_VIDEO_DEBUG")) {
-            std::fprintf(stderr, "[video] _m sibling '%s' not decodable; "
-                                 "playing unmasked\n",
-                         sibling.c_str());
-        }
         return false;
     }
     if (src->width() != ds.width || src->height() != ds.height) {
-        if (std::getenv("OA_VIDEO_DEBUG")) {
-            std::fprintf(stderr, "[video] _m sibling '%s' dims %dx%d != main "
-                                 "%dx%d; mask ignored\n",
-                         sibling.c_str(), src->width(), src->height(), ds.width,
-                         ds.height);
-        }
         return false;
     }
     auto mp = std::make_unique<DecodeState::MaskPartner>();
@@ -490,36 +378,14 @@ bool VideoEngine::attach_mask(VideoChannel& channel, DecodeState& ds) {
     channel.mask_on = true;
     bake_video_mask_alpha(ds.rgba.data(), ds.width, ds.height,
                           ds.mask->src->rgba().data());
-    if (std::getenv("OA_VIDEO_DEBUG")) {
-        std::fprintf(stderr, "[video] mask partner attached '%s' + '%s' "
-                             "%dx%d (composited)\n",
-                     channel.file.c_str(), sibling.c_str(), ds.width, ds.height);
-    }
     return true;
 }
 
-// one mask-partner step per DELIVERED main frame (index lock;
-// the pair shares a phase by construction on equal-length files — the
-// census pair is 301 == 301 frames). The mask restarts at its
-// own EOF exactly when an equal-length main restarts (including the decode-
-// pool worker's silent loop wraps, which land on the same element boundary);
-// when the mask can no longer advance it freezes at its last frame instead
-// of popping the picture back to the unmasked look. Then the composite alpha
-// (main luma-key x mask gray) is baked into the current frame. Runs on the
-// caller thread right after every frame delivery site (pipe fast path, sync
-// pull, sync loop restart), never on the pipe worker.
+// one mask-partner step per DELIVERED main frame (index lock; the pair shares a phase by construction on equal-length files — the census pa...
 void VideoEngine::step_mask(const VideoChannel& channel, DecodeState& ds) {
     DecodeState::MaskPartner* mp = ds.mask.get();
     if (!mp || !mp->src) return;
     if (mp->w != ds.width || mp->h != ds.height) {
-        // A decoder changing picture size mid-stream would invalidate the
-        // per-pixel pairing; drop the partner (never observed in the wild;
-        // logged for diagnostics).
-        if (std::getenv("OA_VIDEO_DEBUG")) {
-            std::fprintf(stderr, "[video] channel '%s' mask dims %dx%d != main "
-                                 "%dx%d; dropping mask\n",
-                         channel.id.c_str(), mp->w, mp->h, ds.width, ds.height);
-        }
         ds.mask.reset();
         return;
     }
@@ -530,17 +396,7 @@ void VideoEngine::step_mask(const VideoChannel& channel, DecodeState& ds) {
         }
         if (!ok) {
             mp->frozen = true;
-            if (std::getenv("OA_VIDEO_DEBUG")) {
-                std::fprintf(stderr, "[video] channel '%s' mask EOF; frozen at "
-                                     "last frame\n",
-                             channel.id.c_str());
-            }
         } else if (mp->src->width() != ds.width || mp->src->height() != ds.height) {
-            if (std::getenv("OA_VIDEO_DEBUG")) {
-                std::fprintf(stderr, "[video] channel '%s' mask dims changed "
-                                     "mid-stream; dropping mask\n",
-                             channel.id.c_str());
-            }
             ds.mask.reset();
             return;
         } else {
@@ -686,12 +542,6 @@ bool VideoEngine::stop_layer(const std::string& id) {
 
 size_t VideoEngine::stop_layer_subtree(const std::string& prefix) {
     // Mirror the emote-player release rule (runtime.cpp LayerDelete): a
-    // deleted layer subtree releases every layer-video channel whose id
-    // equals the deleted id or sits below it. Without this an unbound
-    // channel keeps decoding + mask-compositing forever (snll's
-    // title petal channel pumped into the story after the title ui
-    // group deletion; the recall-montage strip kept looping after its
-    // cgdel). Overlay channels are not part of the scene tree.
     std::lock_guard<std::mutex> lk(engine_mutex_);
     size_t n = 0;
     for (auto it = state_.video_layers.begin(); it != state_.video_layers.end();) {
@@ -779,16 +629,7 @@ void VideoEngine::queue_finish(const std::string& id) {
     queue_finish_locked(id);
 }
 
-/// Produce the movie audio due for `delta_ms` on one channel: pull the
-/// frames the 44100 Hz output clock owes (media players' delta-clock idiom),
-/// apply the [video] row gain * the movie volume bus, forward to the output
-/// hook and update the channel audio counters. Runs on the same thread that
-/// advances the channel clock (driver loop or headless advance), so pacing
-/// follows the deterministic tick stream. The audio source has its own demux
-/// on the same bytes: the decode-pool pipe worker's video stream never
-/// contends with it, and looping audio restarts itself at its own EOF like
-/// the video loop restarts at the picture EOF (with a
-/// bounded per-iteration drift).
+/// Produce the movie audio due for `delta_ms` on one channel: pull the frames the 44100 Hz output clock owes (media players' delta-clock idi...
 void VideoEngine::pump_channel_audio(VideoChannel& channel, DecodeState& ds,
                                      uint64_t delta_ms) {
     if (!channel.playing || !channel.audio_on || ds.audio_done) return;
@@ -876,17 +717,6 @@ void VideoEngine::pump_channel(VideoChannel& channel, DecodeState& ds) {
                     continue;
                 }
                 if (pf->eof) {
-                    // The worker reached the end (non-loop EOF or a loop
-                    // whose restart failed): natural finish, same as the
-                    // sync pump's give-up path.
-                    if (std::getenv("OA_VIDEO_DEBUG")) {
-                        std::fprintf(stderr,
-                                     "[video] channel '%s' pipe EOF after "
-                                     "%llu decoded frames (pos=%llums)\n",
-                                     channel.id.c_str(),
-                                     (unsigned long long)ds.revision,
-                                     (unsigned long long)channel.position_ms);
-                    }
                     lk.unlock();
                     cancel_pipe(ds); // retire; finish follows below
                     channel.playing = false;
@@ -897,11 +727,6 @@ void VideoEngine::pump_channel(VideoChannel& channel, DecodeState& ds) {
             }
             lk.unlock();
             // Worker lagged / was cancelled: retire the pipe permanently and
-            // decode the wanted frame synchronously (same byte stream).
-            // Adopt the worker's decoders first: they sit at the exact next
-            // stream frame, so the sync path resumes phase-locked (main and
-            // mask) with zero discard — the old path re-decoded the whole
-            // stream from zero to re-sync.
             {
                 std::unique_lock<std::mutex> g(pf->mu);
                 pf->cancel = true;
@@ -974,20 +799,63 @@ void VideoEngine::pump_channel(VideoChannel& channel, DecodeState& ds) {
         // tail deterministically so nothing keeps playing after the picture
         // (bounded push alone would leave up to kMovieBoundFrames behind).
         flush_movie_audio_locked(channel.id);
-        if (std::getenv("OA_VIDEO_DEBUG")) {
-            std::fprintf(stderr,
-                         "[video] channel '%s' EOF after %llu decoded frames "
-                         "(pos=%llums)\n",
-                         channel.id.c_str(), (unsigned long long)ds.revision,
-                         (unsigned long long)channel.position_ms);
-        }
         queue_finish_locked(channel.id == kOverlayVideoId ? std::string() : channel.id);
         return;
     }
 }
 
+
+void VideoEngine::collect_fresh_locked(
+    std::vector<std::pair<std::string, bool>>* fresh) const {
+    if (!frame_push_) return;
+    auto pushed = [this](const std::string& k) {
+        const auto it = pushed_rev_.find(k);
+        return it == pushed_rev_.end() ? uint64_t(0) : it->second;
+    };
+    if (state_.overlay_video) {
+        if (const DecodeState* ds = decode_of(kOverlayVideoId);
+            ds && ds->revision != pushed(kOverlayVideoId))
+            fresh->emplace_back(std::string(), false);
+    }
+    for (const auto& [id, ch] : state_.video_layers) {
+        if (const DecodeState* ds = decode_of(id); ds && ds->revision != pushed(id))
+            fresh->emplace_back(id, !ch.mask_on);
+    }
+}
+
+void VideoEngine::push_frames(
+    const std::vector<std::pair<std::string, bool>>& fresh) {
+    if (!frame_push_ || !texture_factory_) return;
+    for (const auto& [id, luma] : fresh) {
+        int w = 0, h = 0;
+        const uint8_t* px = nullptr;
+        uint64_t rev = 0;
+        if (!video_frame(id, &w, &h, &px, &rev)) continue;
+        const std::string key = id.empty() ? kOverlayVideoId : id;
+        TextureRef& tex = textures_[key];
+        if (!tex || tex->width() != w || tex->height() != h)
+            tex = texture_factory_(w, h);
+        if (!tex) continue;
+        if (luma) {
+            // 未遮罩通道的亮度键在源侧完成；纹理只接收成品 RGBA。
+            std::vector<uint8_t> tmp(px, px + size_t(w) * size_t(h) * 4);
+            for (size_t i = 0; i + 3 < tmp.size(); i += 4)
+                tmp[i + 3] = oa::media::layer_video_key_alpha(
+                    oa::media::rgba_luma(tmp.data() + i));
+            tex->update(w, h, tmp.data());
+        } else {
+            tex->update(w, h, px);
+        }
+        frame_push_(id, tex, w, h);
+        std::lock_guard<std::mutex> lk(engine_mutex_);
+        pushed_rev_[key] = rev;
+    }
+}
+
 void VideoEngine::update(uint64_t delta_ms) {
     if (driver_running_.load()) return;
+    std::vector<std::pair<std::string, bool>> fresh; // channel, luma_key
+    {
     std::lock_guard<std::mutex> lk(engine_mutex_);
     state_.clock_ms += delta_ms;
     if (state_.overlay_video) {
@@ -1010,6 +878,9 @@ void VideoEngine::update(uint64_t delta_ms) {
             ch.playing = false;
         }
     }
+    collect_fresh_locked(&fresh); // 锁内只收集，推送在锁外
+    } // unlock
+    push_frames(fresh);
 }
 
 std::vector<VideoFinishEvent> VideoEngine::poll_finish_events() {
@@ -1075,11 +946,6 @@ void ycbcr_to_rgba(const th_ycbcr_buffer yuv, int pic_x, int pic_y, int w, int h
     const int vs = yuv[2].stride;
     if (cx == 1 && cy == 1 && (pic_x % 2) == 0 && (pic_y % 2) == 0) {
         // 4:2:0 fast path (every real asset): an aligned 2x2 output block
-        // shares ONE (U,V) fetch, so the chroma bytes load a quarter as
-        // often as the per-pixel loop. Same integer expressions, same
-        // output bytes — the shared index is exactly the per-pixel one
-        // ((fx) >> 1 == (fx + 1) >> 1 for even fx, and both picture rows of
-        // a pair map to the same chroma row for even fy).
         for (int py = 0; py < h; py += 2) {
             const int fy = pic_y + py;
             uint8_t* out0 = rgba.data() + size_t(py) * size_t(w) * 4;
@@ -1675,15 +1541,6 @@ bool FfmpegSource::init_stream() {
     height_ = S.height;
     rgba_.assign(rgba_bytes(width_, height_), 0);
     frame_rate_ = stream_fps(st);
-
-    if (std::getenv("OA_VIDEO_DEBUG")) {
-        std::fprintf(stderr,
-                     "[video] ffmpeg source: format=%s codec=%s %dx%d @%.2ffps "
-                     "vstream=%d bytes=%zu\n",
-                     S.fmt->iformat ? S.fmt->iformat->name : "?",
-                     codec->name, width_, height_, frame_rate_, S.vstream,
-                     bytes_.size());
-    }
     return true;
 }
 
@@ -1760,16 +1617,7 @@ bool FfmpegSource::seek_zero() {
     return init_stream();
 }
 
-// ---------------------------------------------------------------------------
-// FfmpegAudioSource: container audio companion — decodes the
-// best audio stream of the same in-memory bytes and converts it to the
-// engine output format (interleaved stereo f32 @ 44100 Hz). No swresample
-// exists in the vcpkg feature set, so format/channel/rate conversion happens
-// here in-engine: decoded AVFrames -> f32, channel-map to mono/stereo, then a
-// streaming linear-interpolation resampler onto 44100 (the MediaPlayers
-// interpolation idiom of audio.cpp §3, simplified to the movie-audio
-// lifecycle).
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------- FfmpegAudioSource: container audio companion — decodes the be...
 
 namespace {
 
@@ -1942,15 +1790,6 @@ bool FfmpegAudioSource::init_stream() {
     if (S.src_rate <= 0) return false;
     channels_ = S.src_ch;
     rate_ = S.src_rate;
-
-    if (std::getenv("OA_VIDEO_DEBUG")) {
-        std::fprintf(stderr,
-                     "[video] movie audio source: format=%s codec=%s %ldHz %dch "
-                     "astream=%d bytes=%zu\n",
-                     S.fmt->iformat ? S.fmt->iformat->name : "?",
-                     codec->name, long(S.src_rate), S.src_ch, S.astream,
-                     bytes_.size());
-    }
     return true;
 }
 

@@ -13,9 +13,7 @@
 #include <vector>
 
 #include "core/fs/fs.h"
-#include "core/render/content_role.h" // layer-model S5: 内容来源/读取域键断言
-#include "core/render/layer_kind.h"
-#include "core/runtime/runtime.h"
+#include "core/runtime/runtime_game.h"
 #include "ogg_fixture.h"
 
 namespace {
@@ -358,34 +356,29 @@ void test_video_layer_content_binding() {
     const oa::render::Layer* mv = b.rt->scene().find("mw");
     check(mv != nullptr, "S5 video bind: carrier exists");
     if (mv) {
-        check(mv->content == oa::render::LayerContent::VideoFrame,
-              "S5 video bind: layer content = VideoFrame (explicit state)");
+        check(mv->host_bound,
+              "S5 video bind: layer bound to a host texture");
         check(mv->file.empty() && mv->path.empty(),
               "S5 video bind: no resource name/path left in the layer");
         check(!mv->has_color && mv->mask.empty(),
               "S5 video bind: solid/mask state dropped");
-        check(oa::render::kind_of(*mv) == oa::render::LayerKind::Video,
-              "S5 video bind: kind_of reads the content state");
-        const oa::render::ContentRole& role = oa::render::content_role_of(*mv);
-        check(role.host_pumped() && !role.decodable_asset(),
-              "S5 video bind: role reads the host-uploaded frame domain");
-        check(role.texture_key(*mv) == oa::render::VideoContent::frame_key("mw"),
-              "S5 video bind: scene read key == host upload key");
-        check(role.textured_content(*mv) && role.content_present(*mv),
+        check(oa::render::textured_content(*mv) &&
+                  oa::render::content_present(*mv),
               "S5 video bind: content present while bound");
+        check(oa::render::content_texture_key(*mv).empty(),
+              "S5 video bind: host content has no asset key");
     }
     // 视频收尾(EOF 等价路径)→ 解绑:层回到空态,不回滚旧静态图(旧拼写绑定
     // 语义逐位保持)。
     b.rt->video().queue_finish("mw");
     b.rt->tick(16, idle);
     const oa::render::Layer* after = b.rt->scene().find("mw");
-    check(after != nullptr && after->content == oa::render::LayerContent::Unbound,
+    check(after != nullptr && !after->host_bound,
           "S5 video finish: content unbound");
     check(after != nullptr && after->file.empty(),
           "S5 video finish: carrier holds no resource name");
-    check(after != nullptr &&
-              oa::render::kind_of(*after) == oa::render::LayerKind::None,
-          "S5 video finish: carrier back to the empty role");
+    check(after != nullptr && !oa::render::textured_content(*after),
+          "S5 video finish: carrier back to the empty content state");
 }
 
 // ---------------------------------------------------------------------------

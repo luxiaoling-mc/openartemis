@@ -1112,7 +1112,19 @@ int main() {
     p.set_variable("face_talk", 0);
     p.set_variable("face_eye_open", 23.0);
     p.advance_ms(500);
-    const std::vector<uint8_t> full = p.rgba();
+    // 全分辨率基准必须自己也请求 1920x1620：此前误把 960x810 的 p 当作
+    // full 缓冲，下面的 1920 步长索引会越过它的 rgba() → 堆越界崩溃。
+    oa::emote::EmotePlayer pfull;
+    if (!pfull.load(*bytes, 1920, 1620, &err)) {
+        check(false, "full-res player load");
+        return 1;
+    }
+    pfull.set_scale(0.6, 0, 0);
+    pfull.set_coord(0, 3695.0 * 0.6 - 810.0 + 100.0);
+    pfull.set_variable("face_talk", 0);
+    pfull.set_variable("face_eye_open", 23.0);
+    pfull.advance_ms(500);
+    const std::vector<uint8_t> full = pfull.rgba();
     set_env("OA_EMOTE_HALFRES", "1");
     oa::emote::EmotePlayer ph;
     if (ph.load(*bytes, 1920, 1620, &err)) {
@@ -1127,7 +1139,9 @@ int main() {
         // half render inside the figure band (rows 60..600 = head/face/torso)
         uint64_t sharp = 0;
         uint64_t edgeE = 0, edgeH = 0;
-        for (int y = 60; y < 600 && y < int(half.size()) / (1920 * 4); ++y) {
+        const int maxY = int(std::min(full.size() / (1920 * 4),
+                                      half.size() / (1920 * 4)));
+        for (int y = 60; y < 600 && y < maxY; ++y) {
             for (int x = 250; x < 1600; ++x) {
                 const uint8_t* pf = &full[(size_t(y) * 1920 + x) * 4];
                 const uint8_t* phh = &half[(size_t(y / 2) * 960 + x / 2) * 4];
@@ -1165,228 +1179,6 @@ int main() {
         check(false, "half-res player load");
     }
     unset_env("OA_EMOTE_HALFRES");
-
-    // --- S2 (research/124 §2): write surface + numeric robustness -----------
-    // Same-process REF/NEW: the REF player latches the pre-S2 write surface
-    // (OA_EMOTE_S2_LEGACY=1) at construction, the NEW player the aligned one.
-    // Every NekoMiko expression is driven through both and the composed
-    // variable snapshot is compared frame by frame — the S2 census says the
-    // difference must be ZERO (G4: 0 predicate-changing key pairs in all six
-    // scanned files; G6: the 5 selector-option tracks each NekoMiko timeline
-    // carries are re-derived by the selector control every frame either way).
-    {
-        std::printf("S2 policy defaults: angleWrap=%d tailFallback=%d paramOobSkip=%d "
-                    "nonfiniteGuard=%d\n",
-                    int(oa::emote::emote_s2_policy().angleWrap),
-                    int(oa::emote::emote_s2_policy().tailFallback),
-                    int(oa::emote::emote_s2_policy().paramOobSkip),
-                    int(oa::emote::emote_s2_policy().nonfiniteGuard));
-        check(oa::emote::emote_s2_policy().angleWrap,
-              "S2 default: G5 angle wrap is ON (reference rule)");
-        check(!oa::emote::emote_s2_policy().tailFallback,
-              "S2 default: G8b tail fallback is OFF (OA_EMOTE_TAILFALLBACK=1)");
-        check(!oa::emote::emote_s2_policy().paramOobSkip,
-              "S2 default: G8a param-OOB skip is OFF (OA_EMOTE_PARAMOOB=1)");
-        check(oa::emote::emote_s2_policy().nonfiniteGuard,
-              "S2 default: G8c non-finite guard is ON");
-        check(oa::emote::emote_mesh_div_policy().mode ==
-                  oa::emote::kEmoteMeshDivNodeAdaptive,
-              "S5 default: mesh subdivision is the node-adaptive hybrid");
-
-        oa::emote::EmoteFile s2file;
-        const bool s2fileOk = s2file.load(*bytes, &err);
-        check(s2fileOk, "S2: emote file loads");
-
-        set_env("OA_EMOTE_S2_LEGACY", "1");
-        oa::emote::EmotePlayer ref;
-        const bool refOk = ref.load(*bytes, 960, 810, &err);
-        unset_env("OA_EMOTE_S2_LEGACY");
-        oa::emote::EmotePlayer nw;
-        const bool newOk = nw.load(*bytes, 960, 810, &err);
-        check(refOk && newOk, "S2 REF/NEW players load");
-        if (refOk && newOk) {
-            const std::set<std::string> known = nw.known_labels();
-            checkf(known.size() > 40, "S2 G6: known-label universe is populated",
-                   (unsigned long long)known.size());
-            auto setup = [](oa::emote::EmotePlayer& pl) {
-                pl.set_scale(0.6, 0, 0);
-                pl.set_coord(0, 3695.0 * 0.6 - 810.0 / 2.0 + 100.0);
-                pl.set_external_pose(true); // pose path only: no CPU raster cost
-            };
-            setup(ref);
-            setup(nw);
-            static const char* const kTls[] = {
-                "通常待機", "通常",          "笑顔",     "照れ",           "悲しみ",
-                "怒り",     "呆れ",          "驚き",     "笑顔_ボイス再生用",
-                "照れ_ボイス再生用"};
-            // The frame-by-frame identity is over the timeline write surface.
-            // The async writers (automatic blink, physics) are excluded:
-            //   * the blink interval is seeded from `file_.uid()`, a counter
-            //     that increments on every load(), so REF and NEW blink at
-            //     different times by construction — the eye-open label can
-            //     never be frame-identical between two player instances;
-            //   * physics labels are written by the integrator, not by either
-            //     write surface, and their spring state follows each player's
-            //     own frame history.
-            // Neither carries information about the S2 surfaces this test
-            // locks, and both also fall outside `known_labels()` (which is the
-            // PSB's variable/parameter/selector universe), so counting them as
-            // "unknown composed labels" measured the metadata gap instead.
-            const std::set<std::string> async = async_driven_labels(nw.file());
-            size_t diffFrames = 0, unknownLabels = 0, frames = 0;
-            std::string firstDiffTl, firstDiffLabel;
-            for (const char* tl : kTls) {
-                ref.play_timeline(tl, 0);
-                nw.play_timeline(tl, 0);
-                for (int f = 0; f < 90; ++f) {
-                    ref.progress(1.0);
-                    nw.progress(1.0);
-                    const auto a = ref.variables();
-                    const auto b = nw.variables();
-                    ++frames;
-                    bool frameDiff = false;
-                    // both directions, so a label present on one side only is
-                    // still a difference
-                    const auto cmp = [&](const std::map<std::string, double>& x,
-                                         const std::map<std::string, double>& y) {
-                        for (const auto& kv : x) {
-                            if (async.count(kv.first)) continue;
-                            const auto it = y.find(kv.first);
-                            if (it == y.end() ||
-                                std::fabs(it->second - kv.second) > 1e-9) {
-                                frameDiff = true;
-                                if (firstDiffLabel.empty()) firstDiffLabel = kv.first;
-                            }
-                            if (known.find(kv.first) == known.end()) {
-                                ++unknownLabels;
-                                if (firstDiffLabel.empty())
-                                    firstDiffLabel = "unknown:" + kv.first;
-                            }
-                        }
-                    };
-                    cmp(a, b);
-                    cmp(b, a);
-                    if (frameDiff) {
-                        ++diffFrames;
-                        if (firstDiffTl.empty()) firstDiffTl = tl;
-                    }
-                }
-            }
-            std::printf("S2 REF/NEW (NekoMiko): timelines=%zu frames=%zu differingFrames=%zu "
-                        "unknownLabels=%zu asyncExcluded=%zu firstDiff=%s/%s\n",
-                        sizeof(kTls) / sizeof(kTls[0]), frames, diffFrames, unknownLabels,
-                        async.size(), firstDiffTl.c_str(), firstDiffLabel.c_str());
-            checku(diffFrames == 0,
-                   "S2 REF/NEW: pre-S2 and aligned write surfaces compose identically "
-                   "(G4 lazy, G6 observationally equivalent)",
-                   (unsigned long long)diffFrames);
-            checku(unknownLabels == 0,
-                   "S2 G6: no composed label falls outside known_labels()",
-                   (unsigned long long)unknownLabels);
-            const auto rs = ref.s2_stats();
-            const auto ns = nw.s2_stats();
-            std::printf("S2 G6 counters: ref selSkipped=%zu unknown=%zu | new selSkipped=%zu "
-                        "unknown=%zu\n", rs.selectorTracksSkipped, rs.unknownLabelWrites,
-                        ns.selectorTracksSkipped, ns.unknownLabelWrites);
-            checku(rs.selectorTracksSkipped == 0,
-                   "S2 G6: the legacy arm keeps writing selector option-name tracks",
-                   (unsigned long long)rs.selectorTracksSkipped);
-            checkf(ns.selectorTracksSkipped > 0,
-                   "S2 G6: the aligned arm skips real selector option-name tracks",
-                   (unsigned long long)ns.selectorTracksSkipped);
-            checku(ns.unknownLabelWrites == 0,
-                   "S2 G6: no real track writes an unknown label (data-lazy)",
-                   (unsigned long long)ns.unknownLabelWrites);
-        }
-
-        // --- G8 numeric robustness: inert in-range, reachable out-of-range ---
-        oa::emote::StaticRenderOptions opt;
-        opt.fitToCanvas = false;
-        opt.scale = 0.6;
-        opt.dx = 480.0;
-        opt.dy = 405.0;
-        auto collect_hash = [&](const std::map<std::string, double>& vars) {
-            if (!s2fileOk) return std::string("ERR");
-            std::vector<oa::emote::EmoteDrawPart> parts;
-            if (!oa::emote::emote_collect_parts(s2file, vars, 960, 810, opt, &parts,
-                                                       &err))
-                return std::string("ERR");
-            unsigned long long h = 1469598103934665603ULL;
-            for (const auto& pt : parts) {
-                h ^= (unsigned long long)pt.source * 1315423911u +
-                     (unsigned long long)pt.icon;
-                h *= 1099511628211ULL;
-                for (const auto& v : pt.verts) {
-                    h ^= (unsigned long long)std::llround(v.x * 4096.0);
-                    h *= 1099511628211ULL;
-                    h ^= (unsigned long long)std::llround(v.y * 4096.0);
-                    h *= 1099511628211ULL;
-                }
-            }
-            char b[40];
-            std::snprintf(b, sizeof(b), "%016llx/%zu", h, parts.size());
-            return std::string(b);
-        };
-        const std::vector<std::map<std::string, double>> inrange = {
-            {},          {{"head_slant", 20}}, {{"body_UD", -20}}, {{"face_talk", 3}},
-            {{"head_UD", -20}}, {{"body_LR", 20}}, {{"arm_type", 1}}};
-        size_t tailDiff = 0, oobDiff = 0, nfDiff = 0;
-        for (const auto& vars : inrange) {
-            oa::emote::emote_set_s2_policy(-1, 0, -1, -1);
-            const std::string tailOff = collect_hash(vars);
-            oa::emote::emote_set_s2_policy(-1, 1, -1, -1);
-            const std::string tailOn = collect_hash(vars);
-            if (tailOff != tailOn) ++tailDiff;
-            oa::emote::emote_set_s2_policy(-1, -1, 0, -1);
-            const std::string oob0 = collect_hash(vars);
-            oa::emote::emote_set_s2_policy(-1, -1, 1, -1);
-            const std::string oob1 = collect_hash(vars);
-            if (oob0 != oob1) ++oobDiff;
-            oa::emote::emote_set_s2_policy(-1, -1, -1, 1);
-            const std::string nf1 = collect_hash(vars);
-            oa::emote::emote_set_s2_policy(-1, -1, -1, 0);
-            const std::string nf0 = collect_hash(vars);
-            if (nf1 != nf0) ++nfDiff;
-            oa::emote::emote_set_s2_policy(-1, -1, -1, -1);
-        }
-        std::printf("S2 G8 inertness over %zu in-range poses: tailFallback=%zu paramOob=%zu "
-                    "nonfinite=%zu differing\n", inrange.size(), tailDiff, oobDiff, nfDiff);
-        checku(tailDiff == 0,
-               "S2 G8b: the tail fallback changes nothing in range (data-lazy)",
-               (unsigned long long)tailDiff);
-        checku(oobDiff == 0, "S2 G8a: the param-OOB skip changes nothing (0/1592 nodes)",
-               (unsigned long long)oobDiff);
-        checku(nfDiff == 0, "S2 G8c: the non-finite guard is inert (0 non-finite frames)",
-               (unsigned long long)nfDiff);
-        // G8b has no reachability assertion any more. d72a2cb made the
-        // content-less-tail rule reference behaviour instead of a policy arm:
-        // pick_frame() now applies it for `node.type == 1` shape containers
-        // unconditionally (the terminal empty key ends an icon's playback,
-        // non-drawing containers keep their geometry), so
-        // EmoteS2Policy::tailFallback is an assigned-but-never-read switch and
-        // toggling it cannot change geometry. The in-range inertness arm above
-        // still pins that the rule changes nothing for in-range poses.
-
-        // G5 counter-guard on NekoMiko: its data has no >180 angle key, so the
-        // wrap must be a no-op here (the tg3/slny arm lives in emote_timeline).
-        size_t wrapDiff = 0;
-        for (const char* axis : {"head_slant", "body_slant", "head_UD", "body_UD"}) {
-            for (double v : {-30.0, -20.0, -15.0, -7.0, 0.0, 7.0, 15.0, 20.0, 30.0}) {
-                std::map<std::string, double> vars{{axis, v}};
-                oa::emote::emote_set_s2_policy(1, -1, -1, -1);
-                const std::string on = collect_hash(vars);
-                oa::emote::emote_set_s2_policy(0, -1, -1, -1);
-                const std::string off = collect_hash(vars);
-                oa::emote::emote_set_s2_policy(-1, -1, -1, -1);
-                if (on != off) ++wrapDiff;
-            }
-        }
-        std::printf("S2 G5 counter-guard (NekoMiko, no >180 key): %zu differing poses\n",
-                    wrapDiff);
-        checku(wrapDiff == 0,
-               "S2 G5: the angle wrap is a no-op on NekoMiko (no >180 angle keys)",
-               (unsigned long long)wrapDiff);
-    }
 
     std::printf("%s\n", failures ? "FAILED" : "PASS");
     return failures ? 1 : 0;

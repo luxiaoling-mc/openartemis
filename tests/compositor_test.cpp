@@ -1,11 +1,15 @@
 // M5b compositor + P1a layer-model alignment: create/remove cascade, prop
 // parse, ancestor autovivification, draw order. Semantics notes: docs/research/08.
+#include <cmath>
 #include <cstdio>
+#include <optional>
 #include <string>
 #include <vector>
 
+#include "core/fs/fs.h"
 #include "core/render/layer.h"
 #include "core/render/render_internal.h" // TweenDone returned by advance_tweens
+#include "core/render/renderer.h"        // 帧计划（display list）
 
 namespace {
 int failures = 0;
@@ -20,6 +24,155 @@ std::vector<std::string> ids_of(const std::vector<const oa::render::Layer*>& v) 
     for (const auto* l : v) out.push_back(l->id);
     return out;
 }
+
+// ---------------------------------------------------------------- 帧计划
+// 层树 → 有序绘制项流：顺序/世界变换/链式不透明度/组作用域/复用门。
+// 像素级验收走 tools/parity 真包对拍，不在单测里跑旅程。
+using oa::render::PlanOp;
+using oa::render::RenderPlan;
+
+std::map<std::string, std::string> props(
+    std::initializer_list<std::pair<const char*, const char*>> kv) {
+    std::map<std::string, std::string> m;
+    for (const auto& [k, v] : kv) m[k] = v;
+    return m;
+}
+
+void build_plan_of(const oa::render::Compositor& c, RenderPlan* plan,
+                   double fade = 1.0) {
+    oa::render::PlanInput in;
+    in.scene = &c;
+    in.text = nullptr;
+    in.sizes = nullptr; // 只测纯色/组（无纹理尺寸源）
+    in.stage_w = 1280;
+    in.stage_h = 720;
+    in.global_fade = fade;
+    oa::render::build_render_plan(in, plan);
+}
+
+std::vector<const oa::render::PlanItem*> items_of(const RenderPlan& p,
+                                                  PlanOp op) {
+    std::vector<const oa::render::PlanItem*> out;
+    for (const auto& it : p.items())
+        if (it.op == op) out.push_back(&it);
+    return out;
+}
+
+struct NullFs : oa::fs::IFileSystem {
+    std::optional<std::vector<uint8_t>> read(std::string_view) const override {
+        return std::nullopt;
+    }
+    const char* kind() const override { return "null"; }
+};
+
+void test_render_plan() {
+    {
+        // 前序 + z：父自身内容先于子树，兄弟按 compare_ids
+        oa::render::Compositor c;
+        c.create("1", props({{"color", "0xFF0000"}, {"width", "100"},
+                             {"height", "50"}, {"left", "10"}, {"top", "20"}}));
+        c.create("1.0", props({{"color", "0x00FF00"}, {"width", "10"},
+                               {"height", "10"}}));
+        c.create("2", props({{"color", "0x0000FF"}, {"width", "5"},
+                             {"height", "5"}}));
+        RenderPlan plan;
+        build_plan_of(c, &plan);
+        const auto content = items_of(plan, PlanOp::Content);
+        check(content.size() == 3 && content[0]->id == "1" &&
+                  content[1]->id == "1.0" && content[2]->id == "2",
+              "plan: 前序 + compare_ids 序");
+        bool z_ok = true;
+        for (size_t i = 0; i < plan.items().size(); ++i)
+            z_ok = z_ok && plan.items()[i].z == uint32_t(i);
+        check(z_ok, "plan: z == 流内序号");
+
+        // 世界变换 + 链式不透明度
+        oa::render::Compositor t;
+        t.set_root_props(props({{"alpha", "128"}}));
+        t.create("1", props({{"color", "0xFFFFFF"}, {"width", "100"},
+                             {"height", "100"}, {"left", "100"},
+                             {"top", "50"}, {"zoom", "200"}}));
+        t.create("1.0", props({{"color", "0xFFFFFF"}, {"width", "10"},
+                               {"height", "10"}, {"left", "5"},
+                               {"top", "5"}, {"alpha", "128"}}));
+        RenderPlan p2;
+        build_plan_of(t, &p2);
+        const auto ci = items_of(p2, PlanOp::Content);
+        check(ci.size() == 2, "plan: 父/子各一内容项");
+        if (ci.size() == 2) {
+            double x = 0, y = 0;
+            ci[1]->world.transform_point(0, 0, &x, &y);
+            check(std::fabs(x - 110.0) < 1e-6 && std::fabs(y - 60.0) < 1e-6,
+                  "plan: 世界变换按父链合成");
+            const double root_a = 128.0 / 255.0;
+            check(std::fabs(ci[0]->opacity - root_a) < 1e-6 &&
+                      std::fabs(ci[1]->opacity - root_a * (128.0 / 255.0)) <
+                          1e-6,
+                  "plan: 不透明度沿父链相乘");
+        }
+    }
+    {
+        // 非恒等组：作用域成对，组 alpha 不进子树
+        oa::render::Compositor c;
+        c.create("2", props({{"color", "0x112233"}, {"width", "200"},
+                             {"height", "200"},
+                             {"intermediate_render", "2"}, {"alpha", "128"}}));
+        c.create("2.0", props({{"color", "0xFFFFFF"}, {"width", "10"},
+                               {"height", "10"}}));
+        RenderPlan plan;
+        build_plan_of(c, &plan);
+        const auto begins = items_of(plan, PlanOp::GroupBegin);
+        const auto ends = items_of(plan, PlanOp::GroupEnd);
+        check(begins.size() == 1 && ends.size() == 1,
+              "plan: 非恒等组合成开/闭成对");
+        if (!begins.empty()) {
+            check(std::fabs(begins[0]->composite.alpha - 128.0 / 255.0) < 1e-6,
+                  "plan: 组 alpha 进合成参数");
+        }
+        bool child_plain = false;
+        for (const auto* it : items_of(plan, PlanOp::Content))
+            if (it->id == "2.0") child_plain = std::fabs(it->opacity - 1.0) < 1e-6;
+        check(child_plain, "plan: 组内子项不含组 alpha");
+
+        // 恒等组内联（不建作用域）；隐藏子树整棵裁掉
+        oa::render::Compositor g;
+        g.create("3", props({{"color", "0x112233"}, {"width", "200"},
+                             {"height", "200"}, {"intermediate_render", "1"}}));
+        g.create("3.0", props({{"color", "0xFFFFFF"}, {"width", "10"},
+                               {"height", "10"}}));
+        RenderPlan p3;
+        build_plan_of(g, &p3);
+        check(items_of(p3, PlanOp::GroupBegin).empty() &&
+                  items_of(p3, PlanOp::Content).size() == 2,
+              "plan: 恒等组内联");
+        g.set_props("3", props({{"visible", "0"}}));
+        RenderPlan p4;
+        build_plan_of(g, &p4);
+        check(p4.items().empty(), "plan: 隐藏子树被裁掉");
+    }
+    {
+        // 全局淡出进根不透明度；计划复用门（OA_PLAN_REUSE 默认开）
+        NullFs fs;
+        oa::render::RenderEngine re(
+            &fs, static_cast<oa::render::RenderHost*>(nullptr), false);
+        oa::render::Compositor& sc = re.scene();
+        sc.create("1", props({{"color", "0xFFFFFF"}, {"width", "10"},
+                              {"height", "10"}}));
+        re.build_plan(sc, 0.25);
+        const auto ci = items_of(re.render_plan(), PlanOp::Content);
+        check(ci.size() == 1 && std::fabs(ci[0]->opacity - 0.25) < 1e-6,
+              "plan: 全局淡出进根不透明度");
+        const uint64_t g1 = re.render_plan().generation;
+        re.build_plan(sc, 0.25);
+        check(re.render_plan().generation == g1, "plan: 无层写 ⇒ 复用");
+        sc.set_props("1", props({{"left", "5"}}));
+        re.build_plan(sc, 0.25);
+        check(re.render_plan().generation == g1 + 1, "plan: 层写 ⇒ 重建");
+        re.build_plan(sc, 0.5);
+        check(re.render_plan().generation == g1 + 2, "plan: 淡出变化 ⇒ 重建");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -240,8 +393,7 @@ int main() {
         // their framework binding never authors the carrier leaf, so the
         // strict rule made the whole story layer-video family invisible.
         check(sc.bind_video_layer("1.0.bx.by.bs.8.bg.8.t.y.x.p.m.a.a.b", true) &&
-                  sc.find("1.0.bx.by.bs.8.bg.8.t.y.x.p.m.a.a.b")->content ==
-                      oa::render::LayerContent::VideoFrame,
+                  sc.find("1.0.bx.by.bs.8.bg.8.t.y.x.p.m.a.a.b")->host_bound,
               "96 allowed missing in-story carrier materializes + binds");
         check(sc.find("1.0") != nullptr && sc.find("1.0.bx.by.bs.8.bg.8") != nullptr,
               "96 materialized in-story carrier ancestors (ensure_path)");
@@ -250,13 +402,12 @@ int main() {
               "96 allow_auto=false keeps the strict 73 refusal");
         sc.create("7", {});
         check(sc.bind_video_layer("7") &&
-                  sc.find("7")->content == oa::render::LayerContent::VideoFrame,
+                  sc.find("7")->host_bound,
               "73 existing carrier binds (any id)");
         check(sc.bind_video_layer("500.z.mv"),
               "73 overlay-zone (500.) missing carrier is materialized");
         const oa::render::Layer* mv = sc.find("500.z.mv");
-        check(mv && mv->content == oa::render::LayerContent::VideoFrame &&
-                  mv->file.empty(),
+        check(mv && mv->host_bound && mv->file.empty(),
               "73 500.z.mv bound to its video channel (no name spelling in file)");
         check(sc.find("500") != nullptr && sc.find("500.z") != nullptr,
               "73 500.z.mv ancestors materialized (ensure_path)");
@@ -316,6 +467,8 @@ int main() {
         check(sc.find("3")->file == "frame1",
               "preserved anime definition can finish and play");
     }
+
+    test_render_plan();
 
     if (failures) {
         std::fprintf(stderr, "compositor_test: %d failure(s)\n", failures);

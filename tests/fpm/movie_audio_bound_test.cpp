@@ -19,7 +19,7 @@
 //     carries seconds of standing level and a non-empty tail after EOF —
 //     proving the arm-1 assertions can fail.
 //
-// Env: OA_TEST_HCT_PFS (movie_bai/logo.mp4, ~5.06 s silent AAC track);
+// Env: OA_TEST_RR_PFS (movie/logo.mp4, ~5 s silent AAC track);
 // SDL_AUDIODRIVER (default dummy). Skip 77 when the archive is unset.
 #include <chrono>
 #include <cstdarg>
@@ -78,7 +78,7 @@ ArmResult run_arm(std::shared_ptr<const oa::fs::IFileSystem> fs, bool bounded) {
     v.set_audio_flush([&mp]() { mp.flush_video_audio(); });
 
     oa::media::VideoConfig cfg;
-    cfg.file = "movie_bai/logo.mp4";
+    cfg.file = "movie/logo.mp4";
     cfg.skippable = true;
     v.play_overlay(cfg);
     check(v.is_overlay_playing(), "arm(bounded=%d): overlay playing", (int)bounded);
@@ -121,15 +121,15 @@ ArmResult run_arm(std::shared_ptr<const oa::fs::IFileSystem> fs, bool bounded) {
 
 int main() {
     setvbuf(stdout, nullptr, _IONBF, 0);
-    const char* pfs_path = std::getenv("OA_TEST_HCT_PFS");
+    const char* pfs_path = std::getenv("OA_TEST_RR_PFS");
     if (!pfs_path || !*pfs_path) {
-        std::printf("OA_TEST_HCT_PFS unset; skipping\n");
+        std::printf("OA_TEST_RR_PFS unset; skipping\n");
         return 77;
     }
     SDL_SetHint(SDL_HINT_AUDIO_DRIVER, "dummy");
     auto fs = std::make_shared<oa::fs::PhysFileSystem>(pfs_path, true);
-    if (!fs->exists("movie_bai/logo.mp4")) {
-        std::fprintf(stderr, "movie_bai/logo.mp4 missing (loose dir not mounted?)\n");
+    if (!fs->exists("movie/logo.mp4")) {
+        std::fprintf(stderr, "movie/logo.mp4 missing (loose dir not mounted?)\n");
         return 1;
     }
 

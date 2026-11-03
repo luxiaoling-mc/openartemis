@@ -30,21 +30,7 @@ uint32_t adler32(const uint8_t* p, size_t n) {
     return (b << 16) | a;
 }
 
-// ---------------------------------------------------------------------------
-// E-mote PSB header decryption. Retail E-mote exports (e.g.
-// 甜蜜女友3) carry the encrypt bit and XOR their 12 header words (file bytes
-// 8..56: header_length/offsetEncrypt, the table offsets, the checksum and
-// the v4 extra-chunk offsets) with the keystream of a xorshift-style
-// 128-bit cipher — the same scheme as the krkr E-mote plugin reference
-// (plugins/emoteplayer/emotefile.cpp emote_decrypt; behavioural reference,
-// reimplemented below, no code copied):
-//     key = { 0x075BCD15, 0x159A55E5, 0x1F123BB5, seed }
-// The seed is per-game/per-license. 甜蜜女友3's seed 0x02F0AF34 was
-// recovered by an exhaustive 32-bit sweep validated against the header
-// adler32. Only the header words are encrypted — the section
-// tables they point to are plain — so after a successful patch the normal
-// parse proceeds unchanged.
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------- E-mote PSB header decryption. Retail E-mote exports (e.g.
 struct EmoteCipher {
     uint32_t key[4];
     uint32_t v = 0;
@@ -102,11 +88,6 @@ bool try_emote_decrypt(std::vector<uint8_t>& buf) {
         for (size_t i = 0; i < 48; ++i) buf[8 + i] ^= emote_cipher_next(&rc);
         return false;
     };
-    if (const char* e = std::getenv("OA_EMOTE_SEED")) { // hex override first
-        char* end = nullptr;
-        const unsigned long v = std::strtoul(e, &end, 0);
-        if (end && *end == '\0' && v != 0 && run(uint32_t(v))) return true;
-    }
     for (const auto& k : kEmoteDecryptSeeds)
         if (run(k.seed)) return true;
     return false;
@@ -513,10 +494,6 @@ bool decode_bc3(const uint8_t* src, int width, int height,
     // span) — fan out across threads for the large E-mote atlases.
     unsigned hw = std::thread::hardware_concurrency();
     unsigned threads = std::clamp(hw ? hw : 1u, 1u, 16u);
-    if (const char* v = std::getenv("OA_EMOTE_THREADS")) {
-        const int n = std::atoi(v);
-        if (n >= 1 && n <= 16) threads = unsigned(n);
-    }
     uint8_t* out = rgba_out->data();
     auto decode_rows = [=](int by0, int by1) {
         for (int by = by0; by < by1; ++by) {

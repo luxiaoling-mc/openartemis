@@ -1,24 +1,5 @@
 #pragma once
-// oa::render — Artemis message-layer text engine: message-layer
-// stack/switch/pop, (scetween), backlog reproduction tags, glyph click-wait
-// icon config, and the pure glyph layout stage (wrap/prohibit/wordparts/ruby
-// keep-ranges).
-//
-// Semantic summary:
-//   - DEFAULT_MESSAGE_LAYER "adv01", default font size 40
-//   - chgmsg id 缺省 → 匿名 id chgmsg_<nanos:x>_<serial> (switch Chgmsg)
-//   - switch_message_layer / apply_font_settings / font_init/close/default
-//     (layer stack); geometry keys left/top/width/height
-//   - push_text / push_line_break(omit) / push_page_break
-//   - reveal：MessageLayer reveal_index/pending/clock + reveal_next
-//     + reveal_all；新内容（空缓冲后首推）
-//     置 pending；scetween 空 → 立即全量
-//   - scetween 配置（ScetweenConfig；type/mode/param/ease/diff/
-//     delay/time/randomdelay）
-//   - backlog：页内 page_tags + BacklogTag（text/backlog）、rp 时按
-//     should_store(backlog 参数或 write_mode) 入 Backlog.push_page
-//   - glyph 图标配置（GlyphIconConfig）
-//   - 排版算法 layout_glyphs
+// oa::render — Artemis message-layer text engine: message-layer stack/switch/pop, (scetween), backlog reproduction tags, glyph click-wait i...
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -106,7 +87,6 @@ struct GlyphIconConfig {
     std::string rplayer;  // 页末图标层（缺省=layer）
     double left = 0, top = 0, rpleft = 0, rptop = 0;
     bool homing = false;
-    static GlyphIconConfig from_raw(const std::map<std::string, std::string>& raw);
 };
 
 struct ClickWaitPlacement {
@@ -191,13 +171,6 @@ public:
 
     void clear_scene();
     /// 把活动层锚回"当前持有可见页内容的层"：页面点击等待释放时调用
-    /// （advance_wait）。读档/UI 页会话残链（存档/读档页
-    /// chgmsg 平衡对以 load 清空的栈为底弹栈）会把活动层留在 UI 层
-    /// （如 500.pageno），而剧本翻页分派（script.asb 的 chgmsg/pop/rp 清页
-    /// 模式）假定 '@' 停驻释放时活动层 == 剧情文本层——错层导致清页清错
-    /// 层、新文本叠在旧页后且 reveal 冻结（NekoMiko 读档后"剧情推进但文字
-    /// 不动"）。锚定同时清空消息层栈，使后续 chgmsg push/pop 平衡对以剧情
-    /// 层为底。无可见文本内容层时不动。
     void anchor_active_to_content();
     const FontDesc& default_font() const { return default_font_; }
 

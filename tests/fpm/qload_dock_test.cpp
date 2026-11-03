@@ -34,7 +34,7 @@
 #endif
 
 #include "core/fs/physfs_fs.h"
-#include "core/runtime/runtime.h"
+#include "core/runtime/runtime_game.h"
 #include "core/runtime/runtime_save.h"
 
 namespace {

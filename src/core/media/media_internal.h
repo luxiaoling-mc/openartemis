@@ -1,20 +1,5 @@
 #pragma once
-// core/media INTERNAL declarations — not a public contract.
-//
-// "Small interface, big file": the public media headers keep only what their
-// callers name (audio.h: AudioEngine + MediaPlayers; video.h: VideoEngine and
-// its channel/config types; decode_pool.h; image.h). Everything the public
-// headers do NOT need to name lives here — the decode-source seam and the
-// backend classes, collected from the former core/media/{video_source,
-// theora,vorbis,ffmpeg_source}.h headers plus the implementation-only part of
-// the media players.
-//
-// Only the media implementation TUs include this header:
-//   audio.cpp — AudioSink, sink_diag_after_push
-//   video.cpp — VideoSource, TheoraSource, FfmpegSource/FfmpegAudioSource
-// (VorbisSource is the one backend that stays declared in the public
-// core/media/audio.h, see its banner.)
-// (same shape as render/render_internal.h.)
+// core/media INTERNAL declarations — not a public contract. "Small interface, big file": the public media headers keep only what their call...
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -114,22 +99,7 @@ private:
 // ---------------------------------------------------------------------------
 #if defined(OA_HAVE_FFMPEG) && OA_HAVE_FFMPEG
 
-/// container-audio companion of FfmpegSource (movie sound).
-/// Opens the SAME bytes through its own demux and decodes the container's
-/// best audio stream (AAC in the mp4 movies of rr/snll, wmav2 in the ASF
-/// brand movies of NekoMiko, vorbis inside ogg — whatever libavcodec can
-/// decode). PCM is converted in-engine (the vcpkg "ffmpeg" port has no
-/// swresample: avcodec+avformat only) to the engine output format every
-/// movie-audio consumer expects — interleaved stereo f32 at 44100 Hz
-/// (MediaPlayers::kOutputRate), the format of the AudioSink device stream:
-/// sample format -> f32, channel map (1 = duplicate, 2 = pass, >2 = average
-/// to mono then duplicate, the media players' convention), and sample-rate
-/// conversion by streaming linear interpolation (the MediaPlayers idiom,
-/// audio.cpp §3). AAC
-/// decoder priming (~2 frames of container start) is not trimmed. VideoEngine
-/// attaches one such source per real decode
-/// channel whose file carries audio; the theora-only build never sees this
-/// class (compiled only when OA_HAVE_FFMPEG, same gate as FfmpegSource).
+/// container-audio companion of FfmpegSource (movie sound). Opens the SAME bytes through its own demux and decodes the container's best audi...
 class FfmpegAudioSource {
 public:
     FfmpegAudioSource(const FfmpegAudioSource&) = delete;
@@ -223,15 +193,7 @@ private:
 
 #endif // OA_HAVE_FFMPEG
 
-// ---------------------------------------------------------------------------
-// §4 audio output sink (implementation part of the playback host).
-// ---------------------------------------------------------------------------
-/// one-sample delivery watermark sampled after
-/// every SDL_PutAudioStreamData into a device stream (`source` picks the
-/// bound stream: 0 = channel mix, 1 = movie container audio). Implemented in
-/// audio.cpp §3; a no-op unless the environment enables the diagnostics. The
-/// host prints the collected summary through
-/// MediaPlayers::print_audio_diag() at shutdown.
+// --------------------------------------------------------------------------- §4 audio output sink (implementation part of the playback host).
 void sink_diag_after_push(int source, SDL_AudioStream* stream, size_t frames);
 
 
@@ -241,35 +203,13 @@ void sink_diag_after_push(int source, SDL_AudioStream* stream, size_t frames);
 void SDLCALL sink_postmix_cb(void* ud, const SDL_AudioSpec* spec, float* buffer,
                              int buflen);
 
-// ---------------------------------------------------------------------------
-// audio output sink: pushes the engine's 44100 Hz stereo f32 mix into
-// SDL3 audio device streams. Each
-// INDEPENDENT audio source gets its own SDL_AudioStream, all bound to the
-// same output device (krkrsdl3's multi-stream pattern) — the device mixes
-// them, so one source's backlog/underrun can never delay or choke another.
-// Source 0 = the tick's channel mix (BGM/SE/voice, fed once per frame),
-// source 1 = the movie container audio (VideoEngine driver pump). When no
-// audio device is available the host runs the engine silently (no sink
-// attached) — state machine, decoding and completion events still run
-// (headless/no-device degradation).
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------- audio output sink: pushes the engine's 44100 Hz stereo f32 mi...
 class AudioSink {
     /// Stereo interleaved float frames at 44100 Hz. Null sink = silent
     /// (decode still advances so EOF/loop behavior stays deterministic).
 public:
     enum { kStreamMix = 0, kStreamMovie = 1, kStreamCount = 2 };
     /// hard latency bound per bound stream, in 44100 Hz stereo
-    /// frames (= queued frames / 44.1 ms). The queued level of a device-bound
-    /// stream IS the audible latency: the device plays the queue in order, so
-    /// a producer that pushes one wall-clock-sized chunk per tick leaves the
-    /// queue at most(max chunk) — a hitch of D ms pushes D ms at once while
-    /// the device drains the (small) standing queue dry, and from then on the
-    /// queue keeps that level forever (production and consumption are both
-    /// 1x, so nothing ever drains it). That "latency ratchet" is the
-    /// mechanism removed here: a standing backlog is dropped instead
-    /// of being played late. 100 ms mix / 120 ms movie are the tolerance
-    /// bands of the two consumers (channel mix: tick-paced; movie: A/V
-    /// clock-locked, where the queued level IS the audible A/V offset).
     enum : size_t {
         kMixBoundFrames = 4410,   // 100 ms
         kMovieBoundFrames = 5292, // 120 ms
@@ -281,15 +221,6 @@ public:
     /// resync is.
     enum : size_t { kMixSafetyFrames = 66150 }; // 1.5 s
     /// Jitter cushion the mix pacer holds ON TOP of the producer's own
-    /// cadence. The mixer runs on the tick thread, so an app stall is an audio
-    /// stall: moving the pointer across a title menu costs 70-100 ms per
-    /// rollover (rollover texture upload + a fresh SE channel: asset read,
-    /// vorbis open, prefetch thread), and a two-device-period mark left the
-    /// device dry 3x/s on that scene (measured: 144 dropouts in 47 s, 4-5 per
-    /// hover change — the "断断续续" report). 160 ms keeps the queue above two
-    /// device periods through every hitch measured on the real packages (worst
-    /// steady frame 25 ms, rollover 71-95 ms, one 130 ms outlier); the Rust
-    /// runtime's 250 ms device ring is the same trade made the other way.
     enum : size_t { kMixJitterFrames = 44100 * 160 / 1000 }; // 160 ms
     ~AudioSink() { close(); }
     bool open() {
@@ -338,11 +269,6 @@ public:
         push_to(kStreamMix, interleaved_stereo, frames);
     }
     /// Movie container-audio feed (VideoEngine pump, any thread). The pump's
-    /// frames are clock-locked to the picture's position_ms, so the queued
-    /// level IS the audible A/V offset: the bound is HARD — a chunk that
-    /// would push the level past the cap first drops the stale head (clear +
-    /// keep the newest cap frames), which resyncs the sound to the current
-    /// picture instead of carrying the offset to the end of the movie.
     void push_movie(const float* interleaved_stereo, size_t frames) {
         SDL_AudioStream* st = stream_[kStreamMovie];
         if (!st || frames == 0) return;
@@ -377,12 +303,6 @@ public:
     /// behaviour) so a test can prove it distinguishes fixed from unfixed.
     void set_bound_enabled(bool on) { bound_ = on; }
     /// signal-face capture: SDL's post-mix hook is installed
-    /// unconditionally (cheap: two level queries per device callback) so the
-    /// DEVICE-side truth — how often a bound stream ran dry and had to be
-    /// padded with silence — is countable in any run, not just a capture run.
-    /// `source`: 0 = channel mix, 1 = movie container audio. Only counted
-    /// while that stream has been pushed to within the last 250 ms (an idle
-    /// stream is empty by definition, not starved).
     uint64_t underruns(int source) const {
         return (source >= 0 && source < kStreamCount) ? underruns_[source] : 0;
     }
@@ -424,13 +344,6 @@ private:
         sink_diag_after_push(source, st, frames);
     }
     /// bounded push. Before appending, a STANDING backlog
-    /// (queued > cap) is dropped, so the stream can never carry a permanent
-    /// delay: the queue of a wall-clock-paced producer does not drain by
-    /// itself (its push chunk size equals what the device consumed in the
-    /// same interval), so one hitch is enough to delay every later sound for
-    /// the rest of the session. The bound drops the STALE audio, never the
-    /// frames being produced: the movie pump's frames belong to the current
-    /// picture, so the newest frames are the correct ones to keep.
     void push_bounded(int source, const float* interleaved_stereo, size_t frames,
                       size_t cap) {
         SDL_AudioStream* st = stream_[source];

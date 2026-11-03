@@ -41,7 +41,7 @@ TimeVarFrame tail(double t) {
 
 double sample(const TimeVar& track, double t, bool* ok = nullptr) {
     double v = -12345.0;
-    const bool hit = emote_sample_track(track, t, false, &v);
+    const bool hit = emote_sample_track(track, t, &v);
     if (ok) *ok = hit;
     assert(hit);
     return v;
@@ -79,15 +79,15 @@ int main() {
     late.frames = {key(30, 7), tail(40)};
     double ignored = 0;
     bool ok = true;
-    emote_sample_track(late, 10.0, false, &ignored);
-    ok = emote_sample_track(late, 10.0, false, &ignored);
+    emote_sample_track(late, 10.0, &ignored);
+    ok = emote_sample_track(late, 10.0, &ignored);
     assert(!ok);
     assert(sample(late, 35.0) == 7.0);
 
     // Empty track: never a write.
     TimeVar empty;
     empty.label = "empty";
-    ok = emote_sample_track(empty, 5.0, false, &ignored);
+    ok = emote_sample_track(empty, 5.0, &ignored);
     assert(!ok);
 
     std::printf("emote_track_sample_test: ok\n");

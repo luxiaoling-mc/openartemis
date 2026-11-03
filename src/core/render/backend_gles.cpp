@@ -244,13 +244,7 @@ void main() {
 }
 )";
 
-// [trans type=2] rule 灰度溶解 fragment（与 kVertexShader 同链接；vColor 未用）。
-// 逐像素旧帧覆盖率 keep = smoothstep(t, t+band, rule.r)，
-//   t = progress*(1+band) - band，band = max(vague,1)/255（vague 0-255 尺度），
-// rule 按整幅舞台 UV 拉伸采样（灰度取 R 通道）。输出 = capture 的 rgb、
-// alpha = cap.a*keep → 标准 blend 叠到当前场景上。端点连续：progress=0 →
-// keep 全 1（只见旧帧），progress=1 → keep 全 0（只见新场景）；rule 灰度低
-// 的像素先揭示（若要反向只改比较方向一行）。
+// [trans type=2] rule 灰度溶解 fragment（与 kVertexShader 同链接；vColor 未用）。 逐像素旧帧覆盖率 keep = smoothstep(t, t+band, rule.r)， t = progress*(1+band)...
 const char* kRuleFragmentShader = R"(
 #version 300 es
 precision highp float;

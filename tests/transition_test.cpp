@@ -9,7 +9,7 @@
 #include <vector>
 
 #include "core/fs/fs.h"
-#include "core/runtime/runtime.h"
+#include "core/runtime/runtime_game.h"
 #include "core/render/layer.h"
 // research/111: anim（Easing/Tween/TweenDone）与 transition（Transition）收为
 // render 内部面；本测试是这两个语义机的直接使用者，故 include 内部头

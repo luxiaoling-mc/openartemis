@@ -10,7 +10,7 @@
 #include <vector>
 
 #include "core/fs/fs.h"
-#include "core/runtime/runtime.h"
+#include "core/runtime/runtime_game.h"
 #include "core/render/layer.h"
 // research/111: Compositor::advance_tweens/apply_lytweendel 按值返回
 // std::vector<TweenDone>，其元素类型定义在 render 内部头（公开头只前向声明）。
