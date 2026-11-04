@@ -17,6 +17,7 @@ param(
     [string]$BuildDir = "build/mingw-asan",
     [int]$SliceMinutes = 20,
     [int]$MonkeyMinutes = 30,
+    [int]$StressMinutes = 10,
     [string]$Engine = "auto"
 )
 
@@ -110,6 +111,38 @@ if ($packages.Count -eq 0) {
     } -ArgumentList $monkeyExe, $packages, $MonkeyMinutes, $out, $deadline.Ticks, $summary
 }
 
+# 并发压力与 fuzz/猴子**并行**：每个包跑满 StressMinutes，runtime 自己的渲染器
+# （tick 里 render_frame，和 app/安卓同一条主线程路径）+ 静音（设备照开，回调
+# 线程照跑）。与猴子错开包轮转。
+$stressJob = $null
+$stressExe = Find-Exe "oa_stress"
+if ($packages.Count -eq 0) {
+    Say "SKIP stress（build/*/root.pfs 一个都没有）"
+} elseif (-not $stressExe) {
+    Say "SKIP stress（没构建出来）"
+} else {
+    $stressJob = Start-Job -ScriptBlock {
+        param($exe, $pkgs, $minutes, $outDir, $deadlineTicks, $summaryPath, $offset)
+        $i = $offset
+        while ((Get-Date).Ticks -lt $deadlineTicks) {
+            $pkg = $pkgs[$i % $pkgs.Count]
+            ++$i
+            $seed = Get-Random -Maximum 2147483647
+            $name = Split-Path -Leaf (Split-Path -Parent $pkg)
+            $log = Join-Path $outDir ("stress-{0}.log" -f $name)
+            $stamp = Get-Date -Format 'MM-dd HH:mm:ss'
+            Add-Content -Path $summaryPath -Value ("{0}  RUN  stress {1} minutes={2} seed={3}" -f $stamp, $name, $minutes, $seed)
+            & $exe $pkg --minutes $minutes --threads 2 --seed $seed --render --silent *>> $log
+            $stamp = Get-Date -Format 'MM-dd HH:mm:ss'
+            if ($LASTEXITCODE -ne 0) {
+                Add-Content -Path $summaryPath -Value ("{0}  CRASH stress {1} seed={2} log={3}" -f $stamp, $name, $seed, $log)
+            } else {
+                Add-Content -Path $summaryPath -Value ("{0}  OK   stress {1}" -f $stamp, $name)
+            }
+        }
+    } -ArgumentList $stressExe, $packages, $StressMinutes, $out, $deadline.Ticks, $summary, 3
+}
+
 while ((Get-Date) -lt $deadline) {
     ++$rounds
     foreach ($t in $targets) {
@@ -153,6 +186,11 @@ if ($monkeyJob) {
     Wait-Job $monkeyJob | Out-Null
     Receive-Job $monkeyJob | Out-Null
     Remove-Job $monkeyJob
+}
+if ($stressJob) {
+    Wait-Job $stressJob | Out-Null
+    Receive-Job $stressJob | Out-Null
+    Remove-Job $stressJob
 }
 
 Say "DONE rounds=$rounds crashes=$crashes"

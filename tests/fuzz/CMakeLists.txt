@@ -30,3 +30,7 @@ oa_add_fuzz(oa_fuzz_render oa_fuzz_render.cpp SDL3::SDL3)
 # 暴力驱动：真包 + 随机输入，可选隐藏窗口渲染。
 add_executable(oa_monkey oa_monkey.cpp)
 target_link_libraries(oa_monkey PRIVATE libopenartemis SDL3::SDL3)
+
+# 并发压力：高频起停视频通道，专打驱动线程与主线程的交错（--threads 多实例）。
+add_executable(oa_stress oa_stress.cpp)
+target_link_libraries(oa_stress PRIVATE libopenartemis)

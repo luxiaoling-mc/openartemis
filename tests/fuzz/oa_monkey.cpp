@@ -177,6 +177,9 @@ int main(int argc, char** argv) {
         rt = std::make_unique<oa::runtime::GameRuntime>(fs);
         rt->open_project("windows");
         rt->boot_project();
+        // App 默认就开解码池；猴子直接驱动 GameRuntime，要显式开，否则音频
+        // 预读/视频解码 worker 这两条线根本没被压到。
+        rt->enable_decode_pool();
         if (!render) return true;
         if (!SDL_Init(SDL_INIT_VIDEO)) {
             std::printf("[monkey] SDL_Init failed: %s\n", SDL_GetError());

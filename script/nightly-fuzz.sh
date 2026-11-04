@@ -6,7 +6,8 @@
 #   build-dir        默认 build/mingw-asan
 #   hours            总时长（默认 6）
 #   fuzz-slice-min   每个 libFuzzer 目标一轮多少分钟（默认 20）
-#   monkey-min       每个真包跑多少分钟（默认 30；0 = 只做冒烟轮转）
+#   monkey-min       每个真包猴子跑多少分钟（默认 30；0 = 只做冒烟轮转）
+#   stress-min       每个真包并发压力跑多少分钟（默认 10；0 = 不跑）
 #
 # 产物（都在 <build>/nightly/）：
 #   summary.txt            进度/结果，一行一件事
@@ -25,6 +26,7 @@ BUILD="${1:-build/mingw-asan}"
 HOURS="${2:-6}"
 SLICE_MIN="${3:-20}"
 MONKEY_MIN="${4:-30}"
+STRESS_MIN="${5:-10}"
 OUT="$BUILD/nightly"
 ART="$OUT/artifacts"
 CORPUS_ROOT="$OUT/corpus"
@@ -48,7 +50,7 @@ for f in build/*/root.pfs; do [ -f "$f" ] && PACKAGES+=("$f"); done
 
 DEADLINE=$(( $(date +%s) + HOURS * 3600 ))
 : > "$CRASH_FILE"
-say "START build=$BUILD hours=$HOURS slice=${SLICE_MIN}m monkey=${MONKEY_MIN}m pkgs=${#PACKAGES[@]}"
+say "START build=$BUILD hours=$HOURS slice=${SLICE_MIN}m monkey=${MONKEY_MIN}m stress=${STRESS_MIN}m pkgs=${#PACKAGES[@]}"
 
 monkey_loop() {
   local monkey="$FUZZ/oa_monkey.exe"
@@ -81,9 +83,39 @@ monkey_loop() {
   done
 }
 
+stress_loop() {
+  local exe="$FUZZ/oa_stress.exe"
+  [ "$STRESS_MIN" -gt 0 ] || return
+  if [ ! -f "$exe" ]; then say "SKIP stress（没构建出来）"; return; fi
+  if [ "${#PACKAGES[@]}" -eq 0 ]; then return; fi
+  local i=0
+  while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+    local pkg="${PACKAGES[$(( (i + 3) % ${#PACKAGES[@]} ))]}"  # 与猴子错开包
+    i=$((i + 1))
+    [ "$(date +%s)" -lt "$DEADLINE" ] || break
+    local seed=$(( (RANDOM << 15 | RANDOM) % 2000000000 ))
+    local name
+    name=$(basename "$(dirname "$pkg")")
+    say "RUN  stress $name minutes=$STRESS_MIN seed=$seed"
+    # --render：走 runtime 自己的渲染器（与 app/安卓同一条主线程路径：tick 里
+    # 直接 render_frame），音频设备/视频音轨/纹理 flush 都在这条线上；
+    # --silent：设备照开（回调线程照跑），只是主音量归零，夜里不吵。
+    "$exe" "$pkg" --minutes "$STRESS_MIN" --threads 2 --seed "$seed" --render --silent \
+        >> "$OUT/stress-$name.log" 2>&1
+    if [ $? -ne 0 ]; then
+      echo x >> "$CRASH_FILE"
+      say "CRASH stress $name seed=$seed"
+    else
+      say "OK   stress $name"
+    fi
+  done
+}
+
 # 猴子先起：它按墙钟跑满每包额度，和 fuzz 目标用的是不同的核。
 monkey_loop &
 MONKEY_PID=$!
+stress_loop &
+STRESS_PID=$!
 
 TARGETS="psb iet image save runtime render"
 ROUND=0
@@ -111,5 +143,6 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
 done
 
 wait "$MONKEY_PID" 2>/dev/null
+wait "$STRESS_PID" 2>/dev/null
 CRASHES=$(wc -l < "$CRASH_FILE" 2>/dev/null | tr -d ' ')
 say "DONE rounds=$ROUND crashes=${CRASHES:-0}"

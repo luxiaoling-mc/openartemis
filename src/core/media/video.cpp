@@ -82,9 +82,6 @@ std::unique_ptr<VideoSource> open_any_source(const std::vector<uint8_t>& bytes);
 void VideoEngine::release_channel_frames(const std::string& key) {
     frame_staging_.erase(key);
     revision_staging_.erase(key);
-    // 通道销毁即释放它持有的视频纹理（层里若还挂着同一句柄则由层决定，
-    // 解绑/删层时随之释放）。
-    textures_.erase(key);
 }
 
 void VideoEngine::cancel_pipe(DecodeState& ds) {
@@ -274,10 +271,10 @@ void VideoEngine::driver_loop() {
         }
         // driver 线程也是"源自己推"：新解码帧必须在这里推到渲染槽，
         // 否则真实 app（driver 模式，update 直接 return）永远没有画面。
-        std::vector<std::pair<std::string, bool>> fresh;
+        std::vector<FreshFrame> fresh;
         collect_fresh_locked(&fresh);
         if (!fresh.empty()) {
-            lk.unlock(); // push_frames -> video_frame() 会再次取锁
+            lk.unlock(); // 推送不再取锁，但仍留在锁外：回调会进 runtime/renderer
             push_frames(fresh);
             lk.lock();
         }
@@ -805,56 +802,54 @@ void VideoEngine::pump_channel(VideoChannel& channel, DecodeState& ds) {
 }
 
 
-void VideoEngine::collect_fresh_locked(
-    std::vector<std::pair<std::string, bool>>* fresh) const {
-    if (!frame_push_) return;
+void VideoEngine::collect_fresh_locked(std::vector<FreshFrame>* fresh) {
+    if (!frame_push_ || !texture_factory_) return;
     auto pushed = [this](const std::string& k) {
         const auto it = pushed_rev_.find(k);
         return it == pushed_rev_.end() ? uint64_t(0) : it->second;
     };
-    if (state_.overlay_video) {
-        if (const DecodeState* ds = decode_of(kOverlayVideoId);
-            ds && ds->revision != pushed(kOverlayVideoId))
-            fresh->emplace_back(std::string(), false);
-    }
-    for (const auto& [id, ch] : state_.video_layers) {
-        if (const DecodeState* ds = decode_of(id); ds && ds->revision != pushed(id))
-            fresh->emplace_back(id, !ch.mask_on);
-    }
+    // 一个通道：有新版解码帧就把纹理/像素准备好（都在锁内，出锁后推送不再加锁）。
+    auto collect_one = [&](const std::string& id, VideoChannel& ch, bool luma) {
+        const std::string key = id.empty() ? kOverlayVideoId : id;
+        const DecodeState* ds = decode_of(key);
+        if (!ds || ds->rgba.empty() || ds->revision == pushed(key)) return;
+        if (!ch.texture || ch.tex_w != ds->width || ch.tex_h != ds->height) {
+            ch.texture = texture_factory_(ds->width, ds->height);
+            ch.tex_w = ds->width;
+            ch.tex_h = ds->height;
+        }
+        if (!ch.texture) return;
+        FreshFrame f;
+        f.id = id;
+        f.luma = luma;
+        f.tex = ch.texture; // shared_ptr：出锁后通道被销毁也不影响这次推送
+        f.pixels.assign(ds->rgba.begin(), ds->rgba.end());
+        f.w = ds->width;
+        f.h = ds->height;
+        pushed_rev_[key] = ds->revision; // 记在收集侧，推送侧就不用再取锁
+        fresh->push_back(std::move(f));
+    };
+    if (state_.overlay_video) collect_one(std::string(), *state_.overlay_video, false);
+    for (auto& [id, ch] : state_.video_layers) collect_one(id, ch, !ch.mask_on);
 }
 
-void VideoEngine::push_frames(
-    const std::vector<std::pair<std::string, bool>>& fresh) {
-    if (!frame_push_ || !texture_factory_) return;
-    for (const auto& [id, luma] : fresh) {
-        int w = 0, h = 0;
-        const uint8_t* px = nullptr;
-        uint64_t rev = 0;
-        if (!video_frame(id, &w, &h, &px, &rev)) continue;
-        const std::string key = id.empty() ? kOverlayVideoId : id;
-        TextureRef& tex = textures_[key];
-        if (!tex || tex->width() != w || tex->height() != h)
-            tex = texture_factory_(w, h);
-        if (!tex) continue;
-        if (luma) {
+void VideoEngine::push_frames(std::vector<FreshFrame>& fresh) {
+    for (FreshFrame& f : fresh) {
+        if (!f.tex) continue;
+        if (f.luma) {
             // 未遮罩通道的亮度键在源侧完成；纹理只接收成品 RGBA。
-            std::vector<uint8_t> tmp(px, px + size_t(w) * size_t(h) * 4);
-            for (size_t i = 0; i + 3 < tmp.size(); i += 4)
-                tmp[i + 3] = oa::media::layer_video_key_alpha(
-                    oa::media::rgba_luma(tmp.data() + i));
-            tex->update(w, h, tmp.data());
-        } else {
-            tex->update(w, h, px);
+            for (size_t i = 0; i + 3 < f.pixels.size(); i += 4)
+                f.pixels[i + 3] = oa::media::layer_video_key_alpha(
+                    oa::media::rgba_luma(f.pixels.data() + i));
         }
-        frame_push_(id, tex, w, h);
-        std::lock_guard<std::mutex> lk(engine_mutex_);
-        pushed_rev_[key] = rev;
+        f.tex->update(f.w, f.h, f.pixels.data());
+        frame_push_(f.id, f.tex, f.w, f.h);
     }
 }
 
 void VideoEngine::update(uint64_t delta_ms) {
     if (driver_running_.load()) return;
-    std::vector<std::pair<std::string, bool>> fresh; // channel, luma_key
+    std::vector<FreshFrame> fresh;
     {
     std::lock_guard<std::mutex> lk(engine_mutex_);
     state_.clock_ms += delta_ms;
@@ -878,7 +873,7 @@ void VideoEngine::update(uint64_t delta_ms) {
             ch.playing = false;
         }
     }
-    collect_fresh_locked(&fresh); // 锁内只收集，推送在锁外
+    collect_fresh_locked(&fresh); // 锁内收集（含像素/纹理），推送在锁外零加锁
     } // unlock
     push_frames(fresh);
 }

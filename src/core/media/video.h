@@ -68,6 +68,9 @@ struct VideoFinishEvent {
     std::optional<VideoFinishHandler> handler;
 };
 
+/// 视频帧纹理（后端无关的可写纹理；源 update，渲染线程 flush）。
+using TextureRef = std::shared_ptr<oa::render::HostTexture>;
+
 struct VideoChannel {
     std::string id;
     std::string file;
@@ -79,6 +82,10 @@ struct VideoChannel {
     std::optional<int32_t> delay_margin_ms;
     uint64_t position_ms = 0;
     bool decoded = false; // true when a decoder is attached (real playback)
+    /// 该通道当前的可写纹理。
+    TextureRef texture;
+    int tex_w = 0;
+    int tex_h = 0;
     /// the channel auto-detected a `<stem>_m.<ext>` mask
     bool mask_on = false;
 
@@ -129,7 +136,6 @@ public:
     }
 
     /// 与后端无关的可写纹理（渲染层提供；源 update 后交给宿主挂到层上）。
-    using TextureRef = std::shared_ptr<oa::render::HostTexture>;
     using TextureFactory = std::function<TextureRef(int w, int h)>;
     /// 纹理工厂（渲染器注入；只在源线程构造对象，不碰后端）。
     void set_texture_factory(TextureFactory f) { texture_factory_ = std::move(f); }
@@ -202,12 +208,23 @@ private:
     FramePush frame_push_;
     TextureFactory texture_factory_;
     std::map<std::string, uint64_t> pushed_rev_;
-    std::map<std::string, TextureRef> textures_; // 每通道一块可写纹理
 
-    /// 收集有新版解码帧的通道（调用方持 engine_mutex_；只读状态）。
-    void collect_fresh_locked(std::vector<std::pair<std::string, bool>>* fresh) const;
+    /// 推送任务：锁内收集，锁外执行（像素/纹理都已拿到手，推送零加锁）。
+    struct FreshFrame {
+        std::string id; // "" = overlay
+        bool luma = false;
+        TextureRef tex;
+        std::vector<uint8_t> pixels;
+        int w = 0;
+        int h = 0;
+    };
+
+    /// 收集有新版解码帧的通道（调用方持 engine_mutex_）：顺手在锁内把纹理
+    /// 拿好、像素拷走、revision 记为已推。这样推送侧不再需要任何锁。
+    void collect_fresh_locked(std::vector<FreshFrame>* fresh);
     /// 把新帧推给渲染推送面（锁外调用；video_frame 内部会再次取锁）。
-    void push_frames(const std::vector<std::pair<std::string, bool>>& fresh);
+    /// 非 const：luma 通道要在推送前把 alpha 就地改写。
+    void push_frames(std::vector<FreshFrame>& fresh);
     void driver_loop();
     void ensure_driver();
     void shutdown_driver_if_idle();

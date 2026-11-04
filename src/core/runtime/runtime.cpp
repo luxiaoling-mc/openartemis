@@ -175,7 +175,7 @@ bool GameRuntime::RuntimeState::attach_window(void* native_window,
     media_.video_.set_texture_factory(
         [this](int w, int h) { return renderer_.create_host_texture(w, h); });
     media_.video_.set_frame_push(
-        [this](const std::string& channel, const oa::media::VideoEngine::TextureRef& tex,
+        [this](const std::string& channel, const oa::media::TextureRef& tex,
                int, int) {
             const std::string id = channel.empty()
                                        ? std::string(oa::render::kOverlayNodeId)
@@ -339,6 +339,9 @@ bool GameRuntime::load_game_from(const std::string& file, int64_t trans_type) { 
 const std::string& GameRuntime::savepath() const { return s_->savepath(); }
 void GameRuntime::apply_save_event(const oa::runtime::Event& e) { s_->apply_save_event(e); }
 bool GameRuntime::apply_media_event(const oa::runtime::Event& e) { return s_->apply_media_event(e); }
+oa::runtime::CallbackResult GameRuntime::apply_event(const oa::runtime::Event& e) {
+    return s_->dispatch_interpreter_event(e);
+}
 void GameRuntime::sound_finished(oa::media::SoundCategory cat, const std::string& id) { s_->sound_finished(cat, id); }
 
 std::pair<double, double> GameRuntime::RuntimeState::bound_image_size(const oa::render::Layer& l) {

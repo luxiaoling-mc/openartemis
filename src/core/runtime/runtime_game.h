@@ -204,6 +204,11 @@ public:
     void enable_decode_pool(int threads = -1);
     /// Drive one media event directly (identical path to interpreter dispatch).
     bool apply_media_event(const oa::runtime::Event& e);
+    /// Drive one interpreter event through the full domain routing (engine →
+    /// media → text → scene → control). Hosts/tools that need to raise a tag
+    /// without a script (e.g. emotestatic/lyc) use this; scripts go through
+    /// the interpreter callback. Waits land in drain_events() as usual.
+    oa::runtime::CallbackResult apply_event(const oa::runtime::Event& e);
     /// Finish one sound channel and dispatch its registered handler.
     void sound_finished(oa::media::SoundCategory cat, const std::string& id);
 

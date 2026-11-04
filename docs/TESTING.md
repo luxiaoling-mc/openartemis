@@ -219,12 +219,45 @@ OA_FUZZ_ITERS=200000 OA_FUZZ_SEED=1 ./oa_fuzz_psb /path/to/corpus
 脚本错误（剧本/资源缺失）在暴力输入下属预期，猴子会记账继续跑；只有 ASan 报告、
 断言或信号才算发现。
 
+### 并发压力（oa_stress）
+
+`oa_stress` 不靠随机点击碰运气，而是把**会起线程的子系统**同时摇起来，专打
+worker 线程与主线程的交错（安卓上那次 video 驱动线程写坏纹理表就是这么炸的）：
+
+| 角色 | 被压的线程面 |
+| --- | --- |
+| `video` | `VideoEngine` 的 driver 线程解码 + 推帧；主线程高频起停/收尾/落纹理 |
+| `audio` | decode pool worker + 每通道 prefetch 线程 + SDL 设备回调线程；主线程起停/淡入淡出/改音量 |
+| `emote` | PSB 并行解码线程池 + 画布合成；同 id 反复重建（替换旧 player） |
+| `layers` | 主线程建/删/改图层（几何、裁剪、掩码），逼计划重建与栅格化 |
+
+`tick` 永远在跑。加 `--render` 时用 **runtime 自己的渲染器**（和 app/安卓同一条
+主线程路径：tick 里直接 `render_frame`，HostTexture flush、组离屏合成、视频音轨
+都在生产路径上）；`--silent` 把主音量归零但设备照开（回调线程照跑，夜里不吵）。
+
+```sh
+./build/mingw-asan/tests/fuzz/oa_stress /path/to/root.pfs \
+    --minutes 10 --threads 2 --render --silent --seed 7
+```
+
+| 参数 | 含义 |
+| --- | --- |
+| `--minutes M` | 跑多少分钟（默认 5） |
+| `--threads N` | N 个独立 runtime 并行（查跨实例共享状态） |
+| `--roles csv` | `video,audio,layers,emote`（默认全开；找不到资产的角色自动跳过） |
+| `--render` | 挂 runtime 自己的渲染器（隐藏窗口）+ 音频设备 |
+| `--silent` | 主音量 0（设备仍开） |
+| `--video/--audio/--emote P` | 手工指定资产（包里没找到时用） |
+| `--seed S` | 随机种子 |
+
 ### 跑一夜
 
 ```sh
 bash script/nightly-fuzz.sh build/mingw-asan 7 20   # 构建目录 小时数 每目标切片分钟
 ```
 
-按切片轮转 6 个输入面 + 两个真包猴子，语料跨轮累积，崩溃样本落在
+三线并行（各占各的核）：6 个输入面按切片轮转、每个真包猴子跑满 30 分钟、每个
+真包并发压力跑满 10 分钟（`--render --silent`）。语料跨轮累积，崩溃样本落在
 `<build>/nightly/artifacts/`，进度一行一条写在 `<build>/nightly/summary.txt`。
-Windows 上等价入口是 `script/nightly-fuzz.ps1`（同样的产物布局）。
+Windows 上等价入口是 `script/nightly-fuzz.ps1`（同样的产物布局，`-StressMinutes`
+控制压力额度）。
