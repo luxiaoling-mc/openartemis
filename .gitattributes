@@ -1,0 +1,2 @@
+# 脚本按 LF 检出：CRLF 会让 bash 把 \r 当成命令的一部分。
+*.sh text eol=lf
