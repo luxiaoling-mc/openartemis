@@ -1,6 +1,10 @@
 {
   "version": 6,
-  "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
   "configurePresets": [
     {
       "name": "default",
@@ -38,7 +42,10 @@
       "displayName": "vcpkg x64-windows MSVC Release",
       "generator": "Visual Studio 17 2022",
       "binaryDir": "${sourceDir}/build/windows",
-      "architecture": { "value": "x64", "strategy": "set" },
+      "architecture": {
+        "value": "x64",
+        "strategy": "set"
+      },
       "cacheVariables": {
         "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
         "VCPKG_TARGET_TRIPLET": "x64-windows"
@@ -92,15 +99,71 @@
         "OA_ENABLE_TESTS": "OFF",
         "OA_BUILD_TOOLS": "OFF"
       }
+    },
+    {
+      "name": "mingw",
+      "displayName": "vcpkg x64-mingw-static (llvm-mingw clang, Ninja Release)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/mingw",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_TARGET_TRIPLET": "x64-mingw-static",
+        "CMAKE_BUILD_TYPE": "Release",
+        "OA_ENABLE_TESTS": "ON"
+      }
+    },
+    {
+      "name": "mingw-asan-fuzz",
+      "displayName": "llvm-mingw + AddressSanitizer + libFuzzer (Ninja RelWithDebInfo)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/mingw-asan",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_TARGET_TRIPLET": "x64-mingw-static",
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "OA_ENABLE_ASAN": "ON",
+        "OA_ENABLE_TESTS": "ON",
+        "OA_ENABLE_FUZZ": "ON"
+      }
     }
   ],
   "buildPresets": [
-    { "name": "default", "configurePreset": "default" },
-    { "name": "debug", "configurePreset": "debug" },
-    { "name": "asan", "configurePreset": "asan" },
-    { "name": "windows", "configurePreset": "windows", "configuration": "Release" },
-    { "name": "android-arm64", "configurePreset": "android-arm64" },
-    { "name": "android-x64", "configurePreset": "android-x64" },
-    { "name": "wasm", "configurePreset": "wasm" }
+    {
+      "name": "default",
+      "configurePreset": "default"
+    },
+    {
+      "name": "debug",
+      "configurePreset": "debug"
+    },
+    {
+      "name": "asan",
+      "configurePreset": "asan"
+    },
+    {
+      "name": "windows",
+      "configurePreset": "windows",
+      "configuration": "Release"
+    },
+    {
+      "name": "android-arm64",
+      "configurePreset": "android-arm64"
+    },
+    {
+      "name": "android-x64",
+      "configurePreset": "android-x64"
+    },
+    {
+      "name": "wasm",
+      "configurePreset": "wasm"
+    },
+    {
+      "name": "mingw",
+      "configurePreset": "mingw"
+    },
+    {
+      "name": "mingw-asan-fuzz",
+      "configurePreset": "mingw-asan-fuzz"
+    }
   ]
 }

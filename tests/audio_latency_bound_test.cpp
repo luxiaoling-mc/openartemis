@@ -31,6 +31,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <thread>
 #include <vector>
 
 #include "SDL3/SDL.h"

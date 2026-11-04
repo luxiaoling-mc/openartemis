@@ -19,6 +19,7 @@ endif()
 option(OA_BUILD_TOOLS "Build bundled command-line tools" OFF)
 option(OA_ENABLE_TESTS "Build unit tests" OFF)
 option(OA_ENABLE_ASAN "Build with AddressSanitizer (diagnostic builds only)" OFF)
+option(OA_ENABLE_FUZZ "Build the parser fuzzers + the random-input monkey" OFF)
 
 # ---------------------------------------------------------------------------
 # Global settings
@@ -59,6 +60,15 @@ if(OA_ENABLE_ASAN)
     add_compile_options(-fsanitize=address -fno-omit-frame-pointer -g)
     add_link_options(-fsanitize=address)
   endif()
+endif()
+
+# ---------------------------------------------------------------------------
+# 覆盖率插桩（OA_ENABLE_FUZZ）：libFuzzer 靠它做引导，必须**覆盖整个库**，
+# 所以放在任何 add_subdirectory 之前全局加 —— 只给 fuzz 目标自己插桩的话
+# 覆盖率只剩目标那几十个 PC，等于瞎跑。
+# ---------------------------------------------------------------------------
+if(OA_ENABLE_FUZZ AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  add_compile_options(-fsanitize-coverage=inline-8bit-counters,pc-table,trace-cmp)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -124,4 +134,53 @@ endif()
 if(OA_ENABLE_TESTS AND NOT ANDROID AND NOT EMSCRIPTEN)
   enable_testing()
   add_subdirectory(tests)
+endif()
+# 模糊测试目标跟着 tests/ 走（独立的 option：fuzz 构建通常不要跑全量单测）。
+# Clang 下给整个库补覆盖率插桩，libFuzzer 才有引导信号；libFuzzer 的 main 由
+# 各目标自己链（tests/fuzz/CMakeLists.txt）。
+if(OA_ENABLE_FUZZ AND NOT ANDROID AND NOT EMSCRIPTEN)
+  # llvm-mingw 的 clang 驱动**拒绝** -fsanitize=fuzzer（windows-gnu 目标），但
+  # 运行时库还在 clang 的 resource dir 里：手动链接那个 .a，覆盖率用
+  # -fsanitize-coverage 显式打开。找不到运行时库就退化成 fuzz_loop.h 的暴力
+  # 变异循环（照样能配 ASan 砸内存错误）。
+  set(OA_FUZZ_LIBFUZZER_OK OFF)
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    set(OA_FUZZ_LIBFUZZER_RUNTIME "" CACHE FILEPATH
+        "libFuzzer runtime archive (empty = auto-detect from clang -print-resource-dir)")
+    if(NOT OA_FUZZ_LIBFUZZER_RUNTIME)
+      execute_process(COMMAND ${CMAKE_CXX_COMPILER} -print-resource-dir
+                      OUTPUT_VARIABLE _oa_clang_rt
+                      OUTPUT_STRIP_TRAILING_WHITESPACE
+                      RESULT_VARIABLE _oa_clang_rt_rc)
+      if(_oa_clang_rt_rc EQUAL 0)
+        # 先按目标架构精确匹配：同一目录里 i386/x86_64 都有，而 file(GLOB)
+        # 会把所有模式的结果排序后一起给出（i386 排在前面），所以逐个模式找、
+        # 命中就停。
+        if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+          set(_oa_fuzzer_arch x86_64)
+        else()
+          set(_oa_fuzzer_arch i386)
+        endif()
+        foreach(_pat
+                "${_oa_clang_rt}/lib/windows/libclang_rt.fuzzer-${_oa_fuzzer_arch}.a"
+                "${_oa_clang_rt}/lib/windows/libclang_rt.fuzzer-*.a"
+                "${_oa_clang_rt}/lib/*/libclang_rt.fuzzer-*.a")
+          if(OA_FUZZ_LIBFUZZER_RUNTIME)
+            break()
+          endif()
+          file(GLOB _oa_hit "${_pat}")
+          if(_oa_hit)
+            list(GET _oa_hit 0 OA_FUZZ_LIBFUZZER_RUNTIME)
+          endif()
+        endforeach()
+      endif()
+    endif()
+    if(OA_FUZZ_LIBFUZZER_RUNTIME AND EXISTS "${OA_FUZZ_LIBFUZZER_RUNTIME}")
+      set(OA_FUZZ_LIBFUZZER_OK ON)
+      message(STATUS "openartemis: fuzz targets = libFuzzer (${OA_FUZZ_LIBFUZZER_RUNTIME})")
+    else()
+      message(STATUS "openartemis: fuzz targets = brute mode (no libFuzzer runtime)")
+    endif()
+  endif()
+  add_subdirectory(tests/fuzz)
 endif()

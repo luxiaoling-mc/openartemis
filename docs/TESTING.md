@@ -132,3 +132,99 @@ OA_SAVE_ROOT=/tmp/s ./build/windows/src/app/Release/openartemis \
 OA_SCENEDUMP="500" OA_TXTDUMP=1 OA_SAVE_ROOT=/tmp/s \
   ./build/windows/src/app/Release/openartemis --headless --frames 600 /path/root.pfs
 ```
+
+---
+
+## 5. sanitizer / fuzz（llvm-mingw）
+
+Windows 上的内存错误检查走 **llvm-mingw（clang 17）**：它有 `libclang_rt.asan` 和
+`libclang_rt.fuzzer`，同一个编译器既能编 ASan 也能编 libFuzzer。MSVC 的
+`/fsanitize=address` 也能跑 ASan 构建，但没有 libFuzzer，只能走暴力变异模式。
+
+前置：把 llvm-mingw 的 `bin` 放进 PATH（vcpkg 的 mingw 端口是按
+`x86_64-w64-mingw32-gcc` 找编译器的，llvm-mingw 提供了同名别名，指向 clang）：
+
+```sh
+export PATH="/path/llvm-mingw1706_64/bin:$PATH"
+```
+
+### 构建
+
+```sh
+cmake --preset mingw-asan-fuzz      # x64-mingw-static + ASan + fuzz 目标
+cmake --build build/mingw-asan -j
+ctest --test-dir build/mingw-asan --output-on-failure   # 全量单测跑在 ASan 下
+```
+
+另有 `--preset mingw`（Release、只带单测）用来验证 mingw 交叉编出来的正常产物。
+依赖（vcpkg 的 SDL3/freetype/ffmpeg…）**不插桩**——ASan 只能看见本工程自己的
+堆/栈/悬垂访问，这是有意的取舍（给 ffmpeg 编 ASan 不值当）。
+
+### 解析面 fuzz
+
+四个目标共用 `tests/fuzz/oa_fuzz.cpp`，编译期宏选输入面：
+
+| 目标 | 输入面 | 典型问题 |
+| --- | --- | --- |
+| `oa_fuzz_psb` | E-mote PSB 容器（表/对象/资源区） | 越界读、偏移未校验 |
+| `oa_fuzz_iet` | 剧本文本 + ASB 二进制（先 decode_asb 再 parse） | 解析器越界/死循环 |
+| `oa_fuzz_image` | PNG/JPEG 解码 + PNG tEXt | 解码器尺寸/行宽计算 |
+| `oa_fuzz_save` | 官方存档 BOWX/BOWG/BOWS（zlib + 尾部目录） | 目录/字段越界 |
+
+Clang 构建下它们就是 libFuzzer（覆盖率引导、自动最小化、corpus 可累积）。
+llvm-mingw 的驱动**拒绝** `-fsanitize=fuzzer`，但 clang 自带的运行时库还在，CMake
+会自己找到并手动链接（`libclang_rt.fuzzer-x86_64.a`，来自 `clang -print-resource-dir`），
+覆盖率用 `-fsanitize-coverage=inline-8bit-counters,pc-table,trace-cmp` 显式打开。
+
+```sh
+mkdir -p /tmp/corpus_psb
+./build/mingw-asan/tests/fuzz/oa_fuzz_psb /tmp/corpus_psb -max_total_time=300
+```
+
+`tests/fuzz/asan_defaults.cpp` 把 ASan 默认选项导出（必须 dllexport：ASan 运行时
+是按导出表找 `__asan_default_options` 的），其中 `detect_container_overflow=0`
+是因为 libFuzzer 自己枚举语料时会被 libc++ 容器注解误报，跟被测代码无关。
+
+非 Clang 构建下同一个可执行文件退化成自带暴力变异循环（可选给一个语料目录当种子）：
+
+```sh
+OA_FUZZ_ITERS=200000 OA_FUZZ_SEED=1 ./oa_fuzz_psb /path/to/corpus
+```
+
+| env | 含义 |
+| --- | --- |
+| `OA_FUZZ_ITERS` | 暴力模式迭代次数（默认 20000） |
+| `OA_FUZZ_SEED` | 变异种子（默认固定，便于复现） |
+| `OA_FUZZ_MAX_INPUT` | 单个输入上限字节数（默认 256 KiB） |
+| `OA_FUZZ_DUMP` | 最后一个输入的落盘路径（默认 `oa_fuzz_last.bin`），崩了用它复现 |
+
+### 暴力驱动（真包猴子）
+
+`oa_monkey` 把真包塞进 `GameRuntime`，随机点击/右键/按键/移动一直 tick；加
+`--render` 还会建一个隐藏窗口每帧真渲染（视频纹理上传、组离屏合成只有在真渲染
+时才跑得到）。每帧的输入先写进 trace，ASan 报错时 trace 最后一行就是复现序列。
+
+```sh
+./build/mingw-asan/tests/fuzz/oa_monkey /path/to/root.pfs \
+    --frames 5000 --seed 7 --render --trace /tmp/monkey.trace
+```
+
+| 参数 | 含义 |
+| --- | --- |
+| `--frames N` | 走多少帧（默认 3000） |
+| `--seed S` | 随机种子（默认固定） |
+| `--render` | 每帧真渲染（隐藏窗口） |
+| `--trace FILE` | 输入序列落盘（默认 `oa_monkey.trace`） |
+
+脚本错误（剧本/资源缺失）在暴力输入下属预期，猴子会记账继续跑；只有 ASan 报告、
+断言或信号才算发现。
+
+### 跑一夜
+
+```sh
+bash script/nightly-fuzz.sh build/mingw-asan 7 20   # 构建目录 小时数 每目标切片分钟
+```
+
+按切片轮转 6 个输入面 + 两个真包猴子，语料跨轮累积，崩溃样本落在
+`<build>/nightly/artifacts/`，进度一行一条写在 `<build>/nightly/summary.txt`。
+Windows 上等价入口是 `script/nightly-fuzz.ps1`（同样的产物布局）。
