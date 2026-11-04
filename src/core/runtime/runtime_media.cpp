@@ -258,9 +258,12 @@ void GameRuntime::RuntimeState::advance_media_frame(uint64_t delta_ms) {
             if (!pending_host_tex_.empty()) take.swap(pending_host_tex_);
         }
         if (!take.empty()) {
-            for (auto& [id, tex] : take)
-                renderer_.scene().set_host_texture(id, std::move(tex),
-                                                   tex->width(), tex->height());
+            for (auto& [id, tex] : take) {
+                if (!tex) continue;
+                const int w = tex->width();
+                const int h = tex->height();
+                renderer_.scene().set_host_texture(id, std::move(tex), w, h);
+            }
             renderer_.request_repaint(); // 像素更新：本帧重绘（不重建计划）
         }
     }
