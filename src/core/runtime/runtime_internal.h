@@ -367,12 +367,14 @@ struct GameRuntime::RuntimeState {
     };
     PointerConsumption process_pointer_input(const oa::runtime::FrameInput& in);
     /// Run one registered row through filter + calllua; true = handled.
-    bool dispatch_layer_row(const std::string& id, const oa::render::LayerEventHandler& row,
+    /// row 按值传：下面的 Lua 回调可以重新注册/删除 handler，寄存器里的
+    /// 那一行随时会失效（fuzz 抓到的 heap-use-after-free）。
+    bool dispatch_layer_row(const std::string& id, oa::render::LayerEventHandler row,
                             const std::string& event_type,
                             const std::vector<std::pair<std::string, std::string>>& runtime_params,
                             PointerDispatch::Kind kind);
     bool dispatch_input_row(const std::string& filter_name,
-                            const oa::render::InputHandler& row,
+                            oa::render::InputHandler row,
                             const std::vector<std::pair<std::string, std::string>>& runtime_params,
                             PointerDispatch::Kind kind);
     /// drag begin/continue/finish.

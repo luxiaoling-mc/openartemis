@@ -2642,6 +2642,16 @@ ExecutionResult Interpreter::run() {
                 continue;
             }
             case TagOutcomeKind::Call: {
+                // 没有目标的 [call]（多半是脚本被截断：`[call` 后没闭合）不能
+                // 当成"跳回文件开头"——那会把同一段再跑一遍并压栈，一帧之内无限
+                // 递归（fuzz：126 行的坏剧本单次 tick 跑 39 秒）。深度上限是
+                // 递归调用的兜底（A→B→A 这类环同样会挂）。
+                if (outcome.label.empty() && outcome.file.empty()) {
+                    throw ScriptError("label", "call: missing label", ins.line);
+                }
+                if (call_stack_.size() >= 512) {
+                    throw ScriptError("call", "call: stack too deep (512)", ins.line);
+                }
                 call_stack_.push_back(CallFrame{outcome.return_script, outcome.return_line});
                 const std::string target_script = outcome.file.empty() ? *current_script_name_
                                                                        : outcome.file;
@@ -3390,6 +3400,12 @@ std::optional<ExecutionResult> Interpreter::flush_tag_queue() {
             }
             case TagOutcomeKind::Call: {
                 queued_saw_call_ = true;
+                if (outcome.label.empty() && outcome.file.empty()) {
+                    throw ScriptError("label", "call: missing label", 0);
+                }
+                if (call_stack_.size() >= 512) {
+                    throw ScriptError("call", "call: stack too deep (512)", 0);
+                }
                 // queued call: return_line = current_line (do NOT add 1)
                 const size_t pinned = call_stack_.size();
                 call_stack_.push_back(CallFrame{*current_script_name_, current_line_});

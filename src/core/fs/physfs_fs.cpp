@@ -150,28 +150,74 @@ ParsedArchive parse_index(Reader& src) {
 // Multi-file container over real volume files (volume concatenation)
 // ---------------------------------------------------------------------------
 
+// 64 位文件句柄。不用 std::ifstream：libc++ 的 filebuf 在 Windows 上走 32 位
+// fseek，>2GB 的包（现实里就有 2.1GB 的）tellg() 直接返回 -1，于是整包被判成
+// "empty PFS volume"，读也读不动。这里统一用 _fseeki64 / fseeko。
+class VolumeHandle {
+public:
+    explicit VolumeHandle(const std::string& path) : path_(path) {
+#if defined(_WIN32)
+        f_ = _wfopen(std::filesystem::path(path).wstring().c_str(), L"rb");
+#else
+        f_ = std::fopen(path.c_str(), "rb");
+#endif
+        if (!f_) throw std::runtime_error("cannot open PFS volume: " + path);
+        if (seek(0, SEEK_END) != 0)
+            throw std::runtime_error("cannot seek PFS volume: " + path);
+        const int64_t end = tell();
+        if (end <= 0) throw std::runtime_error("empty PFS volume: " + path);
+        size_ = uint64_t(end);
+    }
+    ~VolumeHandle() {
+        if (f_) std::fclose(f_);
+    }
+    VolumeHandle(const VolumeHandle&) = delete;
+    VolumeHandle& operator=(const VolumeHandle&) = delete;
+
+    uint64_t size() const { return size_; }
+
+    void read_at(uint64_t pos, void* buf, size_t len) const {
+        if (seek(int64_t(pos), SEEK_SET) != 0)
+            throw std::runtime_error("seek failed in PFS volume " + path_);
+        if (std::fread(buf, 1, len, f_) != len)
+            throw std::runtime_error("short read from PFS volume " + path_);
+    }
+
+private:
+    int seek(int64_t off, int whence) const {
+#if defined(_WIN32)
+        return _fseeki64(f_, off, whence);
+#else
+        return fseeko(f_, off_t(off), whence);
+#endif
+    }
+    int64_t tell() const {
+#if defined(_WIN32)
+        return _ftelli64(f_);
+#else
+        return int64_t(ftello(f_));
+#endif
+    }
+
+    std::string path_;
+    std::FILE* f_ = nullptr;
+    uint64_t size_ = 0;
+};
+
 class FileSet {
 public:
     explicit FileSet(std::vector<std::string> paths) {
         for (auto& p : paths) {
-            auto f = std::make_unique<std::ifstream>(p, std::ios::binary);
-            if (!*f) throw std::runtime_error("cannot open PFS volume: " + p);
-            f->seekg(0, std::ios::end);
-            const auto end = f->tellg();
-            if (end <= 0) throw std::runtime_error("empty PFS volume: " + p);
-            specs_.push_back(VolumeFile{p, uint64_t(end)});
-            streams_.push_back(std::move(f));
+            auto f = std::make_unique<VolumeHandle>(p);
+            specs_.push_back(VolumeFile{p, f->size()});
+            handles_.push_back(std::move(f));
         }
     }
 
     /// Independent handles to the same volume set (PHYSFS_Io duplication /
     /// per-open-file isolation). One FileSet must never serve two streams.
     FileSet(const FileSet& other) : specs_(other.specs_) {
-        for (const auto& v : specs_) {
-            auto f = std::make_unique<std::ifstream>(v.path, std::ios::binary);
-            if (!*f) throw std::runtime_error("cannot open PFS volume: " + v.path);
-            streams_.push_back(std::move(f));
-        }
+        for (const auto& v : specs_) handles_.push_back(std::make_unique<VolumeHandle>(v.path));
     }
 
     uint64_t total_size() const {
@@ -190,11 +236,7 @@ public:
             }
             const size_t avail = size_t(specs_[i].size - global);
             const size_t take = std::min(len, avail);
-            streams_[i]->seekg(std::streamoff(global));
-            streams_[i]->read(reinterpret_cast<char*>(out), std::streamsize(take));
-            if (size_t(streams_[i]->gcount()) != take) {
-                throw std::runtime_error("short read from PFS volume " + specs_[i].path);
-            }
+            handles_[i]->read_at(global, out, take);
             out += take;
             len -= take;
             global = 0;
@@ -209,7 +251,7 @@ private:
         uint64_t size = 0;
     };
     std::vector<VolumeFile> specs_;
-    std::vector<std::unique_ptr<std::ifstream>> streams_;
+    std::vector<std::unique_ptr<VolumeHandle>> handles_;
 };
 
 // ---------------------------------------------------------------------------

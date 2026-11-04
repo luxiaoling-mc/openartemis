@@ -183,6 +183,10 @@ bool PsbReader::load(const uint8_t* data, size_t size, std::string* err) {
             std::string rev;
             while (cur != 0) {
                 if (cur >= names_data.size()) return fail("psb: name trie oob");
+                // 名字是沿 names_data 回溯出来的；节点指回自己/成环时这个循环
+                // 永远走不到 0，rev 会一路 push_back 吃光内存（fuzz 抓到的
+                // OOM：46KB 输入涨到 742MB）。链长不可能超过表本身。
+                if (rev.size() >= names_data.size()) return fail("psb: name trie cycle");
                 uint32_t code = names_data[cur];
                 if (code >= charset.size()) return fail("psb: charset index oob");
                 uint32_t byte = cur - charset[code];
@@ -245,6 +249,10 @@ bool PsbReader::parse_array_head(uint32_t off, int* count_width, int* count,
     const int ew = wm - 0x0C;
     const uint32_t ent = off + 1 + cw + 1;
     if (uint64_t(ent) + uint64_t(cnt) * ew > data_.size()) return false;
+    // entry_width 可以为 0（标记 0x0C），此时上面的乘法恒成立 —— 光靠它拦不住
+    // 一个天文数字的 cnt 被 assign/reserve 直接吃光内存（fuzz 抓到的 OOM：
+    // 46KB 的 psb 让进程吃到 4GB）。条目数不可能超过它之后还剩的字节数。
+    if (uint64_t(cnt) > uint64_t(data_.size() - ent)) return false;
     *count_width = cw;
     *count = int(cnt);
     *entry_width = ew;

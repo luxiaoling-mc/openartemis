@@ -2098,7 +2098,7 @@ void GameRuntime::RuntimeState::notify_pointer(const PointerDispatch& d) {
 }
 
 bool GameRuntime::RuntimeState::dispatch_layer_row(
-    const std::string& id, const oa::render::LayerEventHandler& row,
+    const std::string& id, oa::render::LayerEventHandler row,
     const std::string& event_type,
     const std::vector<std::pair<std::string, std::string>>& runtime_params,
     PointerDispatch::Kind kind) {
@@ -2169,7 +2169,7 @@ bool GameRuntime::RuntimeState::dispatch_layer_row(
 }
 
 bool GameRuntime::RuntimeState::dispatch_input_row(
-    const std::string& filter_name, const oa::render::InputHandler& row,
+    const std::string& filter_name, oa::render::InputHandler row,
     const std::vector<std::pair<std::string, std::string>>& runtime_params,
     PointerDispatch::Kind kind) {
     const auto verdict = interpreter_->lua_bridge().run_event_filter(filter_name, row.filter_params);

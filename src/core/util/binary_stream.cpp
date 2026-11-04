@@ -390,12 +390,12 @@ void Reader::skip_at(size_t depth) {
         case kTagStr8: case kTagRaw8: ++pos_; skip_len(u8()); return;
         case kTagStr16: case kTagRaw16: ++pos_; skip_len(u16()); return;
         case kTagStr32: case kTagRaw32: ++pos_; skip_len(u32()); return;
-        case kTagFloat32: need(4); pos_ += 5; return;
-        case kTagFloat64: need(8); pos_ += 9; return;
-        case kTagU8: case kTagI8: need(1); pos_ += 2; return;
-        case kTagU16: case kTagI16: need(2); pos_ += 3; return;
-        case kTagU32: case kTagI32: need(4); pos_ += 5; return;
-        case kTagU64: case kTagI64: need(8); pos_ += 9; return;
+        case kTagFloat32: need(5); pos_ += 5; return;
+        case kTagFloat64: need(9); pos_ += 9; return;
+        case kTagU8: case kTagI8: need(2); pos_ += 2; return;
+        case kTagU16: case kTagI16: need(3); pos_ += 3; return;
+        case kTagU32: case kTagI32: need(5); pos_ += 5; return;
+        case kTagU64: case kTagI64: need(9); pos_ += 9; return;
         default: throw FormatError("unknown tag in document");
     }
 }
