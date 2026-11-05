@@ -24,6 +24,17 @@
 
 #include "core/fs/physfs_fs.h"
 #include "core/runtime/runtime_game.h"
+#include "host_input.h"
+
+namespace {
+const char* wait_name(const oa::runtime::Wait* w) {
+    if (!w) return "-";
+    if (w->waiting_click()) return "click";
+    if (w->is_park()) return "stop";
+    if (w->timed()) return "timed";
+    return "other";
+}
+} // namespace
 
 namespace {
 int failures = 0;
@@ -33,11 +44,10 @@ void check(bool cond, const char* what) {
         ++failures;
     }
 }
-bool is_clickable_wait(const oa::runtime::WaitReason* w) {
-    using K = oa::runtime::WaitReason::Kind;
+bool is_clickable_wait(const oa::runtime::Wait* w) {
     if (!w) return false;
-    return w->kind == K::Generic || w->kind == K::Generic0 ||
-           w->kind == K::Timed || w->kind == K::Se || w->kind == K::KeyWait;
+    return w->waiting_click() || w->timed() ||
+           w->stage == oa::runtime::Wait::Stage::Se || !w->keys.empty();
 }
 } // namespace
 
@@ -60,65 +70,23 @@ int main() {
             if (f && *f == "title_init") title = true;
         };
         for (size_t f = 0; f < 20000 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             if (!title) continue;
             const auto* w = rt.current_wait();
-            if (w && w->kind == oa::runtime::WaitReason::Kind::Stop &&
-                w->id.empty())
+            if (w && w->is_park() &&
+                w->stage_id.empty())
                 break;
         }
-        {
-            oa::runtime::FrameInput in;
-            const int cands[][2] = {{140, 136}, {80, 124}, {200, 150}};
-            for (int ci = 0; ci < 3 && rt.scene().find("500"); ++ci) {
-                in.left_click_edge = true;
-                in.left_down = true;
-                in.mouse_x = cands[ci][0];
-                in.mouse_y = cands[ci][1];
-                for (size_t f = 0; f < 600 && !rt.exit_requested(); ++f) {
-                    rt.tick(16, in);
-                    in.left_click_edge = false;
-                    in.left_down = false;
-                    in.mouse_x = -1;
-                    in.mouse_y = -1;
-                    if (rt.scene().find("500") == nullptr) break;
-                }
-            }
-        }
-        auto parked = [&]() {
-            if (rt.transition().is_in_progress(rt.now_ms())) return false;
-            const auto* w = rt.current_wait();
-            if (!is_clickable_wait(w)) return false;
-            // full reveal (mirror the windowed driver's ad_story_parked)
-            const oa::render::MessageLayer* ml =
-                rt.text().layer("1.80.mw.adv_adv");
-            return ml && ml->reveal_index >= ml->char_count &&
-                   !ml->reveal_pending;
-        };
-        // walk ~10 story pages so the log spans a backlog page
+        // 像玩家一样：标题点「开始」→ 回到剧情页 → 正常读几页。
+        if (const auto p = oa::test::row_click_point(rt, "bt_start"))
+            oa::test::click_at(rt, p->first, p->second);
+        check(oa::test::ensure_story(rt), "story page reached");
         int turns = 0;
-        bool click_armed = false;
-        for (size_t f = 0; f < 60000 && !rt.exit_requested() && turns < 10;
-             ++f) {
-            if (click_armed) {
-                rt.tick(16, idle);
-                click_armed = false;
-                continue;
-            }
-            if (!parked()) {
-                rt.tick(16, idle);
-                continue;
-            }
-            oa::runtime::FrameInput cl;
-            cl.left_click_edge = true;
-            cl.left_down = true;
-            cl.mouse_x = 640;
-            cl.mouse_y = 600;
-            rt.tick(16, cl);
-            click_armed = true;
-            ++turns;
-        }
-        for (size_t f = 0; f < 300; ++f) rt.tick(16, idle); // settle (windowed parity)
+        for (int i = 0; i < 12; ++i)
+            if (oa::test::advance_page(rt)) ++turns;
+        check(turns >= 3, "read a few story pages before the backlog");
+        check(oa::test::ensure_story(rt), "story page parked before F8");
+        for (size_t f = 0; f < 300; ++f) oa::test::frame(rt); // settle (windowed parity)
         {
             const oa::render::MessageLayer* ml =
                 rt.text().layer("1.80.mw.adv_adv");
@@ -132,13 +100,9 @@ int main() {
             std::printf("[r10b] before F8: story='%s' layers=%zu\n",
                         s0.c_str(), rt.scene().size());
         }
-        // F8 opens the backlog
-        {
-            oa::runtime::FrameInput k;
-            k.key_down_edges = {119};
-            k.keys_down.insert(119);
-            for (size_t f = 0; f < 60; ++f) rt.tick(16, f == 0 ? k : idle);
-        }
+        // F8 opens the backlog（真实按住，只给一帧边沿会被数据侧当抖动）
+        oa::test::hold_key(rt, 119);
+        for (size_t f = 0; f < 56; ++f) oa::test::frame(rt);
         {
             size_t blogs = 0;
             for (const oa::render::Layer* l : rt.scene().draw_order())
@@ -149,7 +113,7 @@ int main() {
         }
         bool up = false;
         for (size_t f = 0; f < 12000 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             if (f == 120 || f == 600) {
                 const oa::render::MessageLayer* ml =
                     rt.text().layer("500.z.bt.tx.1.1");
@@ -162,10 +126,10 @@ int main() {
                         pageup = true;
                 }
                 const auto* w = rt.current_wait();
-                std::printf("[r10b] f8wait f=%zu layers=%zu wait=%d tx11=%s "
+                std::printf("[r10b] f8wait f=%zu layers=%zu wait=%s tx11=%s "
                             "pageup=%d\n",
                             f, rt.scene().size(),
-                            w ? (int)w->kind : -1,
+                            wait_name(w),
                             ml ? (ml->page.empty() ? "empty" : "filled") : "absent",
                             pageup ? 1 : 0);
             }
@@ -182,7 +146,7 @@ int main() {
                         failures);
             return failures ? 1 : 0;
         }
-        for (size_t f = 0; f < 300; ++f) rt.tick(16, idle); // settle
+        for (size_t f = 0; f < 300; ++f) oa::test::frame(rt); // settle
         // rows: every filled row text layer (.1) must be BOUND to a live
         // scene node (the e8411fa regression deleted those nodes), and the
         // sub row (.2) must still carry its slot when the layer exists.

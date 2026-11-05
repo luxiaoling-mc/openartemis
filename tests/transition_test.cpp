@@ -10,6 +10,7 @@
 
 #include "core/fs/fs.h"
 #include "core/runtime/runtime_game.h"
+#include "fpm/host_input.h"
 #include "core/render/layer.h"
 // research/111: anim（Easing/Tween/TweenDone）与 transition（Transition）收为
 // render 内部面；本测试是这两个语义机的直接使用者，故 include 内部头
@@ -395,24 +396,16 @@ void test_runtime_trans_wait() {
     rt.open_project("windows");
     rt.boot_project();
     oa::runtime::FrameInput idle;
-    // First tick: the interpreter runs up to [trans] and parks.
-    rt.tick(16, idle);
+    // First tick: the interpreter runs up to [trans] and parks. The host
+    // pipeline closes the frame itself (finish_frame -> renderer.process_event),
+    // so the transition is already running — no manual event replay.
+    oa::test::frame(rt);
     {
-        const oa::runtime::WaitReason* w = rt.current_wait();
+        const oa::runtime::Wait* w = rt.current_wait();
         check(w != nullptr, "trans parks the interpreter");
-        check(w && w->kind == oa::runtime::WaitReason::Kind::Stop && w->id == "trans",
+        check(w && w->stage == oa::runtime::Wait::Stage::Trans,
               "trans wait is Stop{reason:trans}");
     }
-    // Host applies the drained Trans event (dispatch order), starting the
-    // transition at the current clock.
-    bool applied = false;
-    for (const auto& e : rt.drain_events()) {
-        if (e.kind == oa::runtime::Event::Kind::Trans) {
-            rt.transition_begin(e.params);
-            applied = true;
-        }
-    }
-    check(applied, "a Trans event was emitted");
     check(rt.transition().is_in_progress(rt.now_ms()), "transition in progress");
 
     // The wait must survive several ticks while the transition runs.
@@ -420,11 +413,11 @@ void test_runtime_trans_wait() {
     int released_at = -1;
     for (int i = 0; i < 40; ++i) {
         const bool was_trans_wait = rt.current_wait() &&
-                                    rt.current_wait()->id == "trans";
-        rt.tick(16, idle);
+                                    rt.current_wait()->stage == oa::runtime::Wait::Stage::Trans;
+        oa::test::frame(rt);
         (void)rt.drain_events();
         if (was_trans_wait && rt.waiting_stop() &&
-            rt.current_wait() && rt.current_wait()->id == "trans")
+            rt.current_wait() && rt.current_wait()->stage == oa::runtime::Wait::Stage::Trans)
             ++held;
         if (was_trans_wait && !rt.current_wait()) {
             released_at = i;
@@ -434,10 +427,10 @@ void test_runtime_trans_wait() {
     check(held >= 3, "trans wait held for several ticks");
     check(released_at >= 0, "trans wait released by elapsed duration");
     // next tick executes [stop] -> plain stop park (no reason)
-    rt.tick(16, idle);
+    oa::test::frame(rt);
     (void)rt.drain_events();
-    const oa::runtime::WaitReason* w = rt.current_wait();
-    check(w && w->kind == oa::runtime::WaitReason::Kind::Stop && w->id.empty(),
+    const oa::runtime::Wait* w = rt.current_wait();
+    check(w && w->is_park() && w->stage_id.empty(),
           "plain [stop] parks after the trans wait");
 }
 
@@ -454,17 +447,16 @@ void test_runtime_trans_input_skip() {
     rt.open_project("windows");
     rt.boot_project();
     oa::runtime::FrameInput idle;
-    rt.tick(16, idle);
+    oa::test::frame(rt);
     for (const auto& e : rt.drain_events())
         if (e.kind == oa::runtime::Event::Kind::Trans) rt.transition_begin(e.params);
     check(rt.transition().is_in_progress(rt.now_ms()), "long transition running");
 
     oa::runtime::FrameInput click;
     click.left_click_edge = true;
-    rt.tick(16, click);
-    const oa::runtime::WaitReason* w = rt.current_wait();
-    check(w == nullptr || !(w->kind == oa::runtime::WaitReason::Kind::Stop &&
-                            w->id == "trans"),
+    oa::test::replay(rt, click);
+    const oa::runtime::Wait* w = rt.current_wait();
+    check(w == nullptr || w->stage != oa::runtime::Wait::Stage::Trans,
           "click skipped the trans wait (input=1)");
     check(!rt.transition().active(), "click cleared the transition state");
 }

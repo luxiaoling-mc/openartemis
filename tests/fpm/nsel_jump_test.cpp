@@ -43,6 +43,7 @@
 
 #include "core/fs/physfs_fs.h"
 #include "core/runtime/runtime_game.h"
+#include "host_input.h"
 #include "core/runtime/runtime_save.h"
 
 namespace {
@@ -58,31 +59,34 @@ void check(bool cond, const char* fmt, ...) {
         ++failures;
     }
 }
-const char* ws(const oa::runtime::WaitReason* w) {
-    using K = oa::runtime::WaitReason::Kind;
+const char* ws(const oa::runtime::Wait* w) {
     if (!w) return "none";
-    switch (w->kind) {
-        case K::Generic: return "generic";
-        case K::Generic0: return "wt0";
-        case K::Timed: return "timed";
-        case K::Stop: return "stop";
-        case K::Se: return "se";
-        case K::VideoLayer: return "video";
-        case K::ScenarioTween: return "stween";
-        case K::KeyWait: return "key";
+    using S = oa::runtime::Wait::Stage;
+    switch (w->stage) {
+        case S::Trans: return "trans";
+        case S::Video: return "video";
+        case S::VideoLayer: return "video-layer";
+        case S::Se: return "se";
+        case S::AllDelete: return "alldelete";
+        case S::Tween: return "tween";
+        case S::None: break;
     }
-    return "?";
+    if (w->timed()) return "timed";
+    if (w->on_reveal_done) return "reveal";
+    if (w->reveal_clear) return "reveal-clear";
+    if (!w->keys.empty()) return "key";
+    if (w->waiting_click()) return "click";
+    return "park";
 }
-bool is_clickable_wait(const oa::runtime::WaitReason* w) {
-    using K = oa::runtime::WaitReason::Kind;
+bool is_clickable_wait(const oa::runtime::Wait* w) {
     if (!w) return false;
-    return w->kind == K::Generic || w->kind == K::Generic0 ||
-           w->kind == K::Timed || w->kind == K::Se || w->kind == K::KeyWait;
+    return w->waiting_click() || w->timed() ||
+           w->stage == oa::runtime::Wait::Stage::Se || !w->keys.empty();
 }
-bool is_story_wait(const oa::runtime::WaitReason* w) {
-    return w && (w->kind == oa::runtime::WaitReason::Kind::Generic ||
-                 w->kind == oa::runtime::WaitReason::Kind::Generic0 ||
-                 w->kind == oa::runtime::WaitReason::Kind::Timed);
+bool is_story_wait(const oa::runtime::Wait* w) {
+    return w && (w->waiting_click() ||
+                 w->waiting_click() ||
+                 w->timed());
 }
 std::string sample(oa::runtime::GameRuntime& rt) {
     const oa::render::MessageLayer* ml = rt.text().layer("1.80.mw.adv_adv");
@@ -124,9 +128,9 @@ struct Boot {
 };
 bool reach_title(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idle) {
     for (size_t f = 0; f < 20000 && !rt.exit_requested(); ++f) {
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         const auto* w = rt.current_wait();
-        if (!(w && w->kind == oa::runtime::WaitReason::Kind::Stop && w->id.empty()))
+        if (!(w && w->is_park() && w->stage_id.empty()))
             continue;
         for (const oa::render::Layer* l : rt.scene().draw_order()) {
             const auto* h = rt.scene().find_event_handler(l->id, "click");
@@ -146,7 +150,7 @@ void start_game(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idle) {
         in.mouse_x = cands[ci][0];
         in.mouse_y = cands[ci][1];
         for (size_t f = 0; f < 600 && !rt.exit_requested(); ++f) {
-            rt.tick(16, in);
+            oa::test::replay(rt, in);
             in.left_click_edge = false;
             in.left_down = false;
             in.mouse_x = -1;
@@ -158,7 +162,7 @@ void start_game(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idle) {
 bool park_story(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idle,
                 size_t budget = 4000) {
     for (size_t f = 0; f < budget && !rt.exit_requested(); ++f) {
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         if (rt.transition().is_in_progress(rt.now_ms())) continue;
         const auto* w = rt.current_wait();
         if (is_clickable_wait(w) && reveal_done(rt)) return true;
@@ -171,21 +175,21 @@ void hover_click(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idle, in
     oa::runtime::FrameInput mv;
     mv.mouse_x = x;
     mv.mouse_y = y;
-    for (size_t f = 0; f < 30; ++f) rt.tick(16, mv);
+    for (size_t f = 0; f < 30; ++f) oa::test::replay(rt, mv);
     oa::runtime::FrameInput cl;
     cl.mouse_x = x;
     cl.mouse_y = y;
     cl.left_click_edge = true;
     cl.left_down = true;
-    rt.tick(16, cl);
+    oa::test::replay(rt, cl);
     oa::runtime::FrameInput hold;
     hold.mouse_x = x;
     hold.mouse_y = y;
-    for (size_t f = 0; f < after && !rt.exit_requested(); ++f) rt.tick(16, hold);
+    for (size_t f = 0; f < after && !rt.exit_requested(); ++f) oa::test::replay(rt, hold);
     oa::runtime::FrameInput out;
     out.mouse_x = -1;
     out.mouse_y = -1;
-    for (size_t f = 0; f < 20 && !rt.exit_requested(); ++f) rt.tick(16, out);
+    for (size_t f = 0; f < 20 && !rt.exit_requested(); ++f) oa::test::replay(rt, out);
 }
 /// World center of the layer whose click row carries `key`.
 bool row_center(oa::runtime::GameRuntime& rt, const std::string& key, int* x, int* y) {
@@ -222,7 +226,7 @@ bool dlg_visible(oa::runtime::GameRuntime& rt) {
 bool confirm_dialog(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idle) {
     size_t held = 0;
     for (size_t f = 0; f < 6000 && !rt.exit_requested(); ++f) {
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         const auto* w = rt.current_wait();
         if (w && dlg_visible(rt)) {
             if (++held > 120) break;
@@ -236,14 +240,14 @@ bool confirm_dialog(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idle)
     en.keys_down.insert(13);
     for (size_t f = 0; f < 60 && !rt.exit_requested(); ++f) rt.tick(16, f == 0 ? en : idle);
     for (size_t f = 0; f < 2000 && !rt.exit_requested(); ++f) {
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         if (!dlg_visible(rt)) return true;
     }
     // fallback: click the yes row
     return click_key(rt, "bt_yes") &&
            [&] {
                for (size_t f = 0; f < 2000 && !rt.exit_requested(); ++f) {
-                   rt.tick(16, idle);
+                   oa::test::frame(rt);
                    if (!dlg_visible(rt)) return true;
                }
                return false;
@@ -310,7 +314,7 @@ int main() {
     start_game(rt, idle);
     bool body = false;
     for (size_t f = 0; f < 12000 && !rt.exit_requested(); ++f) {
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         if (rt.text().page_has_visible_text("1.80.mw.adv_adv")) {
             body = true;
             break;
@@ -327,11 +331,11 @@ int main() {
         cl.left_down = true;
         cl.mouse_x = 640;
         cl.mouse_y = 600;
-        rt.tick(16, cl);
+        oa::test::replay(rt, cl);
         ++clicks;
         bool settled = false;
         for (size_t f = 0; f < 2500 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             const std::string now = sample(rt);
             if (now != last) {
                 last = now;
@@ -368,7 +372,7 @@ int main() {
             std::fprintf(stderr, "[nsel] messkip set failed: %s\n", ex.what());
         }
         check(ok, "NSE-2 messkip toggle issued");
-        for (size_t f = 0; f < 120 && !rt.exit_requested(); ++f) rt.tick(16, idle);
+        for (size_t f = 0; f < 120 && !rt.exit_requested(); ++f) oa::test::frame(rt);
     }
     // ---- NSE-3: dock bt_nsel (list_*_ja.tbl mw.bt.dc.1.5, exec=adv_selnext) ----
     int bx = 0, by = 0;
@@ -403,7 +407,7 @@ int main() {
     size_t mask_frames = 0;      // frames the mask was up (black-screen width)
     std::vector<SelectOpt> opts;
     for (size_t f = 0; f < 60000 && !rt.exit_requested() && !opts_seen; ++f) {
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         if (chapter != ch_before) ch_moved = true;
         if (mask_layer(rt)) {
             mask_seen = true;
@@ -433,10 +437,10 @@ int main() {
         cl.left_down = true;
         cl.mouse_x = 640;
         cl.mouse_y = 600;
-        rt.tick(16, cl);
+        oa::test::replay(rt, cl);
         ++land_clicks;
         for (size_t f = 0; f < 4000 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             if (chapter != ch_before) ch_moved = true;
             if (mask_layer(rt)) mask_seen = true;
             if (find_select_opts(rt, &opts)) {
@@ -501,7 +505,7 @@ int main() {
         for (size_t f = 0; f < 80 && !rt.exit_requested(); ++f) rt.tick(16, f == 0 ? cl : idle);
         bool resolved = false;
         for (size_t f = 0; f < 8000 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             std::vector<SelectOpt> chk;
             if (!find_select_opts(rt, &chk)) {
                 resolved = true;
@@ -519,9 +523,9 @@ int main() {
             c2.left_down = true;
             c2.mouse_x = 640;
             c2.mouse_y = 600;
-            rt.tick(16, c2);
+            oa::test::replay(rt, c2);
             for (size_t f = 0; f < 2500 && !rt.exit_requested(); ++f) {
-                rt.tick(16, idle);
+                oa::test::frame(rt);
                 if (sample(rt) != s0 || is_story_wait(rt.current_wait())) {
                     adv = true;
                     break;

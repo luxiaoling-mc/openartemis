@@ -28,6 +28,7 @@
 
 #include "core/fs/physfs_fs.h"
 #include "core/runtime/runtime_game.h"
+#include "host_input.h"
 
 namespace {
 int failures = 0;
@@ -37,11 +38,10 @@ void check(bool cond, const char* what) {
         ++failures;
     }
 }
-bool is_clickable_wait(const oa::runtime::WaitReason* w) {
-    using K = oa::runtime::WaitReason::Kind;
+bool is_clickable_wait(const oa::runtime::Wait* w) {
     if (!w) return false;
-    return w->kind == K::Generic || w->kind == K::Generic0 ||
-           w->kind == K::Timed || w->kind == K::Se || w->kind == K::KeyWait;
+    return w->waiting_click() || w->timed() ||
+           w->stage == oa::runtime::Wait::Stage::Se || !w->keys.empty();
 }
 struct Target {
     std::string key;
@@ -69,11 +69,11 @@ int main() {
             if (f && *f == "title_init") title = true;
         };
         for (size_t f = 0; f < 20000 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             if (!title) continue;
             const auto* w = rt.current_wait();
-            if (w && w->kind == oa::runtime::WaitReason::Kind::Stop &&
-                w->id.empty())
+            if (w && w->is_park() &&
+                w->stage_id.empty())
                 break;
         }
         {
@@ -85,7 +85,7 @@ int main() {
                 in.mouse_x = cands[ci][0];
                 in.mouse_y = cands[ci][1];
                 for (size_t f = 0; f < 600 && !rt.exit_requested(); ++f) {
-                    rt.tick(16, in);
+                    oa::test::replay(rt, in);
                     in.left_click_edge = false;
                     in.left_down = false;
                     in.mouse_x = -1;
@@ -96,7 +96,7 @@ int main() {
         }
         bool body = false;
         for (size_t f = 0; f < 8000 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             if (rt.text().page_has_visible_text("1.80.mw.adv_adv")) {
                 body = true;
                 break;
@@ -105,7 +105,7 @@ int main() {
         check(body, "story body parked");
         auto park = [&](size_t budget) {
             for (size_t f = 0; f < budget && !rt.exit_requested(); ++f) {
-                rt.tick(16, idle);
+                oa::test::frame(rt);
                 if (rt.transition().is_in_progress(rt.now_ms())) continue;
                 const auto* w = rt.current_wait();
                 if (is_clickable_wait(w)) return true;
@@ -119,12 +119,12 @@ int main() {
             cl.left_down = true;
             cl.mouse_x = 640;
             cl.mouse_y = 600;
-            rt.tick(16, cl);
+            oa::test::replay(rt, cl);
             for (size_t f = 0; f < 2000 && !rt.exit_requested(); ++f) {
-                rt.tick(16, idle);
+                oa::test::frame(rt);
                 const auto* w = rt.current_wait();
-                if (w && (w->kind == oa::runtime::WaitReason::Kind::Generic ||
-                          w->kind == oa::runtime::WaitReason::Kind::Generic0))
+                if (w && (w->waiting_click() ||
+                          w->waiting_click()))
                     break;
             }
         }
@@ -161,7 +161,7 @@ int main() {
         };
         bool open = false;
         for (size_t f = 0; f < 9000 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             if (rt.scene().size() > 150 && has_key("bt_exit")) {
                 open = true;
                 break;
@@ -169,7 +169,7 @@ int main() {
         }
         check(open, "config screen open");
         if (!open) return failures ? 1 : 0;
-        for (size_t f = 0; f < 400; ++f) rt.tick(16, idle);
+        for (size_t f = 0; f < 400; ++f) oa::test::frame(rt);
         // enumerate click targets
         std::vector<Target> targets;
         std::vector<std::string> seen;
@@ -205,7 +205,7 @@ int main() {
                 oa::runtime::FrameInput mv;
                 mv.mouse_x = targets[i].cx;
                 mv.mouse_y = targets[i].cy;
-                rt.tick(16, mv);
+                oa::test::replay(rt, mv);
             }
             const oa::render::MessageLayer* ml = rt.text().layer("500.z.help");
             if (ml && !ml->page.empty()) helpful.push_back((int)i);
@@ -223,7 +223,7 @@ int main() {
             oa::runtime::FrameInput mv;
             mv.mouse_x = t.cx;
             mv.mouse_y = t.cy;
-            rt.tick(16, mv);
+            oa::test::replay(rt, mv);
         }
         // settle: one more hover, then read the resting node top
         std::printf("[r10v] metrics help=%d wrong=%d last_active='%s'\n",

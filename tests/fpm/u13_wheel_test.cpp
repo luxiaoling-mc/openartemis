@@ -15,6 +15,7 @@
 
 #include "core/fs/physfs_fs.h"
 #include "core/runtime/runtime_game.h"
+#include "host_input.h"
 
 namespace {
 int failures = 0;
@@ -29,26 +30,29 @@ void check(bool cond, const char* fmt, ...) {
         ++failures;
     }
 }
-const char* ws(const oa::runtime::WaitReason* w) {
-    using K = oa::runtime::WaitReason::Kind;
+const char* ws(const oa::runtime::Wait* w) {
     if (!w) return "none";
-    switch (w->kind) {
-        case K::Generic: return "generic";
-        case K::Generic0: return "wt0";
-        case K::Timed: return "timed";
-        case K::Stop: return "stop";
-        case K::Se: return "se";
-        case K::VideoLayer: return "video";
-        case K::ScenarioTween: return "stween";
-        case K::KeyWait: return "key";
+    using S = oa::runtime::Wait::Stage;
+    switch (w->stage) {
+        case S::Trans: return "trans";
+        case S::Video: return "video";
+        case S::VideoLayer: return "video-layer";
+        case S::Se: return "se";
+        case S::AllDelete: return "alldelete";
+        case S::Tween: return "tween";
+        case S::None: break;
     }
-    return "?";
+    if (w->timed()) return "timed";
+    if (w->on_reveal_done) return "reveal";
+    if (w->reveal_clear) return "reveal-clear";
+    if (!w->keys.empty()) return "key";
+    if (w->waiting_click()) return "click";
+    return "park";
 }
-bool is_clickable_wait(const oa::runtime::WaitReason* w) {
-    using K = oa::runtime::WaitReason::Kind;
+bool is_clickable_wait(const oa::runtime::Wait* w) {
     if (!w) return false;
-    return w->kind == K::Generic || w->kind == K::Generic0 ||
-           w->kind == K::Timed || w->kind == K::Se || w->kind == K::KeyWait;
+    return w->waiting_click() || w->timed() ||
+           w->stage == oa::runtime::Wait::Stage::Se || !w->keys.empty();
 }
 bool reveal_done(const oa::runtime::GameRuntime& rt) {
     for (const std::string& id : rt.text().visible_content_layers()) {
@@ -98,10 +102,10 @@ int main() {
             if (f && *f == "title_init") title = true;
         };
         for (size_t f = 0; f < 20000 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             if (!title) continue;
             const auto* w = rt.current_wait();
-            if (w && w->kind == oa::runtime::WaitReason::Kind::Stop && w->id.empty()) break;
+            if (w && w->is_park() && w->stage_id.empty()) break;
         }
         check(title, "U13-0 title parked");
         {
@@ -113,7 +117,7 @@ int main() {
                 in.mouse_x = cands[ci][0];
                 in.mouse_y = cands[ci][1];
                 for (size_t f = 0; f < 600 && !rt.exit_requested(); ++f) {
-                    rt.tick(16, in);
+                    oa::test::replay(rt, in);
                     in.left_click_edge = false;
                     in.left_down = false;
                     in.mouse_x = -1;
@@ -125,7 +129,7 @@ int main() {
         // ---- real-cadence page turns to build story depth + a backlog ----
         auto park = [&](size_t budget) {
             for (size_t f = 0; f < budget && !rt.exit_requested(); ++f) {
-                rt.tick(16, idle);
+                oa::test::frame(rt);
                 if (rt.transition().is_in_progress(rt.now_ms())) continue;
                 const auto* w = rt.current_wait();
                 if (is_clickable_wait(w) && reveal_done(rt)) return true;
@@ -138,16 +142,16 @@ int main() {
             cl.left_down = true;
             cl.mouse_x = 640;
             cl.mouse_y = 600;
-            rt.tick(16, cl);
+            oa::test::replay(rt, cl);
             for (size_t f = 0; f < 4000 && !rt.exit_requested(); ++f) {
-                rt.tick(16, idle);
+                oa::test::frame(rt);
                 const auto* w = rt.current_wait();
                 if (is_clickable_wait(w) && reveal_done(rt)) break;
             }
         };
         bool body = false;
         for (size_t f = 0; f < 8000 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             if (rt.text().page_has_visible_text("1.80.mw.adv_adv")) {
                 body = true;
                 break;
@@ -183,17 +187,17 @@ int main() {
             oa::runtime::FrameInput d0;
             d0.key_down_edges = {kDown};
             d0.keys_down.insert(kDown);
-            rt.tick(16, d0);
+            oa::test::replay(rt, d0);
             oa::runtime::FrameInput d1;
             d1.keys_down.insert(kDown);
-            rt.tick(16, d1);
+            oa::test::replay(rt, d1);
             oa::runtime::FrameInput u0;
             u0.key_up_edges = {kDown};
-            rt.tick(16, u0);
+            oa::test::replay(rt, u0);
             // wait for the page to turn (bounded) and settle on a new park
             bool moved = false;
             for (size_t f = 0; f < 4000 && !rt.exit_requested(); ++f) {
-                rt.tick(16, idle);
+                oa::test::frame(rt);
                 const std::string ns = sample(rt);
                 if (ns != cur && ns != "-") {
                     cur = ns;
@@ -205,7 +209,7 @@ int main() {
             ++turned;
             // settle into the next clean park before the next pulse
             for (size_t f = 0; f < 4000 && !rt.exit_requested(); ++f) {
-                rt.tick(16, idle);
+                oa::test::frame(rt);
                 const auto* w = rt.current_wait();
                 if (is_clickable_wait(w) && reveal_done(rt)) break;
             }
@@ -218,7 +222,7 @@ int main() {
         std::string still = sample(rt);
         bool free_run = false;
         for (size_t f = 0; f < 500 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             const std::string ns = sample(rt);
             if (ns != still) {
                 free_run = true;
@@ -232,16 +236,16 @@ int main() {
             oa::runtime::FrameInput w0;
             w0.key_down_edges = {136};
             w0.keys_down.insert(136);
-            rt.tick(16, w0);
+            oa::test::replay(rt, w0);
             oa::runtime::FrameInput w1;
             w1.keys_down.insert(136);
-            rt.tick(16, w1);
+            oa::test::replay(rt, w1);
             oa::runtime::FrameInput wu;
             wu.key_up_edges = {136};
-            rt.tick(16, wu);
+            oa::test::replay(rt, wu);
             bool blog = false;
             for (size_t f = 0; f < 8000 && !rt.exit_requested(); ++f) {
-                rt.tick(16, idle);
+                oa::test::frame(rt);
                 if (rt.scene().find("500.z.bt.tx.1.1") != nullptr && rt.scene().size() > 180) {
                     blog = true;
                     break;
@@ -250,7 +254,7 @@ int main() {
             check(blog, "U13-5 wheel-up pulse opened the backlog");
             if (blog) {
                 // give the backlog its settle + initial view
-                for (size_t f = 0; f < 800; ++f) rt.tick(16, idle);
+                for (size_t f = 0; f < 800; ++f) oa::test::frame(rt);
                 // the test needs more than one history page to scroll into
                 // older entries; if only one page fits, stillness alone is
                 // still the U13 property (no free-run). Scroll with HUP(136)
@@ -261,29 +265,29 @@ int main() {
                     oa::runtime::FrameInput s0;
                     s0.key_down_edges = {136};
                     s0.keys_down.insert(136);
-                    rt.tick(16, s0);
+                    oa::test::replay(rt, s0);
                     oa::runtime::FrameInput s1;
                     s1.keys_down.insert(136);
-                    rt.tick(16, s1);
+                    oa::test::replay(rt, s1);
                     oa::runtime::FrameInput su;
                     su.key_up_edges = {136};
-                    rt.tick(16, su);
+                    oa::test::replay(rt, su);
                     for (size_t f = 0; f < 2500 && !rt.exit_requested(); ++f) {
-                        rt.tick(16, idle);
+                        oa::test::frame(rt);
                         if (blog_fp(rt) != fp0) {
                             fp0 = blog_fp(rt);
                             ++scrolled;
                             break;
                         }
                     }
-                    for (size_t f = 0; f < 400; ++f) rt.tick(16, idle);
+                    for (size_t f = 0; f < 400; ++f) oa::test::frame(rt);
                 }
                 std::printf("[u13] blog scrolled=%d/3 fp='%s'\n", scrolled,
                             blog_fp(rt).c_str());
                 bool blog_free = false;
                 std::string bf = blog_fp(rt);
                 for (size_t f = 0; f < 500 && !rt.exit_requested(); ++f) {
-                    rt.tick(16, idle);
+                    oa::test::frame(rt);
                     if (blog_fp(rt) != bf) {
                         blog_free = true;
                         bf = blog_fp(rt);

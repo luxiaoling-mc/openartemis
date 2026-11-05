@@ -156,6 +156,7 @@ struct MessageLayer {
     uint64_t reveal_index = 0;
     bool reveal_pending = false;
     uint64_t reveal_clock_ms = 0;
+    bool reveal_fresh = false;
     std::vector<ScetweenConfig> scetween;
     std::vector<BacklogTag> page_tags;
     std::map<std::string, std::string> page_font;
@@ -208,6 +209,8 @@ public:
     void reveal_next(uint64_t delta_ms);
     void reveal_all();
     bool is_reveal_complete() const;
+    /// 有页面正在"逐字"（存在非零间隔）——瞬显页不算，避免吃掉点击。
+    bool is_reveal_paced() const;
     // click_wait 图标位置（行末/页末）
     std::optional<ClickWaitPlacement> click_wait_placement(bool page_end) const;
 

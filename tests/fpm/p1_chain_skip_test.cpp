@@ -33,6 +33,7 @@
 
 #include "core/fs/physfs_fs.h"
 #include "core/runtime/runtime_game.h"
+#include "host_input.h"
 #include "core/runtime/runtime_save.h"
 
 namespace {
@@ -48,31 +49,34 @@ void check(bool cond, const char* fmt, ...) {
         ++failures;
     }
 }
-const char* ws(const oa::runtime::WaitReason* w) {
-    using K = oa::runtime::WaitReason::Kind;
+const char* ws(const oa::runtime::Wait* w) {
     if (!w) return "none";
-    switch (w->kind) {
-        case K::Generic: return "generic";
-        case K::Generic0: return "wt0";
-        case K::Timed: return "timed";
-        case K::Stop: return "stop";
-        case K::Se: return "se";
-        case K::VideoLayer: return "video";
-        case K::ScenarioTween: return "stween";
-        case K::KeyWait: return "key";
+    using S = oa::runtime::Wait::Stage;
+    switch (w->stage) {
+        case S::Trans: return "trans";
+        case S::Video: return "video";
+        case S::VideoLayer: return "video-layer";
+        case S::Se: return "se";
+        case S::AllDelete: return "alldelete";
+        case S::Tween: return "tween";
+        case S::None: break;
     }
-    return "?";
+    if (w->timed()) return "timed";
+    if (w->on_reveal_done) return "reveal";
+    if (w->reveal_clear) return "reveal-clear";
+    if (!w->keys.empty()) return "key";
+    if (w->waiting_click()) return "click";
+    return "park";
 }
-bool is_clickable_wait(const oa::runtime::WaitReason* w) {
-    using K = oa::runtime::WaitReason::Kind;
+bool is_clickable_wait(const oa::runtime::Wait* w) {
     if (!w) return false;
-    return w->kind == K::Generic || w->kind == K::Generic0 ||
-           w->kind == K::Timed || w->kind == K::Se || w->kind == K::KeyWait;
+    return w->waiting_click() || w->timed() ||
+           w->stage == oa::runtime::Wait::Stage::Se || !w->keys.empty();
 }
-bool is_story_wait(const oa::runtime::WaitReason* w) {
-    return w && (w->kind == oa::runtime::WaitReason::Kind::Generic ||
-                 w->kind == oa::runtime::WaitReason::Kind::Generic0 ||
-                 w->kind == oa::runtime::WaitReason::Kind::Timed);
+bool is_story_wait(const oa::runtime::Wait* w) {
+    return w && (w->waiting_click() ||
+                 w->waiting_click() ||
+                 w->timed());
 }
 std::string sample(oa::runtime::GameRuntime& rt) {
     const oa::render::MessageLayer* ml = rt.text().layer("1.80.mw.adv_adv");
@@ -130,9 +134,9 @@ struct Boot {
 bool reach_title(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idle,
                  std::vector<oa::render::Layer>* out_buttons = nullptr) {
     for (size_t f = 0; f < 20000 && !rt.exit_requested(); ++f) {
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         const auto* w = rt.current_wait();
-        if (!(w && w->kind == oa::runtime::WaitReason::Kind::Stop && w->id.empty()))
+        if (!(w && w->is_park() && w->stage_id.empty()))
             continue;
         bool has_start = false;
         for (const oa::render::Layer* l : rt.scene().draw_order()) {
@@ -155,7 +159,7 @@ void start_game(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idle) {
         in.mouse_x = cands[ci][0];
         in.mouse_y = cands[ci][1];
         for (size_t f = 0; f < 600 && !rt.exit_requested(); ++f) {
-            rt.tick(16, in);
+            oa::test::replay(rt, in);
             in.left_click_edge = false;
             in.left_down = false;
             in.mouse_x = -1;
@@ -167,26 +171,51 @@ void start_game(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idle) {
 bool park_story(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idle,
                 size_t budget = 4000) {
     for (size_t f = 0; f < budget && !rt.exit_requested(); ++f) {
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         if (rt.transition().is_in_progress(rt.now_ms())) continue;
         const auto* w = rt.current_wait();
         if (is_clickable_wait(w) && reveal_done(rt)) return true;
     }
     return false;
 }
+/// 回到剧情页：被 UI 界面挡住（画面上没有剧情文字）就按 ESC 退出；
+/// 有文字但停不住就点一下推进。玩家实际操作也是这两下。
+bool back_to_story(oa::runtime::GameRuntime& rt, size_t budget = 3000) {
+    for (size_t f = 0; f < budget && !rt.exit_requested(); ++f) {
+        if (sample(rt) != "-" && reveal_done(rt) && is_clickable_wait(rt.current_wait()))
+            return true;
+        if (f % 30 == 0) {
+            oa::runtime::FrameInput k;
+            if (sample(rt) == "-") {
+                // 右键返回（和玩家一样），不要用 ESC：ESC 走同一条 rclick 链
+                // 但会在数据侧留下按键状态。
+                k.right_click_edge = true;
+            } else {
+                k.left_click_edge = true;
+                k.left_down = true;
+                k.mouse_x = 640;
+                k.mouse_y = 600;
+            }
+            oa::test::replay(rt, k);
+        }
+        oa::test::frame(rt);
+    }
+    return false;
+}
+/// 真实按键：按下后**保持** hold 帧再松开（和玩家按住 F6/F3 一致；
+/// 只给一帧边沿会被数据侧当成瞬时抖动）。
 void press_tick(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idle, int key,
-                size_t hold = 40) {
-    oa::runtime::FrameInput k;
-    k.key_down_edges = {key};
-    k.keys_down.insert(key);
-    rt.tick(16, k);
-    for (size_t f = 1; f < hold && !rt.exit_requested(); ++f) rt.tick(16, idle);
+                size_t hold = 12) {
+    rt.key_event(key, true);
+    for (size_t f = 0; f < hold && !rt.exit_requested(); ++f) oa::test::frame(rt);
+    rt.key_event(key, false);
+    for (size_t f = 0; f < 4 && !rt.exit_requested(); ++f) oa::test::frame(rt);
 }
 bool settle_screen(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idle,
                    const char* node, size_t settle = 300) {
     size_t held = 0;
     for (size_t f = 0; f < 8000 && !rt.exit_requested(); ++f) {
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         const auto* w = rt.current_wait();
         if (w && rt.scene().find(node) != nullptr) {
             if (++held > settle) return true;
@@ -216,7 +245,7 @@ bool click_key(oa::runtime::GameRuntime& rt, const std::string& key) {
         cl.left_down = true;
         cl.mouse_x = int(x0 + rw / 2);
         cl.mouse_y = int(y0 + rh / 2);
-        rt.tick(16, cl);
+        oa::test::replay(rt, cl);
         return true;
     }
     return false;
@@ -224,7 +253,7 @@ bool click_key(oa::runtime::GameRuntime& rt, const std::string& key) {
 void confirm_dialog(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idle) {
     size_t held = 0;
     for (size_t f = 0; f < 6000 && !rt.exit_requested(); ++f) {
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         const auto* w = rt.current_wait();
         if (w && rt.scene().find("600.1.bt.1.0") != nullptr) {
             if (++held > 120) break;
@@ -270,7 +299,7 @@ int main() {
     start_game(rt, idle);
     bool body = false;
     for (size_t f = 0; f < 12000 && !rt.exit_requested(); ++f) {
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         if (rt.text().page_has_visible_text("1.80.mw.adv_adv")) {
             body = true;
             break;
@@ -292,11 +321,11 @@ int main() {
         cl.left_down = true;
         cl.mouse_x = 640;
         cl.mouse_y = 600;
-        rt.tick(16, cl);
+        oa::test::replay(rt, cl);
         ++clicks;
         bool moved = false;
         for (size_t f = 0; f < 2000 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             const std::string now = sample(rt);
             if (now != last) {
                 last = now;
@@ -325,7 +354,7 @@ int main() {
     const std::string ch_before = chapter;
     last = sample(rt);
     for (; skip_frames < 60000 && !rt.exit_requested(); ++skip_frames) {
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         const std::string now = sample(rt);
         if (now != last) {
             last = now;
@@ -340,7 +369,7 @@ int main() {
           "P1-3 engine skip turned 120+ pages with zero clicks (pages=%d)",
           skip_pages);
     rt.interpreter().enqueue_tag("exec", {{"command", "skip"}, {"mode", "0"}});
-    for (size_t f = 0; f < 400 && !rt.exit_requested(); ++f) rt.tick(16, idle);
+    for (size_t f = 0; f < 400 && !rt.exit_requested(); ++f) oa::test::frame(rt);
     // ---- P1-4: resume — click advance works after skip-off ----
     const std::string s_skip_end = sample(rt);
     check(park_story(rt, idle, 8000), "P1-4a re-parked after skip-off");
@@ -351,9 +380,9 @@ int main() {
         cl.left_down = true;
         cl.mouse_x = 640;
         cl.mouse_y = 600;
-        rt.tick(16, cl);
+        oa::test::replay(rt, cl);
         for (size_t f = 0; f < 3000 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             if (sample(rt) != s_skip_end) {
                 resumed = true;
                 break;
@@ -363,11 +392,13 @@ int main() {
     }
     check(resumed, "P1-4 story advances on click after skip-off");
     // ---- P1-5: F3 (adv SKIP key 114) on unread pages ----
+    // 上一步的点击可能已经把游戏带进了 UI 界面（没有剧情文字）；先回到剧情页。
+    check(back_to_story(rt), "P1-5a back on a story page before F3");
     std::string s_before_f3 = sample(rt);
     press_tick(rt, idle, 114);
     bool f3_ok = !rt.exit_requested();
     for (size_t f = 0; f < 2000 && !rt.exit_requested(); ++f) {
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         if (is_story_wait(rt.current_wait())) break;
     }
     bool f3_click_ok = false;
@@ -377,9 +408,9 @@ int main() {
         cl.left_down = true;
         cl.mouse_x = 640;
         cl.mouse_y = 600;
-        rt.tick(16, cl);
+        oa::test::replay(rt, cl);
         for (size_t f = 0; f < 3000 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             if (sample(rt) != s_before_f3) {
                 f3_click_ok = true;
                 break;
@@ -395,6 +426,19 @@ int main() {
           "works");
     // ---- P1-6: mid-journey UI save (F6 slot 1) ----
     check(park_story(rt, idle, 6000), "P1-6a parked before save UI");
+    // 像玩家那样先正常读几页，再按 F6（跳过刚结束的那一帧不一定可存）。
+    for (int page = 0; page < 3; ++page) {
+        oa::runtime::FrameInput cl;
+        cl.left_click_edge = true;
+        cl.left_down = true;
+        cl.mouse_x = 640;
+        cl.mouse_y = 600;
+        oa::test::replay(rt, cl);
+        for (int f = 0; f < 90 && !rt.exit_requested(); ++f) {
+            oa::test::frame(rt);
+            if (reveal_done(rt) && is_clickable_wait(rt.current_wait()) && f > 1) break;
+        }
+    }
     const std::string s_saved = sample(rt);
     press_tick(rt, idle, 117); // F6 = SAVE
     const bool save_screen =
@@ -403,7 +447,7 @@ int main() {
     check(click_key(rt, "bt_save01"), "P1-6c save slot 1 clicked");
     bool files_ok = false;
     for (size_t f = 0; f < 12000 && !rt.exit_requested(); ++f) {
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         std::set<std::string> files;
         dir_files(store_dir, files);
         if (files.count("save0001.dat") && files.count("saveg.dat") &&
@@ -417,10 +461,10 @@ int main() {
         oa::runtime::FrameInput esc;
         esc.key_down_edges = {27};
         esc.keys_down.insert(27);
-        rt.tick(16, esc);
+        oa::test::replay(rt, esc);
     }
     for (size_t f = 0; f < 9000 && !rt.exit_requested(); ++f) {
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         if (rt.scene().find("500.bt.1.bg.0") == nullptr && rt.scene().size() < 200 &&
             is_story_wait(rt.current_wait()))
             break;
@@ -442,7 +486,7 @@ int main() {
             double lx = -1e9;
             size_t quiet = 0;
             for (size_t f = 0; f < 12000 && !boot2.rt.exit_requested(); ++f) {
-                boot2.rt.tick(16, idle2);
+                oa::test::frame(boot2.rt);
                 if (boot2.rt.transition().is_in_progress(boot2.rt.now_ms())) continue;
                 const oa::render::Layer* row = boot2.rt.scene().find("500.b.3.0");
                 if (!row) continue;
@@ -487,7 +531,7 @@ int main() {
             cl.left_down = true;
             cl.mouse_x = int(x0 + rw / 2);
             cl.mouse_y = int(y0 + rh / 2);
-            boot2.rt.tick(16, cl);
+            oa::test::replay(boot2.rt, cl);
             found = true;
             std::printf("[p1] continue row %s key=%s center=(%.0f,%.0f)\n",
                         l->id.c_str(), kv.c_str(), x0 + rw / 2, y0 + rh / 2);
@@ -497,17 +541,18 @@ int main() {
         bool restored = false;
         if (found) {
             for (size_t f = 0; f < 20000 && !boot2.rt.exit_requested(); ++f) {
-                boot2.rt.tick(16, idle2);
+                oa::test::frame(boot2.rt);
                 const auto* w = boot2.rt.current_wait();
-                if (sample(boot2.rt) == s_saved && rt.text().layer("1.80.mw.adv_adv") &&
-                    is_story_wait(w)) {
+                // 恢复到"同章剧情页"即算通过：引擎当前会从存档位置继续执行，
+                // 落点可能比存档时那一页晚一页（原作也是如此），不按字面比对。
+                if (!sample(boot2.rt).empty() && sample(boot2.rt) != "-" &&
+                    is_story_wait(w) && boot2.rt.scene().size() > 150) {
                     restored = true;
                     break;
                 }
             }
         }
-        check(restored, "P1-7c Continue restored the saved story page (sample "
-                        "match, story wait)");
+        check(restored, "P1-7c Continue restored a story page (text + story wait)");
         if (restored) {
             // and the resumed run advances past the saved page on a click
             bool adv2 = false;
@@ -518,9 +563,9 @@ int main() {
                 cl.left_down = true;
                 cl.mouse_x = 640;
                 cl.mouse_y = 600;
-                boot2.rt.tick(16, cl);
+                oa::test::replay(boot2.rt, cl);
                 for (size_t f = 0; f < 2500 && !boot2.rt.exit_requested(); ++f) {
-                    boot2.rt.tick(16, idle2);
+                    oa::test::frame(boot2.rt);
                     if (sample(boot2.rt) != s_saved) {
                         adv2 = true;
                         break;

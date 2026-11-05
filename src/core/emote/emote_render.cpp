@@ -280,12 +280,19 @@ struct EvalCtx {
     double maxX = -std::numeric_limits<double>::max();
     double maxY = -std::numeric_limits<double>::max();
 
-    double var_value(const std::string& name) const {
+    double raw_value(const std::string& name) const {
         auto it = vars.find(name);
         if (it != vars.end()) return it->second;
         auto d = file.variableDefaults.find(name);
         if (d != file.variableDefaults.end()) return d->second;
         return 0.0;
+    }
+    double var_value(const std::string& name) const {
+        const double v = raw_value(name);
+        // 标准变量兜底: 模型不消费 body_UD 时，把作者写的体偏移折到整体位移轴
+        // move_UD 上（同一套 [-30,30]/division 坐标，见 EmoteFile 的判定）。
+        if (file.body_ud_to_move_ud && name == "move_UD") return v + raw_value("body_UD");
+        return v;
     }
 };
 
@@ -1560,7 +1567,7 @@ bool emote_mesh_debug() { return meshdiv_env().debug; }
 // ---------------------------------------------------------------------------
 bool static_content_bounds(const EmoteFile& file, const std::map<std::string, double>& vars,
                            double* minX, double* minY, double* maxX, double* maxY) {
-    EvalCtx ctx{file, vars, nullptr, nullptr};
+    EvalCtx ctx{file, vars, nullptr, nullptr, {}};
     ctx.wantBounds = true; // this is the one consumer of the eval-time bounds
     const int midx = file.find_motion(file.baseChara, file.baseMotion);
     if (midx < 0) return false;
@@ -1605,7 +1612,7 @@ static bool evaluate_entries(const EmoteFile& file,
         }
         evalVars = &resolvedVars;
     }
-    EvalCtx ctx{file, *evalVars, entries, err};
+    EvalCtx ctx{file, *evalVars, entries, err, {}};
     // the render/collect paths compute their own content
     // bounds from the grid they sample anyway — only the debug trace wants the
     // eval-time bounds here (static_content_bounds builds its own context).
@@ -1653,7 +1660,7 @@ bool emote_collect_anchors(const EmoteFile& file,
     if (!out) return false;
     out->clear();
     if (labels.empty()) return true;
-    EvalCtx ctx{file, vars, nullptr, err};
+    EvalCtx ctx{file, vars, nullptr, err, {}};
     ctx.wantBounds = false;
     const int midx = file.find_motion(file.baseChara, file.baseMotion);
     if (midx < 0) {

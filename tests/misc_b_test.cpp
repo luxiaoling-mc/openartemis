@@ -20,6 +20,7 @@
 
 #include "core/fs/fs.h"
 #include "core/runtime/runtime_game.h"
+#include "fpm/host_input.h"
 #include "core/runtime/runtime_save.h"
 #include "ogg_fixture.h"
 
@@ -31,24 +32,29 @@ void check(bool cond, const char* what) {
         ++failures;
     }
 }
-const char* kind_str(oa::runtime::WaitReason::Kind k) {
-    using K = oa::runtime::WaitReason::Kind;
-    switch (k) {
-        case K::Generic: return "generic";
-        case K::Generic0: return "wt0";
-        case K::Timed: return "timed";
-        case K::Stop: return "stop";
-        case K::Se: return "se";
-        case K::VideoLayer: return "video";
-        case K::ScenarioTween: return "scenario-tween";
-        case K::KeyWait: return "key";
-    }
-    return "?";
-}
-std::string wait_str(const oa::runtime::WaitReason* w) {
+const char* kind_str(const oa::runtime::Wait* w) {
     if (!w) return "none";
-    std::string s = kind_str(w->kind);
-    if (!w->id.empty()) s += "('" + w->id + "')";
+    using S = oa::runtime::Wait::Stage;
+    switch (w->stage) {
+        case S::Trans: return "trans";
+        case S::Video: return "video";
+        case S::VideoLayer: return "video-layer";
+        case S::Se: return "se";
+        case S::AllDelete: return "alldelete";
+        case S::Tween: return "tween";
+        case S::None: break;
+    }
+    if (w->timed()) return "timed";
+    if (w->on_reveal_done) return "reveal";
+    if (w->reveal_clear) return "reveal-clear";
+    if (!w->keys.empty()) return "key";
+    if (w->waiting_click()) return "click";
+    return "park";
+}
+std::string wait_str(const oa::runtime::Wait* w) {
+    if (!w) return "none";
+    std::string s = kind_str(w);
+    if (!w->stage_id.empty()) s += "('" + w->stage_id + "')";
     return s;
 }
 
@@ -230,7 +236,7 @@ void test_text_pages_survive_save_load() {
     rt.open_project("windows");
     rt.boot_project();
     for (int i = 0; i < 4; ++i) {
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         (void)rt.drain_events();
     }
     const auto* ml = rt.text().layer("adv");
@@ -242,12 +248,12 @@ void test_text_pages_survive_save_load() {
     rt2.open_project("windows");
     rt2.boot_project();
     for (int i = 0; i < 2; ++i) {
-        rt2.tick(16, idle);
+        oa::test::frame(rt2);
         (void)rt2.drain_events();
     }
     check(rt2.load_game_from("save/q01.dat", 0), "W17 load succeeds");
     for (int i = 0; i < 3; ++i) {
-        rt2.tick(16, idle);
+        oa::test::frame(rt2);
         (void)rt2.drain_events();
     }
     const auto* ml2 = rt2.text().layer("adv");
@@ -333,9 +339,9 @@ void test_skip_reaches_media() {
     oa::runtime::FrameInput idle;
     bool parked = false;
     for (int i = 0; i < 60 && !rt.exit_requested(); ++i) {
-        rt.tick(16, idle);
-        const oa::runtime::WaitReason* w = rt.current_wait();
-        if (w && w->kind == oa::runtime::WaitReason::Kind::Se && w->id == "s") {
+        oa::test::frame(rt);
+        const oa::runtime::Wait* w = rt.current_wait();
+        if (w && w->stage == oa::runtime::Wait::Stage::Se && w->stage_id == "s") {
             parked = true;
             break;
         }
@@ -347,11 +353,11 @@ void test_skip_reaches_media() {
     bool skipping = false;
     bool released = false;
     for (int i = 0; i < 60 && !rt.exit_requested(); ++i) {
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         if (rt.audio().state().is_skipping) skipping = true;
-        const oa::runtime::WaitReason* w = rt.current_wait();
-        if (skipping && w && w->kind == oa::runtime::WaitReason::Kind::Stop &&
-            w->id.empty()) {
+        const oa::runtime::Wait* w = rt.current_wait();
+        if (skipping && w && w->is_park() &&
+            w->stage_id.empty()) {
             released = true;
             break;
         }
@@ -411,7 +417,7 @@ void test_lytween_cancel_completion_survival() {
     rt.open_project("windows");
     rt.boot_project();
     oa::runtime::FrameInput idle;
-    for (int i = 0; i < 240 && !rt.exit_requested(); ++i) rt.tick(16, idle);
+    for (int i = 0; i < 240 && !rt.exit_requested(); ++i) oa::test::frame(rt);
     auto content = [&](const char* id) {
         const oa::render::MessageLayer* ml = rt.text().layer(id);
         if (!ml) return std::string("-no-layer-");
@@ -483,7 +489,7 @@ void test_natural_tween_completion_survival() {
         rt.interpreter().enqueue_tag("calllua",
                                       {{"function", "arm_natcal"}});
         for (int i = 1; i <= 40 && !rt.exit_requested(); ++i) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             if (content("m.cal") == "CAL") {
                 finish_tick = i - 2;
                 std::printf("[71] calibration: delivery at tick %d -> finish "
@@ -500,9 +506,9 @@ void test_natural_tween_completion_survival() {
     rt.interpreter().enqueue_tag("calllua",
                                       {{"function", "arm_nat71"}});
     for (int i = 0; i < finish_tick && !rt.exit_requested(); ++i)
-        rt.tick(16, idle);
+        oa::test::frame(rt);
     rt.interpreter().enqueue_tag("lydel", {{"id", "g.71"}});
-    for (int i = 0; i < 40 && !rt.exit_requested(); ++i) rt.tick(16, idle);
+    for (int i = 0; i < 40 && !rt.exit_requested(); ++i) oa::test::frame(rt);
     const std::string a = content("m.71");
     std::printf("[71] natural+teardown content='%s'\n", a.c_str());
     check(a == "-no-layer-" || a == "-empty-",
@@ -511,7 +517,7 @@ void test_natural_tween_completion_survival() {
     // ---- case B: layer survives -> normal delivery ----
     rt.interpreter().enqueue_tag("calllua",
                                       {{"function", "arm_nat71"}});
-    for (int i = 0; i < 60 && !rt.exit_requested(); ++i) rt.tick(16, idle);
+    for (int i = 0; i < 60 && !rt.exit_requested(); ++i) oa::test::frame(rt);
     const std::string b = content("m.71");
     std::printf("[71] natural+alive content='%s'\n", b.c_str());
     check(b == "FIRED-71", "71 naturally-finished round with a live layer "
@@ -533,7 +539,7 @@ void test_var_get_layer_info_flush() {
     rt.open_project("windows");
     rt.boot_project();
     oa::runtime::FrameInput idle;
-    rt.tick(16, idle);
+    oa::test::frame(rt);
     // Queue a layer creation the way a Lua e:tag would (deferred), then
     // apply the get_layer_info var synchronously.
     rt.interpreter().enqueue_tag("lyc2",
@@ -555,7 +561,7 @@ void test_var_get_layer_info_flush() {
     rt.interpreter().enqueue_tag("lyc2",
                                  {{"id", "probe.h"}, {"width", "1"},
                                   {"height", "1"}, {"x", "0"}, {"y", "0"}});
-    rt.tick(16, idle); // drain queue
+    oa::test::frame(rt); // drain queue
     rt.interpreter().apply_var({{"id", "probe.h"},
                                 {"system", "get_layer_info"},
                                 {"name", "r.ly"},
@@ -597,10 +603,10 @@ struct AutoBoot {
     // Tick until a Generic/Generic0 wait parks (budget frames).
     size_t park_generic(size_t budget = 300) {
         for (size_t f = 0; f < budget && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             const auto* w = rt.current_wait();
-            if (w && (w->kind == oa::runtime::WaitReason::Kind::Generic ||
-                      w->kind == oa::runtime::WaitReason::Kind::Generic0))
+            if (w && (w->waiting_click() ||
+                      w->waiting_click()))
                 return f;
         }
         return size_t(-1);
@@ -608,10 +614,10 @@ struct AutoBoot {
     // Tick until a non-Generic wait parks (release of the auto gate).
     size_t wait_release(size_t budget = 1200) {
         for (size_t f = 0; f < budget && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             const auto* w = rt.current_wait();
-            if (w && !(w->kind == oa::runtime::WaitReason::Kind::Generic ||
-                       w->kind == oa::runtime::WaitReason::Kind::Generic0))
+            if (w && !(w->waiting_click() ||
+                       w->waiting_click()))
                 return f;
         }
         return size_t(-1);
@@ -642,8 +648,8 @@ void test_automode_voice_gate() {
     for (size_t f = 0; f < 30; ++f) {
         b.rt.tick(16, b.idle);
         const auto* w = b.rt.current_wait();
-        if (!(w && (w->kind == oa::runtime::WaitReason::Kind::Generic ||
-                    w->kind == oa::runtime::WaitReason::Kind::Generic0)))
+        if (!(w && (w->waiting_click() ||
+                    w->waiting_click())))
             ++hold_breaks;
         if (!b.rt.audio().is_sound_playing("1")) ++hold_breaks;
     }
@@ -656,7 +662,7 @@ void test_automode_voice_gate() {
     if (rl != size_t(-1)) {
         playing_at_release = b.rt.audio().is_sound_playing("1");
         const auto* w = b.rt.current_wait();
-        if (w && w->kind == oa::runtime::WaitReason::Kind::Stop && w->id.empty())
+        if (w && w->is_park() && w->stage_id.empty())
             reached_stop = true;
     }
     std::printf("[W6a] park@%zu release@%zu playing_at_release=%d stop=%d\n", pk, rl,

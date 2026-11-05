@@ -12,6 +12,7 @@
 
 #include "core/fs/fs.h"
 #include "core/runtime/runtime_game.h"
+#include "fpm/host_input.h"
 #include "core/render/layer.h"
 #include "core/render/text.h"
 
@@ -457,7 +458,7 @@ void test_text_node_materialization_and_world_chain() {
     rt.open_project("windows");
     rt.boot_project();
     oa::runtime::FrameInput idle;
-    rt.tick(16, idle);
+    oa::test::frame(rt);
     (void)rt.drain_events();
     // 文本节点已物化为 grp.sheet 的子节点
     const oa::render::Layer* n = rt.scene().find("grp.sheet.txt");
@@ -474,7 +475,7 @@ void test_text_node_materialization_and_world_chain() {
         // 经解释器队列驱动（scene 只读面）。
         rt.interpreter().enqueue_tag("lyprop",
                                      {{"id", "grp"}, {"xscale", "200"}, {"rotate", "30"}});
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         (void)rt.drain_events();
         oa::render::Affine2 w2;
         check(rt.scene().world_transform("grp.sheet.txt", &w2) &&
@@ -482,12 +483,12 @@ void test_text_node_materialization_and_world_chain() {
               "R4-4 parent scale/rotate reaches the text node world transform");
         // 父级隐藏 → 文本不可见（节点显隐沿父链）
         rt.interpreter().enqueue_tag("lyprop", {{"id", "grp"}, {"visible", "0"}});
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         (void)rt.drain_events();
         check(!rt.scene().is_message_layer_visible("grp.sheet.txt"),
               "R4-5 hiding the parent group hides the text layer");
         rt.interpreter().enqueue_tag("lyprop", {{"id", "grp"}, {"visible", "1"}});
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         (void)rt.drain_events();
         check(rt.scene().is_message_layer_visible("grp.sheet.txt"),
               "R4-6 showing the parent group revives text visibility");
@@ -583,19 +584,19 @@ void test_overlay_text_hides_with_tree_ancestor() {
     rt.open_project("windows");
     rt.boot_project();
     oa::runtime::FrameInput idle;
-    rt.tick(16, idle);
+    oa::test::frame(rt);
     (void)rt.drain_events();
     const std::string msg = "1.80.mw.adv_adv";
     check(rt.text().layer(msg) != nullptr && rt.scene().is_message_layer_visible(msg),
           "R5-5 overlay text visible with the tree ancestor shown");
     // 隐藏 1.80（FPM msg_hide 语义）→ overlay 文本必须不可见
     rt.interpreter().enqueue_tag("lyprop", {{"id", "1.80"}, {"visible", "0"}});
-    rt.tick(16, idle);
+    oa::test::frame(rt);
     (void)rt.drain_events();
     check(!rt.scene().is_message_layer_visible(msg),
           "R5-6 hiding the message-window tree root hides the overlay text");
     rt.interpreter().enqueue_tag("lyprop", {{"id", "1.80"}, {"visible", "1"}});
-    rt.tick(16, idle);
+    oa::test::frame(rt);
     (void)rt.drain_events();
     check(rt.scene().is_message_layer_visible(msg),
           "R5-7 showing the tree root revives the overlay text");
@@ -623,7 +624,7 @@ void test_runtime_text_flow() {
     rt.open_project("windows");
     rt.boot_project();
     oa::runtime::FrameInput idle;
-    rt.tick(16, idle);
+    oa::test::frame(rt);
     (void)rt.drain_events(); // 停 @
     const oa::render::TextEngine& t = rt.text();
     check(t.text_layers() >= 1, "T16 message layer created");
@@ -656,12 +657,11 @@ void test_runtime_text_flow() {
     // 点击推进：@ 解除 → /chgmsg pop 回 adv01 → [stop]
     oa::runtime::FrameInput click;
     click.left_click_edge = true;
-    rt.tick(16, click);
+    oa::test::replay(rt, click);
     (void)rt.drain_events();
-    rt.tick(16, idle);
+    oa::test::frame(rt);
     (void)rt.drain_events();
-    check(rt.current_wait() && rt.current_wait()->kind ==
-                                   oa::runtime::WaitReason::Kind::Stop,
+    check(rt.current_wait() && rt.current_wait()->is_park(),
           "T16 flow reaches [stop] after the click");
     check(t.active_layer_id() == std::string("adv01"),
           "T16 /chgmsg popped back to the default layer");
@@ -804,7 +804,7 @@ void test_content_newline_runtime_e2e() {
     rt.open_project("windows");
     rt.boot_project();
     oa::runtime::FrameInput idle;
-    rt.tick(16, idle);
+    oa::test::frame(rt);
     (void)rt.drain_events();
     const oa::render::TextEngine& t = rt.text();
     check(rt.text_events() == 1, "N10 one scenario text event from the Lua print");
@@ -844,7 +844,7 @@ void test_orphan_print_paint_gate() {
     rt.open_project("windows");
     rt.boot_project();
     oa::runtime::FrameInput idle;
-    rt.tick(16, idle);
+    oa::test::frame(rt);
     (void)rt.drain_events();
 
     auto drawable = [&](const std::string& id) {
@@ -856,7 +856,7 @@ void test_orphan_print_paint_gate() {
     rt.interpreter().enqueue_tag("rp", {});
     rt.interpreter().enqueue_tag("print", {{"data", "70"}});
     rt.interpreter().enqueue_tag("/chgmsg", {});
-    rt.tick(16, idle);
+    oa::test::frame(rt);
     (void)rt.drain_events();
     const oa::render::MessageLayer* ml = rt.text().layer("500.p03");
     check(ml != nullptr && !ml->page.empty() && ml->page[0].data == "70",
@@ -876,7 +876,7 @@ void test_orphan_print_paint_gate() {
                                   {"width", "80"}, {"height", "60"}});
     rt.interpreter().enqueue_tag("print", {{"data", "70"}});
     rt.interpreter().enqueue_tag("/chgmsg", {});
-    rt.tick(16, idle);
+    oa::test::frame(rt);
     (void)rt.drain_events();
     const oa::render::MessageLayer* ml2 = rt.text().layer("500.p03");
     check(ml2 && ml2->positioned, "63 font layout keys set positioned on the layer");
@@ -891,11 +891,11 @@ void test_orphan_print_paint_gate() {
     rt.interpreter().enqueue_tag("rp", {});
     rt.interpreter().enqueue_tag("print", {{"data", "x"}});
     rt.interpreter().enqueue_tag("/chgmsg", {});
-    rt.tick(16, idle);
+    oa::test::frame(rt);
     (void)rt.drain_events();
     check(!drawable("500.q03"), "63 another unboxed orphan not drawable");
     rt.interpreter().enqueue_tag("lyprop", {{"id", "500.q03"}, {"left", "10"}});
-    rt.tick(16, idle);
+    oa::test::frame(rt);
     (void)rt.drain_events();
     const oa::render::Layer* bn2 = rt.scene().find("500.q03");
     check(bn2 && !bn2->script_created && !drawable("500.q03"),
@@ -903,7 +903,7 @@ void test_orphan_print_paint_gate() {
     rt.interpreter().enqueue_tag("lyc2",
                                  {{"id", "500.q03"}, {"width", "10"},
                                   {"height", "10"}});
-    rt.tick(16, idle);
+    oa::test::frame(rt);
     (void)rt.drain_events();
     const oa::render::Layer* bn3 = rt.scene().find("500.q03");
     check(bn3 && bn3->script_created && drawable("500.q03"),

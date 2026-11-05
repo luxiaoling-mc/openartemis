@@ -10,6 +10,7 @@
 
 #include "core/fs/fs.h"
 #include "core/runtime/runtime_game.h"
+#include "fpm/host_input.h"
 #include "core/render/layer.h"
 
 namespace {
@@ -260,7 +261,7 @@ void test_h11_runtime_owns_scene_and_applies_layer_events() {
     rt.open_project("windows");
     rt.boot_project();
     oa::runtime::FrameInput idle;
-    for (int i = 0; i < 12 && !rt.exit_requested(); ++i) rt.tick(16, idle);
+    for (int i = 0; i < 12 && !rt.exit_requested(); ++i) oa::test::frame(rt);
 
     const auto& scene = rt.scene();
     check(scene.find("500") != nullptr && scene.find("500.b") != nullptr &&
@@ -277,7 +278,7 @@ void test_h11_runtime_owns_scene_and_applies_layer_events() {
     check(scene.find("missing") == nullptr, "H11 lydel on a missing id is a no-op");
 
     // host event stream contains no scene events
-    for (int i = 0; i < 4; ++i) rt.tick(16, idle);
+    for (int i = 0; i < 4; ++i) oa::test::frame(rt);
     for (const auto& e : rt.drain_events()) {
         check(e.kind != oa::runtime::Event::Kind::LayerCreate &&
                   e.kind != oa::runtime::Event::Kind::LayerDelete &&

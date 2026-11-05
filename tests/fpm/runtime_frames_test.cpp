@@ -9,6 +9,7 @@
 
 #include "core/fs/physfs_fs.h"
 #include "core/runtime/runtime_game.h"
+#include "host_input.h"
 
 namespace {
 int failures = 0;
@@ -40,13 +41,17 @@ int main() {
         int last_kind = -99;
         std::string pos_summary;
         for (int i = 0; i < 500 && !rt.exit_requested(); ++i) {
-            rt.tick(16, no_input);
-            const oa::runtime::WaitReason* w = rt.current_wait();
+            oa::test::replay(rt, no_input);
+            const oa::runtime::Wait* w = rt.current_wait();
             if (w) {
                 ++wait_events;
-                if (w->kind == oa::runtime::WaitReason::Kind::Stop) ++stop_waits;
+                if (w->is_park()) ++stop_waits;
             }
-            const int k = w ? (int)w->kind : -1;
+            const int k = !w ? -1
+                          : w->waiting_click() ? 0
+                          : w->is_park()       ? 1
+                          : w->timed()    ? 2
+                                               : 3;
             if (k != last_kind) {
                 last_kind = k;
                 pos_summary += "[" + std::to_string(i) + ":" + std::to_string(k) + "@" +
@@ -62,18 +67,18 @@ int main() {
         // the next tick without input (visual-host model, research/09 §10.4).
         bool released_plain_stop_by_click = false;
         for (int i = 0; i < 10; ++i) {
-            const oa::runtime::WaitReason* before = rt.current_wait();
+            const oa::runtime::Wait* before = rt.current_wait();
             const bool plain_stop_before =
-                before && before->kind == oa::runtime::WaitReason::Kind::Stop &&
-                before->id.empty();
-            rt.tick(16, click);
+                before && before->is_park() &&
+                before->stage_id.empty();
+            oa::test::replay(rt, click);
             if (plain_stop_before && !rt.waiting_stop()) released_plain_stop_by_click = true;
         }
         // decide edges keep the machine alive without errors
         for (int i = 0; i < 120; ++i) {
             if (i % 30 == 0) rt.apply_override(124, 32);
             if (i % 30 == 15) rt.apply_override(124, 0);
-            rt.tick(16, no_input);
+            oa::test::replay(rt, no_input);
             if (rt.exit_requested()) break;
         }
 

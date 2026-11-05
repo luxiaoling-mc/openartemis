@@ -34,6 +34,7 @@
 #include "core/runtime/runtime_save.h"
 #include "core/render/layer.h"
 #include "core/runtime/runtime_game.h"
+#include "fpm/host_input.h"
 #include "core/runtime/runtime_save.h"
 
 namespace {
@@ -124,7 +125,7 @@ struct Harness {
         in.mouse_y = my;
         in.left_down = click;
         in.left_click_edge = click;
-        rt->tick(16, in);
+        oa::test::replay(*rt, in);
     }
     void tick_ms(uint64_t ms) { rt->tick(ms, oa::runtime::FrameInput{}); }
     void warm(int n = 3) {
@@ -142,18 +143,14 @@ struct Harness {
         return n;
     }
     std::string wait_str() const {
-        const oa::runtime::WaitReason* w = rt->current_wait();
+        const oa::runtime::Wait* w = rt->current_wait();
         if (!w) return "none";
-        switch (w->kind) {
-            case oa::runtime::WaitReason::Kind::Generic: return "generic";
-            case oa::runtime::WaitReason::Kind::Generic0: return "wt0";
-            case oa::runtime::WaitReason::Kind::Timed: return "timed";
-            case oa::runtime::WaitReason::Kind::Stop: return "stop";
-            case oa::runtime::WaitReason::Kind::Se: return "se";
-            case oa::runtime::WaitReason::Kind::VideoLayer: return "video";
-            case oa::runtime::WaitReason::Kind::ScenarioTween: return "scenario";
-            case oa::runtime::WaitReason::Kind::KeyWait: return "key";
-        }
+        if (w->is_park()) return "stop";
+        if (w->timed()) return "timed";
+        if (w->on_reveal_done) return "scenario";
+        if (!w->keys.empty()) return "key";
+        // 点击停驻：[wt0] 认 decide，[wt] 只认物理点击。
+        if (w->waiting_click()) return w->can(oa::runtime::Wait::OnDecide) ? "wt0" : "wt";
         return "?";
     }
     std::pair<std::string, size_t> pos() const {
@@ -604,15 +601,15 @@ void test_events_emitted_during_load_dispatch_survive() {
     // push_back 的队列，尾部 swap 会把这个事件整批丢掉）。
     Harness h("[call file=\"story.iet\" label=\"main\"]\n",
               "*main\n[load file=\"s9.dat\"]\n[stop]\n");
-    h.run_lua("function restore(e, p) e:tag{\"trans\", type=\"0\"} end\n");
+    // type=1 + 100ms: the transition stays in progress, so "the event survived
+    // the load dispatch" is observable through the renderer state (the host
+    // frame drains events, so drain_events() is empty by design).
+    h.run_lua("function restore(e, p) e:tag{\"trans\", type=\"1\", time=\"100\", input=\"0\"} end\n");
     auto d = scene_fixture({lay("s9scene", props({{"file", "s.png"}}))}, 1 /* [stop] */);
     h.install("s9.dat", d);
     h.tick();
     check(h.has_layer("s9scene"), "S9 the scripted [load] performed the load");
-    bool saw_trans = false;
-    for (const auto& e : h.rt->drain_events())
-        if (e.kind == oa::runtime::Event::Kind::Trans) saw_trans = true;
-    check(saw_trans,
+    check(h.rt->transition().is_in_progress(h.rt->now_ms()),
           "S9 an event produced by the load chain itself (Lua restore() -> e:tag) "
           "reaches the host pump");
 }

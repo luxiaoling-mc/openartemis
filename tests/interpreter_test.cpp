@@ -27,7 +27,7 @@ using oa::runtime::Event;
 using oa::runtime::ExecutionResult;
 using oa::runtime::Interpreter;
 using oa::runtime::ScriptError;
-using oa::runtime::WaitReason;
+using oa::runtime::Wait;
 using oa::runtime::Value;
 using oa::runtime::ValueKind;
 
@@ -265,9 +265,8 @@ void test_wait_kinds() {
         run_script(it, h);
         check(h.waits == 1, "wt waits once");
         check(h.events.size() == 1 && h.events[0].kind == Event::Kind::Wait_, "wt event");
-        check(h.events[0].reason.kind == WaitReason::Kind::Generic &&
-                  h.events[0].reason.id == "wt",
-              "bare wt is a click wait (Generic, id=wt)");
+        check(h.events[0].wait.waiting_click() && !h.events[0].wait.can(Wait::OnDecide),
+              "bare wt is a click-only wait");
         check(it.variables().get("r")->as_int() == 1, "advance past wt runs next");
     }
     // [wt] with an explicit parameter keeps the TIMED form and keeps input=
@@ -281,10 +280,9 @@ void test_wait_kinds() {
                        "*main\n[wt time=500 input=0]\n[var name=\"r\" data=\"1\"]\n");
         run_script(it, h);
         check(h.waits == 1, "wt with args waits once");
-        check(h.events[0].reason.kind == WaitReason::Kind::Timed &&
-                  h.events[0].reason.milliseconds == 500 &&
-                  h.events[0].reason.input == 0,
-              "wt time=500 input=0 stays Timed(500) input=0");
+        check(h.events[0].wait.timer_ms == 500 &&
+                  !h.events[0].wait.can(Wait::OnClick),
+              "wt time=500 input=0 stays a 500ms timer that ignores clicks");
         check(it.variables().get("r")->as_int() == 1, "advance past wt(time) runs next");
     }
     // [wt0] Generic0
@@ -293,7 +291,9 @@ void test_wait_kinds() {
         Harness h;
         it.load_script("test", "*main\n[wt0]\n");
         run_script(it, h);
-        check(h.events[0].reason.kind == WaitReason::Kind::Generic0, "wt0 Generic0");
+        check(h.events[0].wait.can(Wait::OnClick) &&
+                  h.events[0].wait.can(Wait::OnDecide),
+              "wt0 accepts click and decide");
     }
     // [@] Generic
     {
@@ -301,7 +301,9 @@ void test_wait_kinds() {
         Harness h;
         it.load_script("test", "*main\n[@]\n");
         run_script(it, h);
-        check(h.events[0].reason.kind == WaitReason::Kind::Generic, "@ Generic");
+        check(h.events[0].wait.can(Wait::OnDecide) &&
+                  h.events[0].wait.can(Wait::OnAuto),
+              "@ accepts decide and auto-mode");
     }
     // [wait time=500] input defaults 0
     {
@@ -309,9 +311,9 @@ void test_wait_kinds() {
         Harness h;
         it.load_script("test", "*main\n[wait time=500]\n");
         run_script(it, h);
-        check(h.events[0].reason.kind == WaitReason::Kind::Timed &&
-                  h.events[0].reason.input == 0 && h.events[0].reason.milliseconds == 500,
-              "wait timed");
+        check(h.events[0].wait.timer_ms == 500 &&
+                  !h.events[0].wait.can(Wait::OnClick),
+              "wait time=500 is a 500ms timer");
     }
     // [wait video=1.0] VideoLayer
     {
@@ -319,8 +321,8 @@ void test_wait_kinds() {
         Harness h;
         it.load_script("test", "*main\n[wait video=\"1.0\"]\n");
         run_script(it, h);
-        check(h.events[0].reason.kind == WaitReason::Kind::VideoLayer &&
-                  h.events[0].reason.id == "1.0",
+        check(h.events[0].wait.stage == Wait::Stage::VideoLayer &&
+                  h.events[0].wait.stage_id == "1.0",
               "wait video layer");
     }
     // [wait scenario=2] ScenarioTween; scenario=0 falls back to Timed
@@ -329,14 +331,12 @@ void test_wait_kinds() {
         Harness h;
         it.load_script("test", "*main\n[wait scenario=2]\n");
         run_script(it, h);
-        check(h.events[0].reason.kind == WaitReason::Kind::ScenarioTween &&
-                  h.events[0].reason.mode == 2,
-              "wait scenario=2");
+        check(h.events[0].wait.reveal_clear, "wait scenario=2 clears instantly");
         Interpreter it2;
         Harness h2;
         it2.load_script("test", "*main\n[wait scenario=0]\n");
         run_script(it2, h2);
-        check(h2.events[0].reason.kind == WaitReason::Kind::Timed, "scenario=0 -> Timed");
+        check(h2.events[0].wait.timer_ms == 0, "scenario=0 -> plain timer");
     }
     // [stop reason] Stop
     {
@@ -344,8 +344,8 @@ void test_wait_kinds() {
         Harness h;
         it.load_script("test", "*main\n[stop exskip]\n");
         run_script(it, h);
-        check(h.events[0].reason.kind == WaitReason::Kind::Stop && h.events[0].reason.id == "exskip",
-              "stop carries positional reason");
+        check(h.events[0].wait.is_park() && h.events[0].wait.ends_exskip,
+              "stop carries its positional reason");
     }
     // stop keeps position: var after stop still runs after advance
     {

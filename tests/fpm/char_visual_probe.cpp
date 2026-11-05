@@ -18,6 +18,7 @@
 
 #include "core/fs/physfs_fs.h"
 #include "core/runtime/runtime_game.h"
+#include "host_input.h"
 
 namespace {
 int failures = 0;
@@ -32,20 +33,24 @@ void check(bool cond, const char* fmt, ...) {
         ++failures;
     }
 }
-const char* ws(const oa::runtime::WaitReason* w) {
-    using K = oa::runtime::WaitReason::Kind;
+const char* ws(const oa::runtime::Wait* w) {
     if (!w) return "none";
-    switch (w->kind) {
-        case K::Generic: return "generic";
-        case K::Generic0: return "wt0";
-        case K::Timed: return "timed";
-        case K::Stop: return "stop";
-        case K::Se: return "se";
-        case K::VideoLayer: return "video";
-        case K::ScenarioTween: return "stween";
-        case K::KeyWait: return "key";
+    using S = oa::runtime::Wait::Stage;
+    switch (w->stage) {
+        case S::Trans: return "trans";
+        case S::Video: return "video";
+        case S::VideoLayer: return "video-layer";
+        case S::Se: return "se";
+        case S::AllDelete: return "alldelete";
+        case S::Tween: return "tween";
+        case S::None: break;
     }
-    return "?";
+    if (w->timed()) return "timed";
+    if (w->on_reveal_done) return "reveal";
+    if (w->reveal_clear) return "reveal-clear";
+    if (!w->keys.empty()) return "key";
+    if (w->waiting_click()) return "click";
+    return "park";
 }
 std::string sample(oa::runtime::GameRuntime& rt, const std::string& id) {
     const oa::render::MessageLayer* ml = rt.text().layer(id);
@@ -54,11 +59,10 @@ std::string sample(oa::runtime::GameRuntime& rt, const std::string& id) {
         if (!u.data.empty()) return u.data.substr(0, 20);
     return "-";
 }
-bool is_clickable_wait(const oa::runtime::WaitReason* w) {
-    using K = oa::runtime::WaitReason::Kind;
+bool is_clickable_wait(const oa::runtime::Wait* w) {
     if (!w) return false;
-    return w->kind == K::Generic || w->kind == K::Generic0 ||
-           w->kind == K::Timed || w->kind == K::Se || w->kind == K::KeyWait;
+    return w->waiting_click() || w->timed() ||
+           w->stage == oa::runtime::Wait::Stage::Se || !w->keys.empty();
 }
 bool reveal_done(const oa::runtime::GameRuntime& rt) {
     for (const std::string& id : rt.text().visible_content_layers()) {
@@ -105,10 +109,10 @@ int main() {
             if (f && *f == "title_init") title = true;
         };
         for (size_t f = 0; f < 12000 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             if (!title) continue;
             const auto* w = rt.current_wait();
-            if (w && w->kind == oa::runtime::WaitReason::Kind::Stop && w->id.empty()) break;
+            if (w && w->is_park() && w->stage_id.empty()) break;
         }
         check(title, "R7-1 boot parked at the title");
         {
@@ -120,7 +124,7 @@ int main() {
                 in.mouse_x = cands[ci][0];
                 in.mouse_y = cands[ci][1];
                 for (size_t f = 0; f < 500 && !rt.exit_requested(); ++f) {
-                    rt.tick(16, in);
+                    oa::test::replay(rt, in);
                     in.left_click_edge = false;
                     in.left_down = false;
                     in.mouse_x = -1;
@@ -131,7 +135,7 @@ int main() {
         }
         bool body = false;
         for (size_t f = 0; f < 8000 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             if (rt.text().page_has_visible_text("1.80.mw.adv_adv")) {
                 body = true;
                 break;
@@ -168,7 +172,7 @@ int main() {
         while (clicks < 300 && !rt.exit_requested()) {
             bool parked = false;
             for (size_t f = 0; f < 4000 && !rt.exit_requested(); ++f) {
-                rt.tick(16, idle);
+                oa::test::frame(rt);
                 if (rt.transition().is_in_progress(rt.now_ms())) continue;
                 const auto* w = rt.current_wait();
                 if (is_clickable_wait(w) && reveal_done(rt)) {
@@ -251,7 +255,7 @@ int main() {
             cl.left_down = true;
             cl.mouse_x = 640;
             cl.mouse_y = 600;
-            rt.tick(16, cl);
+            oa::test::replay(rt, cl);
             ++clicks;
             const std::string cur = sample(rt, "1.80.mw.adv_adv");
             if (cur != last_page) {

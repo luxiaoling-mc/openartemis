@@ -23,6 +23,7 @@
 
 #include "core/fs/fs.h"
 #include "core/runtime/runtime_game.h"
+#include "fpm/host_input.h"
 #include "core/runtime/runtime_save.h"
 #include "core/runtime/runtime_save.h"
 #include "core/util/binary_stream.h"
@@ -36,24 +37,29 @@ void check(bool cond, const char* what) {
         ++failures;
     }
 }
-const char* kind_str(oa::runtime::WaitReason::Kind k) {
-    using K = oa::runtime::WaitReason::Kind;
-    switch (k) {
-        case K::Generic: return "generic";
-        case K::Generic0: return "wt0";
-        case K::Timed: return "timed";
-        case K::Stop: return "stop";
-        case K::Se: return "se";
-        case K::VideoLayer: return "video";
-        case K::ScenarioTween: return "scenario-tween";
-        case K::KeyWait: return "key";
-    }
-    return "?";
-}
-std::string wait_str(const oa::runtime::WaitReason* w) {
+const char* kind_str(const oa::runtime::Wait* w) {
     if (!w) return "none";
-    std::string s = kind_str(w->kind);
-    if (!w->id.empty()) s += "('" + w->id + "')";
+    using S = oa::runtime::Wait::Stage;
+    switch (w->stage) {
+        case S::Trans: return "trans";
+        case S::Video: return "video";
+        case S::VideoLayer: return "video-layer";
+        case S::Se: return "se";
+        case S::AllDelete: return "alldelete";
+        case S::Tween: return "tween";
+        case S::None: break;
+    }
+    if (w->timed()) return "timed";
+    if (w->on_reveal_done) return "reveal";
+    if (w->reveal_clear) return "reveal-clear";
+    if (!w->keys.empty()) return "key";
+    if (w->waiting_click()) return "click";
+    return "park";
+}
+std::string wait_str(const oa::runtime::Wait* w) {
+    if (!w) return "none";
+    std::string s = kind_str(w);
+    if (!w->stage_id.empty()) s += "('" + w->stage_id + "')";
     return s;
 }
 
@@ -210,7 +216,7 @@ void test_numbered_save_load() {
     size_t f = 0;
     bool saved = false;
     for (; f < 600 && !rt.exit_requested(); ++f) {
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         if (store->exists("save/save01.dat")) {
             saved = true;
             break;
@@ -315,7 +321,7 @@ void test_numbered_save_load() {
     check(rt2.audio().is_se_playing("se1"), "T3 se1 restored playing");
     // Keep ticking a bit: resumed flow must not crash and text was cleared
     // ( clear_scene_text on load).
-    for (int i = 0; i < 20; ++i) rt2.tick(16, idle);
+    for (int i = 0; i < 20; ++i) oa::test::frame(rt2);
 }
 
 // ---------------------------------------------------------------------------
@@ -331,7 +337,7 @@ void test_screenshots_and_files() {
     rt.open_project("windows");
     rt.boot_project();
     oa::runtime::FrameInput idle;
-    rt.tick(16, idle);
+    oa::test::frame(rt);
 
     // [takess] without a host capture then [savess]: placeholder PNG.
     oa::runtime::Event take;
@@ -381,7 +387,7 @@ void test_screenshots_and_files() {
     rt2.boot_project();
     bool autosaved = false;
     for (int i = 0; i < 60 && !rt2.exit_requested(); ++i) {
-        rt2.tick(16, idle);
+        oa::test::frame(rt2);
         if (store->exists("save/autosave.dat")) {
             autosaved = true;
             break;

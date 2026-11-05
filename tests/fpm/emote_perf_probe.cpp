@@ -36,6 +36,7 @@
 #include "core/render/layer.h"
 #include "core/render/renderer.h"
 #include "core/runtime/runtime_game.h"
+#include "host_input.h"
 
 namespace {
 using Clock = std::chrono::steady_clock;
@@ -80,15 +81,12 @@ struct PartsStat {
     double avg() const { return n ? total_ms / double(n) : 0; }
 };
 
-const char* wait_desc(const oa::runtime::WaitReason* w) {
+const char* wait_desc(const oa::runtime::Wait* w) {
     if (!w) return "run";
-    switch (w->kind) {
-        case oa::runtime::WaitReason::Kind::Stop: return "stop";
-        case oa::runtime::WaitReason::Kind::Timed: return "timed";
-        case oa::runtime::WaitReason::Kind::Generic: return "click";
-        case oa::runtime::WaitReason::Kind::Generic0: return "click0";
-        default: return "other";
-    }
+    if (w->is_park()) return "stop";
+    if (w->timed()) return "timed";
+    if (w->waiting_click()) return "click";
+    return "other";
 }
 
 /// First emote PSB under image/fg whose name contains `sub` (the games keep
@@ -150,7 +148,7 @@ int main(int argc, char** argv) {
     // ---- phase 1: baseline (pre-emote) ------------------------------------
     for (int i = 0; i < base_ticks && !rt.exit_requested(); ++i) {
         const auto t0 = Clock::now();
-        rt.tick(16, in);
+        oa::test::replay(rt, in);
         base_stat.add(ms_since(t0));
     }
 
@@ -169,7 +167,7 @@ int main(int argc, char** argv) {
         rt.interpreter().lua_bridge().run_code(code.c_str(), "emote_perf_probe");
     }
     for (int i = 0; i < boot_cap && rt.emote_layers().empty(); ++i)
-        rt.tick(16, in);
+        oa::test::replay(rt, in);
     if (rt.emote_layers().empty()) {
         std::printf("[perf] emote layer did not materialize\n");
         return 4;
@@ -200,7 +198,7 @@ int main(int argc, char** argv) {
     // steady: idle breathing only (the standing-portrait baseline state)
     for (int i = 0; i < steady_ticks && !rt.exit_requested(); ++i) {
         const auto t0 = Clock::now();
-        rt.tick(16, in);
+        oa::test::replay(rt, in);
         steady_stat.add(ms_since(t0));
     }
 
@@ -218,7 +216,7 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        rt.tick(16, in);
+        oa::test::replay(rt, in);
         churn_stat.add(ms_since(t0));
     }
 
@@ -352,7 +350,7 @@ int main(int argc, char** argv) {
                         }
                     }
                     const auto t0 = Clock::now();
-                    rt.tick(16, in);
+                    oa::test::replay(rt, in);
                     // ---- host frame pump: the real core-side pump ----
                     // (图像源自己在 tick 里推送，探针不再拉取)
                     // loop makes; the probe's local rev map is no longer the

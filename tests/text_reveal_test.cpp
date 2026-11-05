@@ -12,6 +12,7 @@
 
 #include "core/fs/fs.h"
 #include "core/runtime/runtime_game.h"
+#include "fpm/host_input.h"
 #include "core/render/text.h"
 
 namespace {
@@ -102,28 +103,27 @@ void test_runtime_click_reveal_gate() {
     rt.open_project("windows");
     rt.boot_project();
     oa::runtime::FrameInput idle;
-    rt.tick(16, idle);
+    oa::test::frame(rt);
     (void)rt.drain_events();
-    const oa::runtime::WaitReason* w = rt.current_wait();
-    check(w && w->kind == oa::runtime::WaitReason::Kind::Generic,
+    const oa::runtime::Wait* w = rt.current_wait();
+    check(w && w->waiting_click(),
           "U5 script parks at [@]");
     check(!rt.text().is_reveal_complete(), "U5 reveal still pending");
     // 首击：只整页揭示，不离开等待
     oa::runtime::FrameInput click;
     click.left_click_edge = true;
-    rt.tick(16, click);
+    oa::test::replay(rt, click);
     (void)rt.drain_events();
     check(rt.text().is_reveal_complete(), "U5 first click reveals the page");
-    check(rt.current_wait() && rt.current_wait()->kind ==
-                                   oa::runtime::WaitReason::Kind::Generic,
+    check(rt.current_wait() && rt.current_wait()->waiting_click(),
           "U5 first click does not leave the wait");
     // 二击：推进（/chgmsg + [stop]）
-    rt.tick(16, click);
+    oa::test::replay(rt, click);
     (void)rt.drain_events();
-    rt.tick(16, idle);
+    oa::test::frame(rt);
     (void)rt.drain_events();
     w = rt.current_wait();
-    check(w && w->kind == oa::runtime::WaitReason::Kind::Stop,
+    check(w && w->is_park(),
           "U5 second click advances to [stop]");
 }
 
@@ -247,7 +247,7 @@ void test_click_wait_icon_driving() {
         rt.open_project("windows");
         rt.boot_project();
         oa::runtime::FrameInput idle;
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         (void)rt.drain_events();
         const oa::render::Layer* ic = rt.scene().find("icon");
         check(ic && ic->visible, "U12 icon shown at Generic wait + reveal complete");
@@ -255,13 +255,13 @@ void test_click_wait_icon_driving() {
               "U12 homing writes placement (text-area end + glyph offset)");
         oa::runtime::FrameInput click;
         click.left_click_edge = true;
-        rt.tick(16, click);
+        oa::test::replay(rt, click);
         (void)rt.drain_events();
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         (void)rt.drain_events();
         ic = rt.scene().find("icon");
         check(rt.current_wait() &&
-                  rt.current_wait()->kind == oa::runtime::WaitReason::Kind::Stop,
+                  rt.current_wait()->is_park(),
               "U12 script parks at [stop] after the click wait");
         check(ic && !ic->visible, "U12 icon hidden when the click wait leaves");
     }
@@ -286,7 +286,7 @@ void test_click_wait_icon_driving() {
         rt.open_project("windows");
         rt.boot_project();
         oa::runtime::FrameInput idle;
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         (void)rt.drain_events();
         const oa::render::Layer* ic = rt.scene().find("icon");
         check(rt.text().is_reveal_complete() == false, "U12 reveal still pending");
@@ -294,19 +294,19 @@ void test_click_wait_icon_driving() {
         oa::runtime::FrameInput click;
         click.left_click_edge = true;
         // 首击：只整页揭示，等待仍在 → 图标出现
-        rt.tick(16, click);
+        oa::test::replay(rt, click);
         (void)rt.drain_events();
         ic = rt.scene().find("icon");
         check(rt.text().is_reveal_complete(), "U12 first click reveals the page");
         check(ic && ic->visible, "U12 icon appears once reveal is complete");
         // 二击：推进 → [stop] → 隐藏
-        rt.tick(16, click);
+        oa::test::replay(rt, click);
         (void)rt.drain_events();
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         (void)rt.drain_events();
         ic = rt.scene().find("icon");
         check(rt.current_wait() &&
-                  rt.current_wait()->kind == oa::runtime::WaitReason::Kind::Stop,
+                  rt.current_wait()->is_park(),
               "U12 second click reaches [stop]");
         check(ic && !ic->visible, "U12 icon hidden after advancing");
     }

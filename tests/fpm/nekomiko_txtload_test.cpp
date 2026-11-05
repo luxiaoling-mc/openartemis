@@ -41,6 +41,7 @@
 
 #include "core/fs/physfs_fs.h"
 #include "core/runtime/runtime_game.h"
+#include "host_input.h"
 #include "core/runtime/runtime_save.h"
 
 namespace {
@@ -56,25 +57,29 @@ void check(bool cond, const char* fmt, ...) {
         ++failures;
     }
 }
-const char* ws(const oa::runtime::WaitReason* w) {
-    using K = oa::runtime::WaitReason::Kind;
+const char* ws(const oa::runtime::Wait* w) {
     if (!w) return "none";
-    switch (w->kind) {
-        case K::Generic: return "generic";
-        case K::Generic0: return "wt0";
-        case K::Timed: return "timed";
-        case K::Stop: return "stop";
-        case K::Se: return "se";
-        case K::VideoLayer: return "video";
-        case K::ScenarioTween: return "stween";
-        case K::KeyWait: return "key";
+    using S = oa::runtime::Wait::Stage;
+    switch (w->stage) {
+        case S::Trans: return "trans";
+        case S::Video: return "video";
+        case S::VideoLayer: return "video-layer";
+        case S::Se: return "se";
+        case S::AllDelete: return "alldelete";
+        case S::Tween: return "tween";
+        case S::None: break;
     }
-    return "?";
+    if (w->timed()) return "timed";
+    if (w->on_reveal_done) return "reveal";
+    if (w->reveal_clear) return "reveal-clear";
+    if (!w->keys.empty()) return "key";
+    if (w->waiting_click()) return "click";
+    return "park";
 }
-bool is_page_wait(const oa::runtime::WaitReason* w) {
+bool is_page_wait(const oa::runtime::Wait* w) {
     if (!w) return false;
-    return w->kind == oa::runtime::WaitReason::Kind::Generic ||
-           w->kind == oa::runtime::WaitReason::Kind::Generic0;
+    return w->waiting_click() ||
+           w->waiting_click();
 }
 std::string sample(oa::runtime::GameRuntime& rt) {
     for (const std::string& lid : rt.text().visible_content_layers()) {
@@ -96,7 +101,7 @@ bool reveal_done(const oa::runtime::GameRuntime& rt) {
 }
 void tickg(oa::runtime::GameRuntime& rt, const oa::runtime::FrameInput& in) {
     try {
-        rt.tick(16, in);
+        oa::test::replay(rt, in);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "TICK CRASH: %s\n", e.what());
         std::fflush(stderr);
@@ -354,7 +359,7 @@ int main() {
             }
             const auto* w = rt.current_wait();
             const bool parked_title =
-                w && w->kind == oa::runtime::WaitReason::Kind::Stop && w->id.empty() &&
+                w && w->is_park() && w->stage_id.empty() &&
                 has_key_handler(rt, "bt_start");
             if (parked_title && !title_clicked) {
                 title_clicked = click_key(rt, "bt_start");

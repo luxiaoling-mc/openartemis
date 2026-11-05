@@ -18,31 +18,36 @@
 
 #include "core/fs/physfs_fs.h"
 #include "core/runtime/runtime_game.h"
+#include "host_input.h"
 
 namespace {
-const char* kind_str(oa::runtime::WaitReason::Kind k) {
-    using K = oa::runtime::WaitReason::Kind;
-    switch (k) {
-        case K::Generic: return "generic";
-        case K::Generic0: return "wt0";
-        case K::Timed: return "timed";
-        case K::Stop: return "stop";
-        case K::Se: return "se";
-        case K::VideoLayer: return "video";
-        case K::ScenarioTween: return "stween";
-        case K::KeyWait: return "key";
-    }
-    return "?";
-}
-std::string wait_str(const oa::runtime::WaitReason* w) {
+const char* kind_str(const oa::runtime::Wait* w) {
     if (!w) return "none";
-    std::string s = kind_str(w->kind);
-    if (!w->id.empty()) s += "('" + w->id + "')";
+    using S = oa::runtime::Wait::Stage;
+    switch (w->stage) {
+        case S::Trans: return "trans";
+        case S::Video: return "video";
+        case S::VideoLayer: return "video-layer";
+        case S::Se: return "se";
+        case S::AllDelete: return "alldelete";
+        case S::Tween: return "tween";
+        case S::None: break;
+    }
+    if (w->timed()) return "timed";
+    if (w->on_reveal_done) return "reveal";
+    if (w->reveal_clear) return "reveal-clear";
+    if (!w->keys.empty()) return "key";
+    if (w->waiting_click()) return "click";
+    return "park";
+}
+std::string wait_str(const oa::runtime::Wait* w) {
+    if (!w) return "none";
+    std::string s = kind_str(w);
+    if (!w->stage_id.empty()) s += "('" + w->stage_id + "')";
     return s;
 }
-bool is_story_park(const oa::runtime::WaitReason* w) {
-    using K = oa::runtime::WaitReason::Kind;
-    return w && (w->kind == K::Generic || w->kind == K::Generic0);
+bool is_story_park(const oa::runtime::Wait* w) {
+    return w && w->waiting_click();
 }
 std::string page_sample(oa::runtime::GameRuntime& rt) {
     const oa::render::MessageLayer* ml = rt.text().layer("1.80.mw.adv_adv");
@@ -97,10 +102,10 @@ int main() {
         };
         size_t boot = 0;
         for (; boot < 2400 && !rt.exit_requested(); ++boot) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             if (!saw_title_init) continue;
             const auto* w = rt.current_wait();
-            if (!(w && w->kind == oa::runtime::WaitReason::Kind::Stop && w->id.empty()))
+            if (!(w && w->is_park() && w->stage_id.empty()))
                 continue;
             for (const oa::render::Layer* l : rt.scene().draw_order()) {
                 const auto* h = rt.scene().find_event_handler(l->id, "click");
@@ -132,9 +137,9 @@ int main() {
             return 1;
         }
         for (size_t stl = 0; stl < 4000 && !rt.exit_requested(); ++stl) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             const auto* wq = rt.current_wait();
-            if (!(wq && wq->kind == oa::runtime::WaitReason::Kind::Stop && wq->id.empty()))
+            if (!(wq && wq->is_park() && wq->stage_id.empty()))
                 continue;
             if (!rt.transition().is_in_progress(rt.now_ms())) break;
         }
@@ -148,7 +153,7 @@ int main() {
                     in.left_down = true;
                     done = true;
                 }
-                rt.tick(16, in);
+                oa::test::replay(rt, in);
                 if (rt.scene().find("500") == nullptr) break;
             }
         }
@@ -164,7 +169,7 @@ int main() {
                 in.mouse_x = cands[ci][0];
                 in.mouse_y = cands[ci][1];
                 for (size_t f = 0; f < 500 && !rt.exit_requested(); ++f) {
-                    rt.tick(16, in);
+                    oa::test::replay(rt, in);
                     in.left_click_edge = false;
                     in.left_down = false;
                     in.mouse_x = -1;
@@ -179,7 +184,7 @@ int main() {
         bool body_reached = false;
         size_t f0 = 0;
         for (; f0 < 8000 && !rt.exit_requested(); ++f0) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             if (rt.text().page_has_visible_text("1.80.mw.adv_adv")) {
                 body_reached = true;
                 break;
@@ -207,7 +212,7 @@ int main() {
         // Wait for the current page to finish revealing (no clicks), then
         // enable automode through the real Lua entry (MW auto button path).
         for (size_t f = 0; f < 4000 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             bool rev_done = true;
             for (const std::string& id : rt.text().visible_content_layers()) {
                 const oa::render::MessageLayer* ml = rt.text().layer(id);
@@ -222,7 +227,7 @@ int main() {
         rt.interpreter().lua_bridge().run_code(
             "if type(automode_start)=='function' then automode_start() end",
             "automode_probe");
-        for (size_t f = 0; f < 60; ++f) rt.tick(16, idle);
+        for (size_t f = 0; f < 60; ++f) oa::test::frame(rt);
         std::printf("[am] automode active=%d wait=%s playing=[%s]\n",
                     (int)rt.automode_active(), wait_str(rt.current_wait()).c_str(),
                     playing_now(rt).c_str());
@@ -279,10 +284,10 @@ int main() {
             }
             // bail out when a non-story park persists (title/stop end state)
             if (w && !is_story_park(w) && parked_at == 0 && f > 2000 &&
-                w->kind == oa::runtime::WaitReason::Kind::Stop) {
+                w->is_park()) {
                 break;
             }
-            rt.tick(16, idle);
+            oa::test::frame(rt);
         }
         std::printf("[am] pages=%zu releases_while_park_voice_playing=%zu\n", pages,
                     rel_while_voice);

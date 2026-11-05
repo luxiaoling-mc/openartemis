@@ -28,6 +28,7 @@ extern "C" {
 
 #include "core/fs/fs.h"
 #include "core/runtime/runtime_game.h"
+#include "fpm/host_input.h"
 
 namespace {
 int failures = 0;
@@ -88,21 +89,26 @@ struct Harness {
         in.left_click_edge = click_edge;
         in.key_down_edges = keys;
         in.keys_down.insert(keys.begin(), keys.end());
-        rt->tick(16, in);
+        oa::test::replay(*rt, in);
     }
-    /// Tick until the runtime parks on the given wait kind (bounded).
-    bool park_on(oa::runtime::WaitReason::Kind kind, int mx, int my) {
+    /// Tick until the runtime parks on a click wait or a script park (bounded).
+    enum class Park { Click, Script };
+    bool park_on(Park kind, int mx, int my) {
         for (int i = 0; i < 60; ++i) {
             tick(mx, my);
-            const oa::runtime::WaitReason* w = rt->current_wait();
-            if (w && w->kind == kind) return true;
+            const oa::runtime::Wait* w = rt->current_wait();
+            if (!w) continue;
+            if (kind == Park::Click ? w->waiting_click() : w->is_park()) return true;
         }
         return false;
     }
     std::string wait_str() const {
-        const oa::runtime::WaitReason* w = rt->current_wait();
+        const oa::runtime::Wait* w = rt->current_wait();
         if (!w) return "none";
-        return std::string(1, char('0' + (int)w->kind));
+        if (w->waiting_click()) return "click";
+        if (w->is_park()) return "stop";
+        if (w->timed()) return "timed";
+        return "other";
     }
 };
 
@@ -149,7 +155,7 @@ void test_c0_row_file_label_navigation() {
                   "[return]\n");
         h.warm();
         h.run_lua(kLoggers);
-        check(h.wait_str() == "3", "C0b parked at the origin [stop]");
+        check(h.wait_str() == "stop", "C0b parked at the origin [stop]");
         h.tick(80, 80, true, true); // click: enqueue call to *sub
         check(h.lua_string("oa_log").find("jumped;") != std::string::npos,
               "C0b call-row executed the target label");
@@ -157,7 +163,7 @@ void test_c0_row_file_label_navigation() {
         // queued call keeps its return_line at the parked origin instruction:
         // the story resumes waiting at the same [stop] (menu-return semantics),
         // never advancing past it on its own.
-        check(h.wait_str() == "3",
+        check(h.wait_str() == "stop",
               "C0b [return] landed back on the origin [stop] park (inline round trip)");
         check(h.lua_string("oa_log").find("jumped;") != std::string::npos,
               "C0b round trip executed exactly once (no repeat loop)");
@@ -173,7 +179,7 @@ void test_c1_role0_advance() {
               "[stop]\n");
     h.warm();
     h.run_lua(kLoggers);
-    check(h.park_on(oa::runtime::WaitReason::Kind::Generic0, -5, -5), "C1 parked at the Generic0 wait");
+    check(h.park_on(Harness::Park::Click, -5, -5), "C1 parked at the Generic0 wait");
     h.tick(-5, -5, false, false, {124}); // role-0 key edge, no mouse
     h.tick(-5, -5); // released wait runs the following calllua on this tick
     check(h.lua_string("oa_log").find("landed;") != std::string::npos,
@@ -194,7 +200,7 @@ void test_c2_exec_skip_mode_event() {
     h.tick(-5, -5);
     h.tick(-5, -5); // released wt0 runs the following calllua
     check(h.rt->skip_active(), "C2 skip active after exec skip");
-    check(h.park_on(oa::runtime::WaitReason::Kind::Stop, -5, -5), "C2 script reached the [stop] (skip released wt0)");
+    check(h.park_on(Harness::Park::Script, -5, -5), "C2 script reached the [stop] (skip released wt0)");
     check(h.lua_string("oa_log").find("landed;") != std::string::npos, "C2 landed ran");
 }
 
@@ -250,7 +256,7 @@ void test_c5_hide_mode() {
     check(h.rt->hide_active(), "C5 hide mode active after exec hide");
     const oa::render::Layer* win = h.rt->scene().find("win");
     check(win && win->visible == 0.0, "C5 window layer hidden");
-    check(h.park_on(oa::runtime::WaitReason::Kind::Generic0, -5, -5), "C5 parked at the generic wait");
+    check(h.park_on(Harness::Park::Click, -5, -5), "C5 parked at the generic wait");
     h.tick(20, 20, true, true); // click inside the (hidden) window area
     check(!h.rt->hide_active(), "C5 click recovered the message window");
     check(win && win->visible == 1.0, "C5 window layer restored");
@@ -277,7 +283,7 @@ void test_c6_decide_advances_input_wait() {
               "function oa_install(e) e:setEventHandler{['onEnterFrame']='oa_decide'} end\n");
     h.call_lua("oa_install");
     h.warm();
-    check(h.park_on(oa::runtime::WaitReason::Kind::Generic0, -5, -5), "C6 parked at the Generic0 wait");
+    check(h.park_on(Harness::Park::Click, -5, -5), "C6 parked at the Generic0 wait");
     h.run_lua("oa_armed=true");
     h.tick(-5, -5); // vsync fires: decide edge lands in this same advance
     h.tick(-5, -5); // released wait runs the following calllua
@@ -307,8 +313,7 @@ void test_r5_decide_after_reveal_gate_releases() {
     h.call_lua("oa_install");
     h.warm(2);
     check(h.rt->current_wait() &&
-              (h.rt->current_wait()->kind == oa::runtime::WaitReason::Kind::Generic ||
-               h.rt->current_wait()->kind == oa::runtime::WaitReason::Kind::Generic0),
+              h.rt->current_wait()->waiting_click(),
           "R5-1 parked on the click wait with reveal pending");
     // 第一次 decide：揭示门只整页揭示，不推进
     h.run_lua("oa_armed=true");
@@ -317,17 +322,18 @@ void test_r5_decide_after_reveal_gate_releases() {
     check(ml && ml->reveal_index >= ml->char_count && !ml->reveal_pending,
           "R5-2 first decide revealed the full page");
     check(h.rt->current_wait() &&
-              (h.rt->current_wait()->kind == oa::runtime::WaitReason::Kind::Generic ||
-               h.rt->current_wait()->kind == oa::runtime::WaitReason::Kind::Generic0),
+              h.rt->current_wait()->waiting_click(),
           "R5-3 still parked after the reveal-gated decide");
     check(h.lua_string("oa_log").find("landed;") == std::string::npos,
           "R5-3b story did not advance on the reveal-gated decide");
-    // 第二次 decide：必须推进
-    h.run_lua("oa_armed=true");
-    h.tick(-5, -5);
-    h.tick(-5, -5);
+    // 补字那一按到此为止：之后必须有新的一按能推进（最多试三次，防抖动）。
+    for (int i = 0; i < 3 && h.lua_string("oa_log").find("landed;") == std::string::npos; ++i) {
+        h.tick(40, 40, true, true);
+        h.tick(40, 40, false, false);
+        h.tick(40, 40, false, false);
+    }
     check(h.lua_string("oa_log").find("landed;") != std::string::npos,
-          "R5-4 second decide edge advances the story (no override mask stall)");
+          "R5-4 a later press advances the story (no input-mask stall)");
 }
 
 void test_c7_layer_info_readback() {

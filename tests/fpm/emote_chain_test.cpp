@@ -38,6 +38,7 @@
 
 #include "core/fs/physfs_fs.h"
 #include "core/runtime/runtime_game.h"
+#include "host_input.h"
 #include "core/runtime/runtime_save.h"
 #include "core/media/image.h"
 #include <array>
@@ -75,7 +76,7 @@ int main() {
     // let the boot Lua run until it parks somewhere
     oa::runtime::FrameInput idle;
     size_t f = 0;
-    for (; f < 9000 && !rt.current_wait(); ++f) rt.tick(16, idle);
+    for (; f < 9000 && !rt.current_wait(); ++f) oa::test::frame(rt);
     std::printf("[emote] parked at f=%zu wait='%s'\n", f,
                 rt.current_wait() ? "" : "(none)");
 
@@ -97,7 +98,7 @@ e:createEmoteLayer{ id='1.0.1.fg.aya.p.m.a.b.0',
     // Drain: the lyc2 + emotestatic instructions process over the next ticks.
     const size_t start_events = rt.emote_layer_events();
     for (f = 0; f < 6000 && rt.emote_layer_events() == start_events; ++f)
-        rt.tick(16, idle);
+        oa::test::frame(rt);
     std::printf("[emote] after %zu ticks events=%zu layers=%zu wait='%s' layer=%s\n", f,
                 rt.emote_layer_events(), rt.emote_layers().size(),
                 rt.current_wait() ? "set" : "none",

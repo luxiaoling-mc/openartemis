@@ -27,6 +27,7 @@
 #include "core/fs/physfs_fs.h"
 #include "core/render/renderer.h"
 #include "core/runtime/runtime_game.h"
+#include "host_input.h"
 
 namespace {
 using Clock = std::chrono::steady_clock;
@@ -42,7 +43,7 @@ size_t rss_mb() {
 }
 void tick_n(oa::runtime::GameRuntime& rt, int n) {
     oa::runtime::FrameInput in;
-    for (int i = 0; i < n; ++i) rt.tick(16, in);
+    for (int i = 0; i < n; ++i) oa::test::replay(rt, in);
 }
 } // namespace
 

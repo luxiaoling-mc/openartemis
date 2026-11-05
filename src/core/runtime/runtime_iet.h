@@ -230,27 +230,57 @@ struct ScriptError : std::runtime_error {
 // Events
 // ---------------------------------------------------------------------------
 
-struct WaitReason {
-    enum class Kind {
-        Generic,        // [@]
-        Generic0,       // [wt0]
-        Timed,          // [wt]/[wait]: ms + input policy
-        Stop,           // [stop]: positional "0" reason text
-        Se,             // [wait se=]: id + optional ms from play start
-        VideoLayer,     // [wait video=]: layer id
-        ScenarioTween,  // [wait scenario=1|2]
-        KeyWait,        // [exkey]: button list
+/// 一次脚本停驻。
+struct Wait {
+    /// 能释放这次停驻的条件，任一成立即继续（stage 未完成时除外）。
+    enum Release : uint32_t {
+        OnClick = 1u << 0,  // 物理点击
+        OnDecide = 1u << 1, // 脚本 decide 边缘（setexclick / overrideKey）
+        OnSkip = 1u << 2,   // 跳过：skip 模式
+        OnAuto = 1u << 4,   // 自动模式计时
     };
-    Kind kind = Kind::Generic;
-    std::string id; // Stop reason / Se id / VideoLayer id
-    std::vector<std::string> buttons;
-    uint64_t milliseconds = 0;
-    int64_t input = 0; // Timed: 0 timer-only, 1 clickable, 2 skip-pass
-    int64_t mode = 0;  // ScenarioTween mode
-    /// [wait se=ID time=N] with an explicit time param: N counts from the
-    /// SE's play start; without
-    /// the param the wait holds until the sound actually ends.
-    bool time_given = false;
+
+    /// 阻塞式演出：完成后才放行（点击/跳过可让它提前结束）。
+    enum class Stage {
+        None,
+        Trans,      // [trans]
+        Video,      // 全屏视频
+        VideoLayer, // [wait video=]
+        Se,         // [wait se=]
+        AllDelete,  // [alldelete]
+        Tween,      // [lytween sync=1]
+    };
+
+    uint32_t release = OnSkip;
+    /// 计时停驻的剩余毫秒；-1 表示"没有计时器"。0 是合法时长（下一帧放行）。
+    int64_t timer_ms = -1;
+    std::vector<int> keys;       // [exkey]：这些键可放行
+    bool on_reveal_done = false; // [wait scenario=1]：等逐字完成
+    bool reveal_clear = false;   // [wait scenario=2]：瞬显，立即继续
+    bool ends_exskip = false;    // [stop 0="exskip"]：放行并结束快进
+
+    Stage stage = Stage::None;
+    std::string stage_id;
+    bool se_time_given = false; // [wait se= time=]：从播放起算
+    uint64_t se_time_ms = 0;
+
+    bool can(uint32_t r) const { return (release & r) != 0; }
+    bool timed() const { return timer_ms >= 0; }
+    /// 可以把输入事件标记挂在哪个停驻上：脚本停驻、点击停驻、
+    /// 只受跳过控制的计时（普通计时等待本来就在跑，不需要锚点）。
+    bool is_input_anchor() const {
+        return is_park() || waiting_click() || (timed() && !can(OnClick));
+    }
+    /// 一个"等点击"的页（用于点击提示图标）：只受点击/跳过影响的空停驻。
+    bool waiting_click() const {
+        return stage == Stage::None && !timed() && keys.empty() && !on_reveal_done &&
+               !reveal_clear && can(OnClick);
+    }
+    /// 脚本停驻（物理点击不放行）：[stop] 及其演出 gate。
+    bool is_park() const {
+        return stage != Stage::None ||
+               (!can(OnClick) && !reveal_clear && !on_reveal_done && !timed());
+    }
 };
 
 struct Event {
@@ -279,15 +309,15 @@ struct Event {
     Kind kind = Kind::Wait_;
     std::string content; // ScenarioText
     bool inline_text = false;
-    WaitReason reason; // Wait_
+    Wait wait; // Wait_
     std::string tag;   // Custom / TextConfig / ConfigEvent / LayerEventCmd
     std::map<std::string, std::string> params;
     std::string id;    // layer / message-layer events
 
-    static Event wait(WaitReason r) {
+    static Event park_on(Wait w) {
         Event e;
         e.kind = Kind::Wait_;
-        e.reason = std::move(r);
+        e.wait = std::move(w);
         return e;
     }
     static Event custom(std::string t, std::map<std::string, std::string> p) {

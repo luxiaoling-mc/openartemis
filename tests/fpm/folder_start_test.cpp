@@ -24,6 +24,7 @@
 
 #include "core/fs/physfs_fs.h"
 #include "core/runtime/runtime_game.h"
+#include "host_input.h"
 
 namespace {
 int failures = 0;
@@ -49,7 +50,7 @@ struct StatTuple {
 };
 StatTuple drive900(oa::runtime::GameRuntime& rt) {
     oa::runtime::FrameInput idle;
-    for (size_t f = 0; f < 900; ++f) rt.tick(16, idle);
+    for (size_t f = 0; f < 900; ++f) oa::test::frame(rt);
     StatTuple t;
     t.layers = rt.scene().size();
     t.layer_ev = rt.scene_layer_events();
@@ -59,7 +60,7 @@ StatTuple drive900(oa::runtime::GameRuntime& rt) {
     for (const oa::render::Layer* l : rt.scene().draw_order())
         if (!l->event_handlers.empty()) ++t.handlers;
     const auto* w = rt.current_wait();
-    t.wait_stop = w && w->kind == oa::runtime::WaitReason::Kind::Stop ? 1 : 0;
+    t.wait_stop = w && w->is_park() ? 1 : 0;
     t.media_ev = rt.media_events();
     t.audio_players = rt.media_players().active_players();
     t.bgm = rt.audio().is_bgm_playing() ? 1 : 0;

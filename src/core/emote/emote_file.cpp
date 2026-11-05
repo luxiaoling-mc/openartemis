@@ -148,6 +148,22 @@ bool EmoteFile::load(const uint8_t* data, size_t size, std::string* err) {
             variableDefaults[sel.options[i].label] = v;
         }
     }
+    // Standard-variable fallback for "差分なし" models (iMel-style packs):
+    // 全体構造/全身変形基礎 里根本没有 body_UD 的变形参数，而作者写的 idle
+    // 时间轴（待機）唯一的轨道就是 body_UD —— 结果立绘站得纹丝不动。这类模型
+    // 通常保留了整体位移轴 move_UD，于是把作者写的体偏移折到该轴上
+    // （EvalCtx::var_value）。有 body_UD consumer 的模型不受影响；纯数据判定。
+    {
+        const auto has_param = [this](const char* id) {
+            for (const auto& m : motions)
+                for (const auto& p : m.parameter)
+                    if (p.id == id) return true;
+            return false;
+        };
+        body_ud_to_move_ud = !has_param("body_UD") &&
+                             has_param("move_UD") &&
+                             variableDefaults.count("body_UD") > 0;
+    }
     // fresh identity for this parse (see EmoteFile::uid): the renderer keys its
     // long-lived atlas textures on it, so a game that swaps the character file
     // behind one layer id can never be served the previous file's atlas.

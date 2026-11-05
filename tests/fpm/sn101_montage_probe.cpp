@@ -43,27 +43,21 @@
 
 #include "core/fs/physfs_fs.h"
 #include "core/runtime/runtime_game.h"
+#include "host_input.h"
 #include "core/runtime/runtime_save.h"
 #include "core/render/layer.h"
 
 namespace {
-using K = oa::runtime::WaitReason::Kind;
-const char* ws(const oa::runtime::WaitReason* w) {
+
+const char* ws(const oa::runtime::Wait* w) {
     if (!w) return "none";
-    switch (w->kind) {
-        case K::Generic: return "generic";
-        case K::Generic0: return "wt0";
-        case K::Timed: return "timed";
-        case K::Stop: return "stop";
-        case K::Se: return "se";
-        case K::VideoLayer: return "video";
-        case K::ScenarioTween: return "stween";
-        case K::KeyWait: return "key";
-    }
-    return "?";
+    if (w->waiting_click()) return "click";
+    if (w->is_park()) return "stop";
+    if (w->timed()) return "timed";
+    return "other";
 }
-bool story_wait(const oa::runtime::WaitReason* w) {
-    return w && (w->kind == K::Generic || w->kind == K::Generic0);
+bool story_wait(const oa::runtime::Wait* w) {
+    return w && w->waiting_click();
 }
 std::string sample(oa::runtime::GameRuntime& rt) {
     for (const std::string& id : rt.text().visible_content_layers()) {
@@ -126,7 +120,7 @@ void host_apply_drained(oa::runtime::GameRuntime& rt) {
     }
 }
 void host_step(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& in) {
-    rt.tick(16, in);
+    oa::test::replay(rt, in);
     host_apply_drained(rt);
 }
 
@@ -263,7 +257,7 @@ int main() {
     for (size_t f = 0; f < 60000 && !rt.exit_requested(); ++f) {
         host_step(rt, idle);
         if (has_key(rt, "bt_start") && rt.current_wait() &&
-            rt.current_wait()->kind == K::Stop && rt.current_wait()->id.empty()) {
+            rt.current_wait()->is_park() && rt.current_wait()->stage_id.empty()) {
             f_title = int(f);
             break;
         }
@@ -350,13 +344,14 @@ int main() {
         }
         // wait skeleton
         const auto* w = rt.current_wait();
-        const int wk = w ? int(w->kind) : -1;
-        const std::string wid = w ? w->id : std::string();
+        const int wk = !w ? -1 : w->waiting_click() ? 0 : w->is_park() ? 1
+                        : w->timed() ? 2 : 3;
+        const std::string wid = w ? w->stage_id : std::string();
         if (wk != m.last_wk || wid != m.last_wid) {
             m.last_wk = wk;
             m.last_wid = wid;
             uint64_t dur = 0;
-            if (w && w->kind == K::Timed) dur = w->milliseconds;
+            if (w && w->timed()) dur = w->timer_ms;
             std::printf("[snp] f=%llu wait-> %s id='%s' dur=%llums\n",
                         (unsigned long long)fr, ws(w), wid.c_str(),
                         (unsigned long long)dur);
@@ -511,7 +506,7 @@ int main() {
                     host_step(rt, idle);
                     const auto* w2 = rt.current_wait();
                     if (rt.scene().size() > base + 40 || rt.scene().find("500.bt.1.bg.0") ||
-                        (w2 && w2->kind == K::Stop && w2->id.empty())) {
+                        (w2 && w2->is_park() && w2->stage_id.empty())) {
                         opened = true;
                         break;
                     }

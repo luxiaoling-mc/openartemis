@@ -26,33 +26,37 @@
 #include "core/fs/physfs_fs.h"
 #include "core/fs/project.h"
 #include "core/runtime/runtime_game.h"
+#include "host_input.h"
 #include "core/runtime/runtime_save.h"
 #include "core/render/layer.h"
 #include "core/render/text.h"
 
 namespace {
 
-const char* wk(const oa::runtime::WaitReason* w) {
-    using K = oa::runtime::WaitReason::Kind;
-    if (!w) return "?";
-    switch (w->kind) {
-        case K::Generic: return "generic";
-        case K::Generic0: return "wt0";
-        case K::Timed: return "timed";
-        case K::Stop: return "stop";
-        case K::Se: return "se";
-        case K::VideoLayer: return "video";
-        case K::ScenarioTween: return "scenario-tween";
-        case K::KeyWait: return "key";
+const char* wk(const oa::runtime::Wait* w) {
+    if (!w) return "none";
+    using S = oa::runtime::Wait::Stage;
+    switch (w->stage) {
+        case S::Trans: return "trans";
+        case S::Video: return "video";
+        case S::VideoLayer: return "video-layer";
+        case S::Se: return "se";
+        case S::AllDelete: return "alldelete";
+        case S::Tween: return "tween";
+        case S::None: break;
     }
-    return "?";
+    if (w->timed()) return "timed";
+    if (w->on_reveal_done) return "reveal";
+    if (w->reveal_clear) return "reveal-clear";
+    if (!w->keys.empty()) return "key";
+    if (w->waiting_click()) return "click";
+    return "park";
 }
 
-bool clickable(const oa::runtime::WaitReason* w) {
-    using K = oa::runtime::WaitReason::Kind;
+bool clickable(const oa::runtime::Wait* w) {
     if (!w) return false;
-    return w->kind == K::Generic || w->kind == K::Generic0 ||
-           w->kind == K::Timed || w->kind == K::Se || w->kind == K::KeyWait;
+    return w->waiting_click() || w->timed() ||
+           w->stage == oa::runtime::Wait::Stage::Se || !w->keys.empty();
 }
 
 struct Key { std::string key; int cx = 0, cy = 0; double w = 0, h = 0; };
@@ -87,7 +91,7 @@ bool click_key(oa::runtime::GameRuntime& rt, const std::string& key) {
             cl.left_down = true;
             cl.mouse_x = v.cx;
             cl.mouse_y = v.cy;
-            rt.tick(16, cl);
+            oa::test::replay(rt, cl);
             for (size_t f = 0; f < 10; ++f) rt.tick(16, {});
             std::printf("[bt91] clicked '%s' at (%d,%d)\n", key.c_str(), v.cx,
                         v.cy);
@@ -317,18 +321,18 @@ int main(int argc, char** argv) {
         };
         bool at_title = false;
         for (size_t f = 0; f < 80000 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             if (!title) continue;
             const auto* w = rt.current_wait();
-            if (w && w->kind == oa::runtime::WaitReason::Kind::Stop &&
-                w->id.empty()) {
+            if (w && w->is_park() &&
+                w->stage_id.empty()) {
                 at_title = true;
                 break;
             }
         }
         std::printf("[bt91] title parked: %d (exit=%d)\n", (int)at_title,
                     (int)rt.exit_requested());
-        for (size_t f = 0; f < 60; ++f) rt.tick(16, idle);
+        for (size_t f = 0; f < 60; ++f) oa::test::frame(rt);
         if (!at_title) {
             auto ks = list_keys(rt);
             std::printf("[bt91] pre-title screen; click keys: %zu\n",
@@ -342,7 +346,7 @@ int main(int argc, char** argv) {
         const char* prekeys = std::getenv("OA_BT91_PRE");
         auto nav_once = [&](const std::string& key, int) {
             for (int f = 0; f < 4000; ++f) {
-                rt.tick(16, idle);
+                oa::test::frame(rt);
                 if (rt.exit_requested()) return false;
                 for (const auto& v : list_keys(rt))
                     if (v.key == key) return click_key(rt, key);
@@ -369,10 +373,10 @@ int main(int argc, char** argv) {
             std::printf("[bt91] load %s ok=%d\n", load_name, (int)ok);
             started = ok;
             if (ok && std::getenv("OA_BT91_LUABLOG_IMMED")) {
-                for (size_t q = 0; q < 240; ++q) rt.tick(16, idle);
+                for (size_t q = 0; q < 240; ++q) oa::test::frame(rt);
                 std::printf("[bt91] lua adv_backlog (immed)\n");
                 rt.interpreter().lua_bridge().call_plain("adv_backlog");
-                for (size_t q = 0; q < 120; ++q) rt.tick(16, idle);
+                for (size_t q = 0; q < 120; ++q) oa::test::frame(rt);
                 if (is_blog_open(rt)) {
                     dump_blog(c, "blog");
                     std::printf("[bt91] DONE after immed blog dump\n");
@@ -385,7 +389,7 @@ int main(int argc, char** argv) {
             const char* start_key = kw ? kw : "bt_start";
             started = click_key(rt, start_key);
             if (started && kw) {
-                for (size_t f = 0; f < 240; ++f) rt.tick(16, idle);
+                for (size_t f = 0; f < 240; ++f) oa::test::frame(rt);
                 auto ks = list_keys(rt);
                 std::printf("[bt91] keys after '%s':\n", start_key);
                 for (const auto& k : ks)
@@ -393,7 +397,7 @@ int main(int argc, char** argv) {
                 if (std::getenv("OA_BT91_DBGKEYS")) return 0;
             }
             for (size_t f = 0; f < 300 && !started; ++f) {
-                rt.tick(16, idle);
+                oa::test::frame(rt);
                 if (any_story_text(c, "")) started = true;
             }
         }
@@ -414,11 +418,11 @@ int main(int argc, char** argv) {
         for (size_t f = 0; f < 4000000 && parks < pages_budget &&
                             !rt.exit_requested();
              ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             if (f8_sent && !blog_dumped) {
                 if (is_blog_open(rt)) {
                     std::printf("[bt91] BACKLOG OPEN f=%zu\n", f);
-                    for (size_t s = 0; s < 30; ++s) rt.tick(16, idle);
+                    for (size_t s = 0; s < 30; ++s) oa::test::frame(rt);
                     dump_blog(c, "blog");
                     blog_dumped = true;
                     std::printf("[bt91] DONE after blog dump\n");
@@ -459,18 +463,18 @@ int main(int argc, char** argv) {
                     if (std::getenv("OA_BT91_LUABLOG")) {
                         std::printf("[bt91] lua adv_backlog at f=%zu\n", f);
                         rt.interpreter().lua_bridge().call_plain("adv_backlog");
-                        for (size_t q = 0; q < 40; ++q) rt.tick(16, idle);
+                        for (size_t q = 0; q < 40; ++q) oa::test::frame(rt);
                     } else {
                         std::printf("[bt91] sending F8 (backlog) f=%zu\n", f);
                         oa::runtime::FrameInput k;
                         k.key_down_edges.push_back(119);
-                        rt.tick(16, k);
+                        oa::test::replay(rt, k);
                     }
-                    for (size_t q = 0; q < 60; ++q) rt.tick(16, idle);
+                    for (size_t q = 0; q < 60; ++q) oa::test::frame(rt);
                     bool opened = is_blog_open(rt);
                     std::printf("[bt91] backlog opened=%d\n", (int)opened);
                     if (opened) {
-                        for (size_t q = 0; q < 60; ++q) rt.tick(16, idle);
+                        for (size_t q = 0; q < 60; ++q) oa::test::frame(rt);
                         dump_blog(c, "blog");
                         std::printf("[bt91] DONE after blog dump\n");
                         return 0;
@@ -503,8 +507,8 @@ int main(int argc, char** argv) {
                 cl.left_down = true;
                 cl.mouse_x = int(cx);
                 cl.mouse_y = int(cy);
-                rt.tick(16, cl);
-                for (size_t q = 0; q < 8; ++q) rt.tick(16, idle);
+                oa::test::replay(rt, cl);
+                for (size_t q = 0; q < 8; ++q) oa::test::frame(rt);
             } else if (!page_park) {
                 parked_prev = false;
             }

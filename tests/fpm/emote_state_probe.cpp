@@ -18,32 +18,37 @@
 
 #include "core/fs/physfs_fs.h"
 #include "core/runtime/runtime_game.h"
+#include "host_input.h"
 #include "core/runtime/runtime_save.h"
 
 namespace {
-const char* kind_str(oa::runtime::WaitReason::Kind k) {
-    using K = oa::runtime::WaitReason::Kind;
-    switch (k) {
-        case K::Generic: return "generic";
-        case K::Generic0: return "wt0";
-        case K::Timed: return "timed";
-        case K::Stop: return "stop";
-        case K::Se: return "se";
-        case K::VideoLayer: return "video";
-        case K::ScenarioTween: return "stween";
-        case K::KeyWait: return "key";
-    }
-    return "?";
-}
-std::string wait_str(const oa::runtime::WaitReason* w) {
+const char* kind_str(const oa::runtime::Wait* w) {
     if (!w) return "none";
-    std::string s = kind_str(w->kind);
-    if (!w->id.empty()) s += "('" + w->id + "')";
+    using S = oa::runtime::Wait::Stage;
+    switch (w->stage) {
+        case S::Trans: return "trans";
+        case S::Video: return "video";
+        case S::VideoLayer: return "video-layer";
+        case S::Se: return "se";
+        case S::AllDelete: return "alldelete";
+        case S::Tween: return "tween";
+        case S::None: break;
+    }
+    if (w->timed()) return "timed";
+    if (w->on_reveal_done) return "reveal";
+    if (w->reveal_clear) return "reveal-clear";
+    if (!w->keys.empty()) return "key";
+    if (w->waiting_click()) return "click";
+    return "park";
+}
+std::string wait_str(const oa::runtime::Wait* w) {
+    if (!w) return "none";
+    std::string s = kind_str(w);
+    if (!w->stage_id.empty()) s += "('" + w->stage_id + "')";
     return s;
 }
-bool is_story_park(const oa::runtime::WaitReason* w) {
-    using K = oa::runtime::WaitReason::Kind;
-    return w && (w->kind == K::Generic || w->kind == K::Generic0);
+bool is_story_park(const oa::runtime::Wait* w) {
+    return w && w->waiting_click();
 }
 std::string page_sample(oa::runtime::GameRuntime& rt) {
     const oa::render::MessageLayer* ml = rt.text().layer("1.80.mw.adv_adv");
@@ -102,7 +107,7 @@ bool click_key(oa::runtime::GameRuntime& rt, const std::string& key) {
             cl.left_down = true;
             cl.mouse_x = v.cx;
             cl.mouse_y = v.cy;
-            rt.tick(16, cl);
+            oa::test::replay(rt, cl);
             for (size_t f = 0; f < 10; ++f) rt.tick(16, {});
             std::printf("[es] clicked '%s' at (%d,%d)\n", key.c_str(), v.cx, v.cy);
             return true;
@@ -145,10 +150,10 @@ int main() {
         };
         size_t boot = 0;
         for (; boot < 2400 && !rt.exit_requested(); ++boot) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             if (!saw_title_init) continue;
             const auto* w = rt.current_wait();
-            if (!(w && w->kind == oa::runtime::WaitReason::Kind::Stop && w->id.empty()))
+            if (!(w && w->is_park() && w->stage_id.empty()))
                 continue;
             for (const oa::render::Layer* l : rt.scene().draw_order()) {
                 const auto* h = rt.scene().find_event_handler(l->id, "click");
@@ -180,9 +185,9 @@ int main() {
             return 1;
         }
         for (size_t stl = 0; stl < 4000 && !rt.exit_requested(); ++stl) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             const auto* wq = rt.current_wait();
-            if (!(wq && wq->kind == oa::runtime::WaitReason::Kind::Stop && wq->id.empty()))
+            if (!(wq && wq->is_park() && wq->stage_id.empty()))
                 continue;
             if (!rt.transition().is_in_progress(rt.now_ms())) break;
         }
@@ -196,15 +201,15 @@ int main() {
                     in.left_down = true;
                     done = true;
                 }
-                rt.tick(16, in);
+                oa::test::replay(rt, in);
                 if (rt.scene().find("500") == nullptr) break;
             }
         }
         // ---- start the story by clicking the real start button ------------
         click_key(rt, "bt_start");
-        for (size_t f = 0; f < 600; ++f) rt.tick(16, idle);
+        for (size_t f = 0; f < 600; ++f) oa::test::frame(rt);
         std::printf("[am] after-start wait=%s\n", wait_str(rt.current_wait()).c_str());
-        for (size_t f = 0; f < 120; ++f) rt.tick(16, idle);
+        for (size_t f = 0; f < 120; ++f) oa::test::frame(rt);
         for (const auto& k : list_keys(rt))
             std::printf("[es] key '%s' at (%d,%d) %.0fx%.0f\n", k.key.c_str(), k.cx,
                         k.cy, k.w, k.h);
@@ -222,7 +227,7 @@ int main() {
                 in.mouse_x = 960;
                 in.mouse_y = 700;
             }
-            rt.tick(16, in);
+            oa::test::replay(rt, in);
             if (page_sample(rt) != "-") {
                 body_reached = true;
                 break;
@@ -248,7 +253,7 @@ int main() {
         // Wait for the current page to finish revealing (no clicks), then
         // enable automode through the real Lua entry (MW auto button path).
         for (size_t f = 0; f < 4000 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             bool rev_done = true;
             for (const std::string& id : rt.text().visible_content_layers()) {
                 const oa::render::MessageLayer* ml = rt.text().layer(id);
@@ -263,7 +268,7 @@ int main() {
         rt.interpreter().lua_bridge().run_code(
             "if type(automode_start)=='function' then automode_start() end",
             "automode_probe");
-        for (size_t f = 0; f < 60; ++f) rt.tick(16, idle);
+        for (size_t f = 0; f < 60; ++f) oa::test::frame(rt);
         std::printf("[am] automode active=%d wait=%s playing=[%s]\n",
                     (int)rt.automode_active(), wait_str(rt.current_wait()).c_str(),
                     playing_now(rt).c_str());
@@ -306,10 +311,10 @@ int main() {
                 oa::runtime::FrameInput enter;
                 enter.key_down_edges = {13};
                 enter.keys_down.insert(13);
-                rt.tick(16, enter);
-                for (int k = 0; k < 30 && !rt.exit_requested(); ++k) rt.tick(16, idle);
+                oa::test::replay(rt, enter);
+                for (int k = 0; k < 30 && !rt.exit_requested(); ++k) oa::test::frame(rt);
             } else {
-                rt.tick(16, idle);
+                oa::test::frame(rt);
             }
         }
         std::printf("[es] pages=%zu\n", pages);

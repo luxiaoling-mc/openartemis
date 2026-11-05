@@ -30,6 +30,7 @@
 
 #include "core/fs/physfs_fs.h"
 #include "core/runtime/runtime_game.h"
+#include "host_input.h"
 
 namespace {
 int failures = 0;
@@ -39,11 +40,10 @@ void check(bool cond, const char* what) {
         ++failures;
     }
 }
-bool is_clickable_wait(const oa::runtime::WaitReason* w) {
-    using K = oa::runtime::WaitReason::Kind;
+bool is_clickable_wait(const oa::runtime::Wait* w) {
     if (!w) return false;
-    return w->kind == K::Generic || w->kind == K::Generic0 ||
-           w->kind == K::Timed || w->kind == K::Se || w->kind == K::KeyWait;
+    return w->waiting_click() || w->timed() ||
+           w->stage == oa::runtime::Wait::Stage::Se || !w->keys.empty();
 }
 struct Key {
     std::string key;
@@ -90,17 +90,17 @@ int main() {
         };
         bool at_title = false;
         for (size_t f = 0; f < 20000 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             if (!title) continue;
             const auto* w = rt.current_wait();
-            if (w && w->kind == oa::runtime::WaitReason::Kind::Stop &&
-                w->id.empty()) {
+            if (w && w->is_park() &&
+                w->stage_id.empty()) {
                 at_title = true;
                 break;
             }
         }
         check(at_title, "boot parked at the title");
-        for (size_t f = 0; f < 300; ++f) rt.tick(16, idle);
+        for (size_t f = 0; f < 300; ++f) oa::test::frame(rt);
         {
             Key start;
             if (find_key(rt, "bt_start", &start)) {
@@ -109,12 +109,12 @@ int main() {
                 cl.left_down = true;
                 cl.mouse_x = start.cx;
                 cl.mouse_y = start.cy;
-                rt.tick(16, cl);
+                oa::test::replay(rt, cl);
             }
         }
         bool body = false;
         for (size_t f = 0; f < 12000 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             if (rt.text().page_has_visible_text("1.80.mw.adv_adv") &&
                 is_clickable_wait(rt.current_wait())) {
                 body = true;
@@ -122,7 +122,7 @@ int main() {
             }
         }
         check(body, "story body parked");
-        for (size_t f = 0; f < 300; ++f) rt.tick(16, idle);
+        for (size_t f = 0; f < 300; ++f) oa::test::frame(rt);
         // pointer observer: count dockarea over/out + button overs
         int area_over = 0, area_out = 0, btn_over_cnt = 0, btn_out_cnt = 0;
         using PD = oa::runtime::GameRuntime::PointerDispatch;
@@ -152,22 +152,22 @@ int main() {
                 oa::runtime::FrameInput mv;
                 mv.mouse_x = lk.cx;
                 mv.mouse_y = lk.cy;
-                rt.tick(16, mv);
+                oa::test::replay(rt, mv);
             }
             oa::runtime::FrameInput cl;
             cl.left_click_edge = true;
             cl.left_down = true;
             cl.mouse_x = lk.cx;
             cl.mouse_y = lk.cy;
-            rt.tick(16, cl);
+            oa::test::replay(rt, cl);
         }
-        for (size_t f = 0; f < 60; ++f) rt.tick(16, idle);
+        for (size_t f = 0; f < 60; ++f) oa::test::frame(rt);
         // hover the strip at x=200 (empty zone) -> dock opens
         for (size_t f = 0; f < 30; ++f) {
             oa::runtime::FrameInput mv;
             mv.mouse_x = 200;
             mv.mouse_y = 695;
-            rt.tick(16, mv);
+            oa::test::replay(rt, mv);
         }
         std::printf("[r38p2] after strip: area_over=%d area_out=%d\n",
                     area_over, area_out);
@@ -179,7 +179,7 @@ int main() {
             oa::runtime::FrameInput mv;
             mv.mouse_x = 1050;
             mv.mouse_y = 695;
-            rt.tick(16, mv);
+            oa::test::replay(rt, mv);
         }
         std::printf("[r38p2] at button zone: area_out_delta=%d btn_over=%d "
                     "btn_out=%d\n",

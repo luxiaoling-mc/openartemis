@@ -25,6 +25,7 @@
 
 #include "core/fs/physfs_fs.h"
 #include "core/runtime/runtime_game.h"
+#include "host_input.h"
 
 namespace {
 int failures = 0;
@@ -34,24 +35,29 @@ void check(bool cond, const char* what) {
         ++failures;
     }
 }
-const char* kind_str(oa::runtime::WaitReason::Kind k) {
-    using K = oa::runtime::WaitReason::Kind;
-    switch (k) {
-        case K::Generic: return "generic";
-        case K::Generic0: return "wt0";
-        case K::Timed: return "timed";
-        case K::Stop: return "stop";
-        case K::Se: return "se";
-        case K::VideoLayer: return "video";
-        case K::ScenarioTween: return "scenario-tween";
-        case K::KeyWait: return "key";
-    }
-    return "?";
-}
-std::string wait_str(const oa::runtime::WaitReason* w) {
+const char* kind_str(const oa::runtime::Wait* w) {
     if (!w) return "none";
-    std::string s = kind_str(w->kind);
-    if (!w->id.empty()) s += "('" + w->id + "')";
+    using S = oa::runtime::Wait::Stage;
+    switch (w->stage) {
+        case S::Trans: return "trans";
+        case S::Video: return "video";
+        case S::VideoLayer: return "video-layer";
+        case S::Se: return "se";
+        case S::AllDelete: return "alldelete";
+        case S::Tween: return "tween";
+        case S::None: break;
+    }
+    if (w->timed()) return "timed";
+    if (w->on_reveal_done) return "reveal";
+    if (w->reveal_clear) return "reveal-clear";
+    if (!w->keys.empty()) return "key";
+    if (w->waiting_click()) return "click";
+    return "park";
+}
+std::string wait_str(const oa::runtime::Wait* w) {
+    if (!w) return "none";
+    std::string s = kind_str(w);
+    if (!w->stage_id.empty()) s += "('" + w->stage_id + "')";
     return s;
 }
 } // namespace
@@ -82,11 +88,11 @@ int main() {
         // ---- (a) boot to the parked title ---------------------------------
         size_t boot = 0;
         for (; boot < 2400 && !rt.exit_requested(); ++boot) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             if (!saw_title_init) continue;
             const auto* w = rt.current_wait();
-            if (!(w && w->kind == oa::runtime::WaitReason::Kind::Stop &&
-                  w->id.empty()))
+            if (!(w && w->is_park() &&
+                  w->stage_id.empty()))
                 continue;
             // parked at the title [stop]: locate the bt_start click row
             for (const oa::render::Layer* l : rt.scene().draw_order()) {
@@ -162,10 +168,10 @@ int main() {
             size_t settle_quiet = 0;
             size_t stl = 0;
             for (; stl < 4000 && !rt.exit_requested(); ++stl) {
-                rt.tick(16, idle);
+                oa::test::frame(rt);
                 const auto* wq = rt.current_wait();
-                if (!(wq && wq->kind == oa::runtime::WaitReason::Kind::Stop &&
-                      wq->id.empty()))
+                if (!(wq && wq->is_park() &&
+                      wq->stage_id.empty()))
                     continue;
                 if (rt.transition().is_in_progress(rt.now_ms())) continue;
                 double x0 = 0, y0 = 0, rw = 0, rh = 0;
@@ -200,7 +206,7 @@ int main() {
             for (; hov < 400 && !rt.exit_requested(); ++hov) {
                 oa::runtime::FrameInput hover;
                 if (rect_center(&hover.mouse_x, &hover.mouse_y)) { /* track */ }
-                rt.tick(16, hover);
+                oa::test::replay(rt, hover);
                 if (rt.is_hovered(target)) hovered = true;
                 if (const oa::render::Layer* l2 = rt.scene().find(target)) {
                     if (l2->has_clip) clip_after = l2->clip_x;
@@ -232,7 +238,7 @@ int main() {
                     edge_pending = false;
                 }
                 try {
-                    rt.tick(16, in);
+                    oa::test::replay(rt, in);
                 } catch (const std::exception& e) {
                     exit_note = std::string("tick error: ") + e.what();
                     break;

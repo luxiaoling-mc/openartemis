@@ -21,29 +21,33 @@
 
 #include "core/fs/physfs_fs.h"
 #include "core/runtime/runtime_game.h"
+#include "host_input.h"
 #include "core/runtime/runtime_save.h"
 
 namespace {
-const char* wk(const oa::runtime::WaitReason* w) {
-    using K = oa::runtime::WaitReason::Kind;
-    if (!w) return "?";
-    switch (w->kind) {
-        case K::Generic: return "generic";
-        case K::Generic0: return "wt0";
-        case K::Timed: return "timed";
-        case K::Stop: return "stop";
-        case K::Se: return "se";
-        case K::VideoLayer: return "video";
-        case K::ScenarioTween: return "scenario-tween";
-        case K::KeyWait: return "key";
+const char* wk(const oa::runtime::Wait* w) {
+    if (!w) return "none";
+    using S = oa::runtime::Wait::Stage;
+    switch (w->stage) {
+        case S::Trans: return "trans";
+        case S::Video: return "video";
+        case S::VideoLayer: return "video-layer";
+        case S::Se: return "se";
+        case S::AllDelete: return "alldelete";
+        case S::Tween: return "tween";
+        case S::None: break;
     }
-    return "?";
+    if (w->timed()) return "timed";
+    if (w->on_reveal_done) return "reveal";
+    if (w->reveal_clear) return "reveal-clear";
+    if (!w->keys.empty()) return "key";
+    if (w->waiting_click()) return "click";
+    return "park";
 }
-bool is_clickable_wait(const oa::runtime::WaitReason* w) {
-    using K = oa::runtime::WaitReason::Kind;
+bool is_clickable_wait(const oa::runtime::Wait* w) {
     if (!w) return false;
-    return w->kind == K::Generic || w->kind == K::Generic0 ||
-           w->kind == K::Timed || w->kind == K::Se || w->kind == K::KeyWait;
+    return w->waiting_click() || w->timed() ||
+           w->stage == oa::runtime::Wait::Stage::Se || !w->keys.empty();
 }
 struct Key {
     std::string key;
@@ -108,9 +112,9 @@ void click_at(oa::runtime::GameRuntime& rt, int x, int y) {
     cl.left_down = true;
     cl.mouse_x = x;
     cl.mouse_y = y;
-    rt.tick(16, cl);
+    oa::test::replay(rt, cl);
     oa::runtime::FrameInput idle;
-    for (size_t f = 0; f < 8; ++f) rt.tick(16, idle);
+    for (size_t f = 0; f < 8; ++f) oa::test::frame(rt);
 }
 } // namespace
 
@@ -145,17 +149,17 @@ int main(int argc, char** argv) {
         };
         bool at_title = false;
         for (size_t f = 0; f < 60000 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             if (!title) continue;
             const auto* w = rt.current_wait();
-            if (w && w->kind == oa::runtime::WaitReason::Kind::Stop &&
-                w->id.empty()) {
+            if (w && w->is_park() &&
+                w->stage_id.empty()) {
                 at_title = true;
                 break;
             }
         }
         std::printf("[so90] title parked: %d\n", (int)at_title);
-        for (size_t f = 0; f < 120; ++f) rt.tick(16, idle);
+        for (size_t f = 0; f < 120; ++f) oa::test::frame(rt);
 
         if (do_load) {
             std::printf("[so90] loading save0001.dat\n");
@@ -169,7 +173,7 @@ int main(int argc, char** argv) {
                 cl.left_down = true;
                 cl.mouse_x = start.cx;
                 cl.mouse_y = start.cy;
-                rt.tick(16, cl);
+                oa::test::replay(rt, cl);
                 std::printf("[so90] clicked bt_start at (%d,%d)\n", start.cx,
                             start.cy);
             } else {
@@ -185,7 +189,7 @@ int main(int argc, char** argv) {
         for (size_t f = 0; f < 2000000 && pages < page_budget &&
                              !rt.exit_requested();
              ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             const auto* w = rt.current_wait();
             const bool parked = is_clickable_wait(w) &&
                 rt.text().page_has_visible_text("1.80.mw.adv_adv");

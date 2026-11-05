@@ -157,7 +157,7 @@ struct GameRuntime::RuntimeState {
     size_t scene_layer_events() const { return renderer_.stats().layers; }
     size_t scene_tween_events() const { return renderer_.stats().tweens; }
     size_t tween_completion_calls() const { return renderer_.stats().tween_done; }
-    const oa::runtime::WaitReason* current_wait() const { return wait_ ? &*wait_ : nullptr; }
+    const oa::runtime::Wait* current_wait() const { return wait_ ? &*wait_ : nullptr; }
     uint64_t now_ms() const { return now_ms_; }
     bool attach_window(void* native_window, const std::string& backend_kind);
     int stage_width() const { return rt_->project_.config.stage_width; }
@@ -268,10 +268,11 @@ struct GameRuntime::RuntimeState {
     // Bucket annotations below; full ownership/load contract:
     // docs/RUNTIME_STATE.md. Keep declaration order stable (dtor order).
     void wire_lua_host();
-    bool resolve_wait(uint64_t delta_ms, const FrameInput& in, bool clicked);
+    /// 输入已归一为两条命令：物理点击、脚本决定边沿。
+    bool resolve_wait(uint64_t delta_ms, bool click_cmd, bool decide_cmd);
     void advance_wait();
     /// Park on a Stop wait named by `id` and clear its timer.
-    void arm_stop_wait(std::string id);
+    void arm_stage(oa::runtime::Wait::Stage st, std::string id = {});
     /// Fixed order: engine → media → text → scene → control → host stream.
     oa::runtime::CallbackResult dispatch_interpreter_event(
         const oa::runtime::Event& e);
@@ -393,7 +394,7 @@ struct GameRuntime::RuntimeState {
         bool claimed_by_jump = false;
     };
     void refresh_inline_event_frame();
-    void begin_inline_event_frame();
+    void begin_inline_event_frame(bool force = false);
     void settle_inline_event_frame(bool paused, bool has_queued, bool saw_call,
                                    bool saw_jump);
     bool inline_event_marker_active() const;
@@ -415,13 +416,17 @@ struct GameRuntime::RuntimeState {
     // [B] E+L: 宿主重建 VM（boot）；读档只 restore_position + Lua restore()
     std::unique_ptr<oa::runtime::Interpreter> interpreter_;
     // [B] E: 读档后由恢复位置的那一行重跑重导出
-    std::optional<oa::runtime::WaitReason> wait_;
+    std::optional<oa::runtime::Wait> wait_;
     // [C] E: 帧号（e:getFrameNumber）
     uint64_t tick_count_ = 0;
-    // [C] E: wait_ 的派生量；读档清零
-    uint64_t wait_remaining_ms_ = 0;
+
     // [C] E: 本 tick 已武装的 wait 至少存活一帧
     bool wait_armed_this_tick_ = false;
+    // [C] E: 一次物理按下 = 一个命令。
+    //   press_live_ 本帧这条命令仍可动作（补字或释放停驻）；
+    //   press_used_ 命令已用尽，只延续一帧以吞掉同一按下的 decide 余波。
+    bool press_live_ = false;
+    bool press_used_ = false;
     // [B] E: [exit] 控制闩；reset_domains 清
     bool exit_requested_ = false;
     // [C] E: 单调引擎时钟（绝不进档）

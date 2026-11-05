@@ -4,12 +4,6 @@
 #include <cmath>
 
 namespace oa::emote {
-namespace {
-
-inline double clamp01(double v) { return std::clamp(v, 0.0, 1.0); }
-
-} // namespace
-
 // Maps a model-pixel displacement onto the authored ±30 axis domain. The angle
 // constant is the reference's 2.25°: displacement*1.15 radians, divided back
 // out, so ~26 px reads as ~30 axis units and larger swings saturate smoothly.

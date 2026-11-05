@@ -29,9 +29,8 @@ constexpr const char* kSavegFile = "saveg.dat";
 constexpr const char* kSystemFile = "system.dat";
 constexpr const char* kAutosaveFile = "autosave.dat";
 
-bool is_input_wait(const oa::runtime::WaitReason* w) {
-    using K = oa::runtime::WaitReason::Kind;
-    return w && (w->kind == K::Generic || w->kind == K::Generic0 || w->kind == K::KeyWait);
+bool is_input_wait(const oa::runtime::Wait* w) {
+    return w && (w->waiting_click() || !w->keys.empty());
 }
 
 /// Drop dangerous/Windows-only segments from the ini SAVEPATH.
@@ -473,19 +472,15 @@ void restore_audio_snapshot(oa::media::AudioEngine* audio, const oa::runtime::Au
     }
 }
 
-const char* wait_kind_name(oa::runtime::WaitReason::Kind k) {
-    using K = oa::runtime::WaitReason::Kind;
-    switch (k) {
-        case K::Generic: return "generic";
-        case K::Generic0: return "wt0";
-        case K::Timed: return "timed";
-        case K::Stop: return "stop";
-        case K::Se: return "se";
-        case K::VideoLayer: return "video";
-        case K::ScenarioTween: return "scenario";
-        case K::KeyWait: return "key";
-    }
-    return "?";
+/// 停驻的身份（不含计时进度），用于"同一次停驻只自动存档一次"。
+std::string wait_sig(const oa::runtime::Wait* w) {
+    if (!w) return {};
+    std::string s = std::to_string(w->release) + ":" + std::to_string(int(w->stage)) +
+                    ":" + w->stage_id;
+    if (w->on_reveal_done) s += ":reveal";
+    if (w->reveal_clear) s += ":clear";
+    for (const int k : w->keys) s += ":k" + std::to_string(k);
+    return s;
 }
 
 } // namespace
@@ -565,7 +560,7 @@ size_t GameRuntime::RuntimeState::reset_ephemeral_on_load() {
     save_.screenshot_.valid = false; clr();
     save_.capture_pending_ = false; clr();
     renderer_.stop_all_delete();
-    wait_.reset(); wait_remaining_ms_ = 0; clr();
+    wait_.reset(); clr();
 
     // ---- 控制域（模式闩；配置面 [* allow] 属 ② 保留，不在此）----
     control_.skip_active_ = false; clr();
@@ -1093,10 +1088,7 @@ void GameRuntime::RuntimeState::maybe_autosave_for_wait() {
     // Reset the once-per-wait latch whenever the parked wait identity changes
     // or no input wait is parked ( maybe_autosave_on_input_wait runs
     // only when a run establishes a new wait,  + ).
-    std::string sig;
-    if (const oa::runtime::WaitReason* w = wait_ ? &*wait_ : nullptr) {
-        sig = std::string(wait_kind_name(w->kind)) + ":" + w->id;
-    }
+    const std::string sig = wait_sig(wait_ ? &*wait_ : nullptr);
     if (sig != save_.autosave_wait_sig_) {
         save_.autosave_wait_sig_ = sig;
         save_.autosaved_current_wait_ = false;

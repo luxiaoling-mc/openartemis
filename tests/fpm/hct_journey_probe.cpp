@@ -30,18 +30,16 @@
 
 #include "core/fs/physfs_fs.h"
 #include "core/runtime/runtime_game.h"
+#include "host_input.h"
 #include "core/runtime/runtime_save.h"
 
 namespace {
-const char* wait_desc(const oa::runtime::WaitReason* w) {
+const char* wait_desc(const oa::runtime::Wait* w) {
     if (!w) return "run";
-    switch (w->kind) {
-        case oa::runtime::WaitReason::Kind::Stop: return "stop";
-        case oa::runtime::WaitReason::Kind::Timed: return "timed";
-        case oa::runtime::WaitReason::Kind::Generic: return "click";
-        case oa::runtime::WaitReason::Kind::Generic0: return "click0";
-        default: return "other";
-    }
+    if (w->is_park()) return "stop";
+    if (w->timed()) return "timed";
+    if (w->waiting_click()) return "click";
+    return "other";
 }
 
 struct VideoSample {
@@ -193,9 +191,9 @@ int main() {
     bool reported_park = false;
 
     for (t = 0; t < tick_cap && !rt.exit_requested(); ++t) {
-        const oa::runtime::WaitReason* w = rt.current_wait();
+        const oa::runtime::Wait* w = rt.current_wait();
         const bool video_park =
-            w && w->kind == oa::runtime::WaitReason::Kind::Stop && w->id == "video";
+            w && w->stage == oa::runtime::Wait::Stage::Video;
         const VideoSample vs = video_snapshot(rt);
         const std::string now_file = vs.file;
 
@@ -315,8 +313,8 @@ int main() {
                    !injected) {
             // entry injection gate below (not input)
         } else if (!video_park && ui_idx >= ui_clicks.size() &&
-                   (w && (w->kind == oa::runtime::WaitReason::Kind::Generic ||
-                          w->kind == oa::runtime::WaitReason::Kind::Generic0))) {
+                   (w && (w->waiting_click() ||
+                          w->waiting_click()))) {
             // story walk: click once when the current page is fully revealed
             const bool text_on =
                 rt.text().page_has_visible_text("1.80.mw.adv_adv") ||
@@ -333,7 +331,7 @@ int main() {
                                 wait_desc(w));
             }
         }
-        rt.tick(16, in);
+        oa::test::replay(rt, in);
         (void)do_click;
         // select-dialog presence tracking (reset the answer latch)
         {
@@ -373,7 +371,7 @@ int main() {
             !any_video_playing(rt)) {
             const auto* w2 = rt.current_wait();
             const bool parked =
-                w2 && w2->kind != oa::runtime::WaitReason::Kind::Stop &&
+                w2 && !w2->is_park() &&
                 !rt.transition().is_in_progress(rt.now_ms());
             if (parked) {
                 std::printf("[M] f=%zu injecting title_start2('%s') wait=%s\n", t,

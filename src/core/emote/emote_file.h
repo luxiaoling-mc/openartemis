@@ -265,6 +265,14 @@ public:
     std::vector<EmoteTimeline> timelines;
     std::vector<std::string> variableNames; // metadata.variableList order
     std::map<std::string, double> variableDefaults; // label -> 0
+    /// Standard-variable fallback for "差分なし" models: the model never
+    /// parameterises `body_UD`, yet the authored idle timeline drives nothing
+    /// but `body_UD`, so the figure would stand perfectly still. When the model
+    /// does own a whole-body translation axis (`move_UD`), the authored body
+    /// offset is folded onto that axis (EvalCtx::var_value). Data-driven: stays
+    /// off for every model that consumes `body_UD` itself. See
+    /// OA_EMOTE_BODY_FALLBACK.
+    bool body_ud_to_move_ud = false;
     std::vector<EyeControl> eyeControls;
     std::vector<SelectorControl> selectors;
     /// Physics rules (metadata.bustControl / hairControl / partsControl).

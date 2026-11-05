@@ -25,6 +25,7 @@
 
 #include "core/fs/physfs_fs.h"
 #include "core/runtime/runtime_game.h"
+#include "host_input.h"
 
 namespace {
 int failures = 0;
@@ -39,24 +40,28 @@ void check(bool cond, const char* fmt, ...) {
         ++failures;
     }
 }
-const char* ws(const oa::runtime::WaitReason* w) {
-    using K = oa::runtime::WaitReason::Kind;
+const char* ws(const oa::runtime::Wait* w) {
     if (!w) return "none";
-    switch (w->kind) {
-        case K::Generic: return "generic";
-        case K::Generic0: return "wt0";
-        case K::Timed: return "timed";
-        case K::Stop: return "stop";
-        case K::Se: return "se";
-        case K::VideoLayer: return "video";
-        case K::ScenarioTween: return "stween";
-        case K::KeyWait: return "key";
+    using S = oa::runtime::Wait::Stage;
+    switch (w->stage) {
+        case S::Trans: return "trans";
+        case S::Video: return "video";
+        case S::VideoLayer: return "video-layer";
+        case S::Se: return "se";
+        case S::AllDelete: return "alldelete";
+        case S::Tween: return "tween";
+        case S::None: break;
     }
-    return "?";
+    if (w->timed()) return "timed";
+    if (w->on_reveal_done) return "reveal";
+    if (w->reveal_clear) return "reveal-clear";
+    if (!w->keys.empty()) return "key";
+    if (w->waiting_click()) return "click";
+    return "park";
 }
-bool is_story_wait(const oa::runtime::WaitReason* w) {
-    return w && (w->kind == oa::runtime::WaitReason::Kind::Generic ||
-                 w->kind == oa::runtime::WaitReason::Kind::Generic0);
+bool is_story_wait(const oa::runtime::Wait* w) {
+    return w && (w->waiting_click() ||
+                 w->waiting_click());
 }
 std::string sample(oa::runtime::GameRuntime& rt) {
     const oa::render::MessageLayer* ml = rt.text().layer("1.80.mw.adv_adv");
@@ -69,9 +74,9 @@ std::string sample(oa::runtime::GameRuntime& rt) {
 bool reach_title(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idle,
                  size_t budget = 12000) {
     for (size_t f = 0; f < budget && !rt.exit_requested(); ++f) {
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         const auto* w = rt.current_wait();
-        if (!(w && w->kind == oa::runtime::WaitReason::Kind::Stop && w->id.empty())) continue;
+        if (!(w && w->is_park() && w->stage_id.empty())) continue;
         for (const oa::render::Layer* l : rt.scene().draw_order()) {
             const auto* h = rt.scene().find_event_handler(l->id, "click");
             if (!h) continue;
@@ -91,7 +96,7 @@ void start_game(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idle) {
         in.mouse_x = cands[ci][0];
         in.mouse_y = cands[ci][1];
         for (size_t f = 0; f < 500 && !rt.exit_requested(); ++f) {
-            rt.tick(16, in);
+            oa::test::replay(rt, in);
             in.left_click_edge = false;
             in.left_down = false;
             in.mouse_x = -1;
@@ -105,12 +110,12 @@ void start_game(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idle) {
 bool reach_story_page(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idle,
                       std::string* page_out) {
     for (size_t f = 0; f < 8000 && !rt.exit_requested(); ++f) {
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         if (rt.text().page_has_visible_text("1.80.mw.adv_adv")) break;
     }
     auto fully = [&](size_t budget) {
         for (size_t f = 0; f < budget && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             const auto* w = rt.current_wait();
             const oa::render::MessageLayer* ml = rt.text().layer("1.80.mw.adv_adv");
             if (is_story_wait(w) && ml && ml->reveal_index >= ml->char_count &&
@@ -126,7 +131,7 @@ bool reach_story_page(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idl
         cl.left_down = true;
         cl.mouse_x = 640;
         cl.mouse_y = 600;
-        rt.tick(16, cl);
+        oa::test::replay(rt, cl);
         (void)fully(2500);
     }
     const std::string page = sample(rt);
@@ -137,7 +142,7 @@ bool reach_story_page(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idl
 bool park_story(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idle,
                 size_t budget = 3000) {
     for (size_t f = 0; f < budget && !rt.exit_requested(); ++f) {
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         const auto* w = rt.current_wait();
         const oa::render::MessageLayer* ml = rt.text().layer("1.80.mw.adv_adv");
         if (is_story_wait(w) && ml && ml->reveal_index >= ml->char_count && !ml->reveal_pending)
@@ -167,7 +172,7 @@ bool click_key_layer(oa::runtime::GameRuntime& rt, const std::string& key) {
         cl.left_down = true;
         cl.mouse_x = int(x0 + rw / 2);
         cl.mouse_y = int(y0 + rh / 2);
-        rt.tick(16, cl);
+        oa::test::replay(rt, cl);
         std::printf("[uf] clicked key=%s layer=%s @(%d,%d) wait=%s layers=%zu\n", key.c_str(),
                     l->id.c_str(), cl.mouse_x, cl.mouse_y, ws(rt.current_wait()),
                     rt.scene().size());
@@ -189,14 +194,14 @@ void press_key(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idle, int 
 bool confirm_dialog(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idle,
                     size_t settle = 120) {
     const auto* w = rt.current_wait();
-    bool parked = w && w->kind == oa::runtime::WaitReason::Kind::Stop;
+    bool parked = w && w->is_park();
     for (size_t f = 0; f < 4000 && !rt.exit_requested(); ++f) {
         if (parked && rt.scene().find("600.1.bt.1.0") != nullptr) break;
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         const auto* w2 = rt.current_wait();
-        parked = w2 && w2->kind == oa::runtime::WaitReason::Kind::Stop;
+        parked = w2 && w2->is_park();
     }
-    for (size_t f = 0; f < settle && !rt.exit_requested(); ++f) rt.tick(16, idle);
+    for (size_t f = 0; f < settle && !rt.exit_requested(); ++f) oa::test::frame(rt);
     oa::runtime::FrameInput en;
     en.key_down_edges = {13};
     en.keys_down.insert(13);
@@ -296,12 +301,12 @@ int main() {
         {
             (void)confirm_dialog(rt, idle);
             for (size_t f = 0; f < 12000 && !rt.exit_requested(); ++f) {
-                rt.tick(16, idle);
+                oa::test::frame(rt);
                 // after [reset] the engine re-boots: the story layer and the
                 // parked title both reappear only on the fresh boot; detect
                 // the reset via the parked title + bt_start + story gone.
                 const auto* w = rt.current_wait();
-                if (!(w && w->kind == oa::runtime::WaitReason::Kind::Stop && w->id.empty()))
+                if (!(w && w->is_park() && w->stage_id.empty()))
                     continue;
                 bool bt = false;
                 for (const oa::render::Layer* l : rt.scene().draw_order()) {
@@ -360,7 +365,7 @@ int main() {
         // the exit dialog: Enter confirms the default (as in U7)
         bool dlg = false;
         for (size_t f = 0; f < 6000 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             if (rt.scene().find("600.1.bt.1.0") != nullptr) {
                 dlg = true;
                 break;
@@ -375,7 +380,7 @@ int main() {
                     exited = true;
                     break;
                 }
-                rt.tick(16, idle);
+                oa::test::frame(rt);
             }
         }
         check(exited, "U8-5 [exit] raised exit_requested() (host quits)");

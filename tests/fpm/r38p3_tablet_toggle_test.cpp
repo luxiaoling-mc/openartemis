@@ -32,6 +32,7 @@
 
 #include "core/fs/physfs_fs.h"
 #include "core/runtime/runtime_game.h"
+#include "host_input.h"
 
 namespace {
 int failures = 0;
@@ -41,11 +42,10 @@ void check(bool cond, const char* what) {
         ++failures;
     }
 }
-bool is_clickable_wait(const oa::runtime::WaitReason* w) {
-    using K = oa::runtime::WaitReason::Kind;
+bool is_clickable_wait(const oa::runtime::Wait* w) {
     if (!w) return false;
-    return w->kind == K::Generic || w->kind == K::Generic0 ||
-           w->kind == K::Timed || w->kind == K::Se || w->kind == K::KeyWait;
+    return w->waiting_click() || w->timed() ||
+           w->stage == oa::runtime::Wait::Stage::Se || !w->keys.empty();
 }
 struct Key {
     std::string key;
@@ -83,15 +83,19 @@ double bar_left(oa::runtime::GameRuntime& rt) {
         return -1e9;
     return x0;
 }
+/// 像玩家一样把指针移过去再点：先经过一个中性位置，让引擎重算 hover
+/// （平板栏滑动后，旧悬停对象会留在缓存里；瞬移回同一个按钮不会触发
+/// rollover，btn.cursor 为空，游戏侧就不执行 tab_left）。
 void click_at(oa::runtime::GameRuntime& rt, int x, int y) {
-    oa::runtime::FrameInput cl;
-    cl.left_click_edge = true;
-    cl.left_down = true;
-    cl.mouse_x = x;
-    cl.mouse_y = y;
-    rt.tick(16, cl);
-    oa::runtime::FrameInput idle;
-    for (size_t f = 0; f < 6; ++f) rt.tick(16, idle);
+    rt.mouse_move(640.0f, 360.0f);
+    oa::test::frame(rt);
+    rt.mouse_move(float(x), float(y));
+    oa::test::frame(rt);
+    rt.mouse_button(1, true);
+    oa::test::frame(rt);
+    rt.mouse_button(1, false);
+    oa::test::frame(rt);
+    for (size_t f = 0; f < 4; ++f) oa::test::frame(rt);
 }
 } // namespace
 
@@ -115,17 +119,17 @@ int main() {
         };
         bool at_title = false;
         for (size_t f = 0; f < 20000 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             if (!title) continue;
             const auto* w = rt.current_wait();
-            if (w && w->kind == oa::runtime::WaitReason::Kind::Stop &&
-                w->id.empty()) {
+            if (w && w->is_park() &&
+                w->stage_id.empty()) {
                 at_title = true;
                 break;
             }
         }
         check(at_title, "boot parked at the title");
-        for (size_t f = 0; f < 300; ++f) rt.tick(16, idle);
+        for (size_t f = 0; f < 300; ++f) oa::test::frame(rt);
         {
             Key start;
             if (find_key(rt, "bt_start", &start)) {
@@ -134,14 +138,14 @@ int main() {
                 cl.left_down = true;
                 cl.mouse_x = start.cx;
                 cl.mouse_y = start.cy;
-                rt.tick(16, cl);
+                oa::test::replay(rt, cl);
             } else {
                 check(false, "bt_start found");
             }
         }
         bool body = false;
         for (size_t f = 0; f < 20000 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             if (rt.text().page_has_visible_text("1.80.mw.adv_adv") &&
                 is_clickable_wait(rt.current_wait())) {
                 body = true;
@@ -149,7 +153,7 @@ int main() {
             }
         }
         check(body, "story body parked");
-        for (size_t f = 0; f < 300; ++f) rt.tick(16, idle);
+        for (size_t f = 0; f < 300; ++f) oa::test::frame(rt);
         // The touchbar must exist (config_tabletui=1) with both containments.
         check(rt.scene().find("1.80.mw.tb.0") != nullptr, "touchbar bar exists");
         check(rt.scene().find("1.80.mw.zmask") != nullptr, "tb_mask exists");
@@ -168,7 +172,7 @@ int main() {
             std::printf("[r38p3] %s: click %s at (%d,%d)\n", what, key, k.cx,
                         k.cy);
             click_at(rt, k.cx, k.cy);
-            for (size_t f = 0; f < 80; ++f) rt.tick(16, idle);
+            for (size_t f = 0; f < 80; ++f) oa::test::frame(rt);
             const double x1 = bar_left(rt);
             std::printf("[r38p3]   -> bar_left=%.0f (expect %.0f)\n", x1,
                         expect);

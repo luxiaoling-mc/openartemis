@@ -32,6 +32,17 @@
 
 #include "core/fs/physfs_fs.h"
 #include "core/runtime/runtime_game.h"
+#include "host_input.h"
+
+namespace {
+const char* wait_name(const oa::runtime::Wait* w) {
+    if (!w) return "-";
+    if (w->waiting_click()) return "click";
+    if (w->is_park()) return "stop";
+    if (w->timed()) return "timed";
+    return "other";
+}
+} // namespace
 
 namespace {
 int failures = 0;
@@ -41,11 +52,10 @@ void check(bool cond, const char* what) {
         ++failures;
     }
 }
-bool is_clickable_wait(const oa::runtime::WaitReason* w) {
-    using K = oa::runtime::WaitReason::Kind;
+bool is_clickable_wait(const oa::runtime::Wait* w) {
     if (!w) return false;
-    return w->kind == K::Generic || w->kind == K::Generic0 ||
-           w->kind == K::Timed || w->kind == K::Se || w->kind == K::KeyWait;
+    return w->waiting_click() || w->timed() ||
+           w->stage == oa::runtime::Wait::Stage::Se || !w->keys.empty();
 }
 struct Key {
     std::string key;
@@ -99,17 +109,17 @@ int main() {
         };
         bool at_title = false;
         for (size_t f = 0; f < 20000 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             if (!title) continue;
             const auto* w = rt.current_wait();
-            if (w && w->kind == oa::runtime::WaitReason::Kind::Stop &&
-                w->id.empty()) {
+            if (w && w->is_park() &&
+                w->stage_id.empty()) {
                 at_title = true;
                 break;
             }
         }
         check(at_title, "boot parked at the title");
-        for (size_t f = 0; f < 300; ++f) rt.tick(16, idle); // title settle
+        for (size_t f = 0; f < 300; ++f) oa::test::frame(rt); // title settle
         {
             Key start;
             if (find_key(rt, "bt_start", &start)) {
@@ -118,12 +128,12 @@ int main() {
                 cl.left_down = true;
                 cl.mouse_x = start.cx;
                 cl.mouse_y = start.cy;
-                rt.tick(16, cl);
+                oa::test::replay(rt, cl);
             }
         }
         bool body = false;
         for (size_t f = 0; f < 12000 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             if (rt.text().page_has_visible_text("1.80.mw.adv_adv") &&
                 is_clickable_wait(rt.current_wait())) {
                 body = true;
@@ -131,24 +141,24 @@ int main() {
             }
         }
         check(body, "story body parked");
-        for (size_t f = 0; f < 300; ++f) rt.tick(16, idle);
+        for (size_t f = 0; f < 300; ++f) oa::test::frame(rt);
         {
             oa::runtime::FrameInput k;
             k.key_down_edges = {121}; // F10 config
             k.keys_down.insert(121);
-            rt.tick(16, k);
+            oa::test::replay(rt, k);
         }
         Key unused;
         bool cfg = false;
         for (size_t f = 0; f < 9000 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             if (rt.scene().size() > 150 && find_key(rt, "bt_title", &unused)) {
                 cfg = true;
                 break;
             }
         }
         check(cfg, "config opened (page 1)");
-        for (size_t f = 0; f < 240; ++f) rt.tick(16, idle);
+        for (size_t f = 0; f < 240; ++f) oa::test::frame(rt);
         // page 2 = text settings with the sample preview
         Key p2;
         check(find_key(rt, "page2", &p2), "config page2 tab present");
@@ -159,29 +169,29 @@ int main() {
                 oa::runtime::FrameInput mv;
                 mv.mouse_x = p2.cx;
                 mv.mouse_y = p2.cy;
-                rt.tick(16, mv);
+                oa::test::replay(rt, mv);
             }
             oa::runtime::FrameInput cl;
             cl.left_click_edge = true;
             cl.left_down = true;
             cl.mouse_x = p2.cx;
             cl.mouse_y = p2.cy;
-            rt.tick(16, cl);
+            oa::test::replay(rt, cl);
         }
-        for (size_t f = 0; f < 400; ++f) rt.tick(16, idle);
+        for (size_t f = 0; f < 400; ++f) oa::test::frame(rt);
         {
             Key slk;
             const auto* w = rt.current_wait();
             std::printf("[r10e] after page2: layers=%zu wait=%d sl0201=%d "
                         "zz=%s\n",
-                        rt.scene().size(), w ? (int)w->kind : -1,
+                        rt.scene().size(), wait_name(w),
                         find_key(rt, "sl0201", &slk) ? 1 : 0,
                         rt.scene().find("500.z.zz") ? "y" : "n");
         }
         // wait for the first print (300 ms round after page open)
         bool alive = false;
         for (size_t f = 0; f < 4000 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             const std::string s = sample(rt);
             if (s != "-empty-" && s != "-no-layer-") {
                 alive = true;
@@ -198,18 +208,18 @@ int main() {
             down.left_down = true;
             down.mouse_x = sl.cx;
             down.mouse_y = sl.cy;
-            rt.tick(16, down);
+            oa::test::replay(rt, down);
             for (int i = 1; i <= 30 && !rt.exit_requested(); ++i) {
                 oa::runtime::FrameInput mv;
                 mv.left_down = true;
                 mv.mouse_x = sl.cx - (i * 90) / 30;
                 mv.mouse_y = sl.cy;
-                rt.tick(16, mv);
+                oa::test::replay(rt, mv);
             }
             oa::runtime::FrameInput up;
             up.mouse_x = sl.cx - 90;
             up.mouse_y = sl.cy;
-            rt.tick(16, up);
+            oa::test::replay(rt, up);
         }
         check(find_key(rt, "sl0201", &sl), "sl0201 present for the drag");
         // post-release: preview must refill and keep cycling
@@ -218,7 +228,7 @@ int main() {
         bool refilled = false;
         bool ended_empty = true;
         for (size_t f = 0; f < 15000 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             const std::string s = sample(rt);
             if (s != "-empty-" && s != "-no-layer-") {
                 ended_empty = false;

@@ -41,6 +41,7 @@
 #include "core/fs/physfs_fs.h"
 #include "core/media/video.h"
 #include "core/runtime/runtime_game.h"
+#include "host_input.h"
 #include "core/runtime/runtime_save.h"
 
 namespace {
@@ -144,15 +145,12 @@ int engine_phase(std::shared_ptr<const oa::fs::IFileSystem> fs) {
 // d1e86u7ftq.mp4 (real sound), asserting movie audio through EOF.
 // ---------------------------------------------------------------------------
 namespace {
-const char* wait_desc(const oa::runtime::WaitReason* w) {
+const char* wait_desc(const oa::runtime::Wait* w) {
     if (!w) return "run";
-    switch (w->kind) {
-        case oa::runtime::WaitReason::Kind::Stop: return "stop";
-        case oa::runtime::WaitReason::Kind::Timed: return "timed";
-        case oa::runtime::WaitReason::Kind::Generic: return "click";
-        case oa::runtime::WaitReason::Kind::Generic0: return "click0";
-        default: return "other";
-    }
+    if (w->is_park()) return "stop";
+    if (w->timed()) return "timed";
+    if (w->waiting_click()) return "click";
+    return "other";
 }
 
 /// One observation window over a fullscreen movie park.
@@ -199,9 +197,9 @@ int journey_phase(std::shared_ptr<const oa::fs::IFileSystem> fs,
                 break;
             }
         }
-        const oa::runtime::WaitReason* w = rt.current_wait();
+        const oa::runtime::Wait* w = rt.current_wait();
         const bool video_park =
-            w && w->kind == oa::runtime::WaitReason::Kind::Stop && w->id == "video";
+            w && w->stage == oa::runtime::Wait::Stage::Video;
         if (video_park) {
             const auto vs = rt.video().state();
             const auto* ch = vs.overlay_video ? &*vs.overlay_video : nullptr;
@@ -256,9 +254,8 @@ int journey_phase(std::shared_ptr<const oa::fs::IFileSystem> fs,
             }
             rt.tick(16, oa::runtime::FrameInput());
             // Released when the wait is no longer this video park.
-            const oa::runtime::WaitReason* w2 = rt.current_wait();
-            if (!cur.released && cur.enter != 0 && !(w2 && w2->kind ==
-                    oa::runtime::WaitReason::Kind::Stop && w2->id == "video")) {
+            const oa::runtime::Wait* w2 = rt.current_wait();
+            if (!cur.released && cur.enter != 0 && !(w2 && w2->stage == oa::runtime::Wait::Stage::Video)) {
                 cur.released = true;
                 cur.exit = t;
                 const auto vs2 = rt.video().state();

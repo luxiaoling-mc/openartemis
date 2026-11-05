@@ -2046,84 +2046,113 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
         return out;
     }
     if (tag == "stop") {
-        WaitReason r;
-        r.kind = WaitReason::Kind::Stop;
-        r.id = resolve_or_empty("0");
+        // 脚本里的 [stop] 只接受脚本决定（decide 边缘），物理点击不放行——
+        // 否则背景点击会把标题/选项菜单穿过去。
+        // Lua 排队的 [stop] 是框架自己排的"等人"步骤（关 backlog 时
+        // system/ui.asb 的 call_ui_stop），点击放行，否则回不到剧情。
+        Wait w;
+        w.release = Wait::OnDecide;
+        if (!ins.origin_script.empty()) w.release |= Wait::OnClick;
+        w.stage_id = resolve_or_empty("0");
+        w.ends_exskip = w.stage_id == "exskip";
         out.kind = TagOutcomeKind::WaitEvent;
-        out.event = Event::wait(std::move(r));
+        out.event = Event::park_on(std::move(w));
         return out;
     }
     if (tag == "wt") {
-        WaitReason r;
-        // A BARE [wt] (no time=, no input=) is the plain CLICK wait. It used
+        Wait w;
+        // A BARE [wt] is the plain click wait: physical clicks only, no decide.
         const std::string wt_time = resolve_or_empty("time");
         const std::string wt_input = resolve_or_empty("input");
         if (wt_time.empty() && wt_input.empty()) {
-            r.kind = WaitReason::Kind::Generic;
-            r.id = "wt"; // physical click only (see resolve_wait Generic)
+            w.release = Wait::OnClick | Wait::OnSkip;
         } else {
-            r.kind = WaitReason::Kind::Timed;
-            r.milliseconds =
-                uint64_t(eval.resolve_param(wt_time).as_int().value_or(0));
-            r.input = eval.resolve_param(wt_input).as_int().value_or(1);
+            w.timer_ms = eval.resolve_param(wt_time).as_int().value_or(0);
+            const int64_t input = eval.resolve_param(wt_input).as_int().value_or(1);
+            w.release = Wait::OnSkip;
+            if (input == 1) w.release |= Wait::OnClick | Wait::OnDecide;
         }
         out.kind = TagOutcomeKind::WaitEvent;
-        out.event = Event::wait(std::move(r));
+        out.event = Event::park_on(std::move(w));
         out.event.tag = tag;
         return out;
     }
-    if (tag == "wt0") {
-        WaitReason r;
-        r.kind = WaitReason::Kind::Generic0;
+    if (tag == "click") {
+        // [click]: クリック待ち — ADV 的一页结束。等待点击（脚本决定/跳过/自动
+        // 也能放行），页面逐字未完成时由输入侧先补完整页。
+        Wait w;
+        w.release = Wait::OnClick | Wait::OnDecide | Wait::OnSkip | Wait::OnAuto;
         out.kind = TagOutcomeKind::WaitEvent;
-        out.event = Event::wait(std::move(r));
+        out.event = Event::park_on(std::move(w));
+        return out;
+    }
+    if (tag == "wt0") {
+        Wait w;
+        w.release = Wait::OnClick | Wait::OnDecide | Wait::OnSkip |
+                    Wait::OnAuto;
+        out.kind = TagOutcomeKind::WaitEvent;
+        out.event = Event::park_on(std::move(w));
         return out;
     }
     if (tag == "wait") {
-        WaitReason r;
-        r.kind = WaitReason::Kind::Timed;
+        Wait w;
         const uint64_t time =
             uint64_t(eval.resolve_param(resolve_or_empty("time")).as_int().value_or(0));
-        r.milliseconds = time;
-        r.input = eval.resolve_param(resolve_or_empty("input")).as_int().value_or(0);
+        const int64_t input = eval.resolve_param(resolve_or_empty("input")).as_int().value_or(0);
         const std::string video = resolve_or_empty("video");
         const std::string scenario = resolve_or_empty("scenario");
         const std::string se = resolve_or_empty("se");
+        w.release = Wait::OnSkip;
         if (!video.empty()) {
-            r.kind = WaitReason::Kind::VideoLayer;
-            r.id = video;
-        } else if (int m = 0; (m = static_cast<int>(eval.resolve_param(scenario).as_int().value_or(0))),
+            w.stage = Wait::Stage::VideoLayer;
+            w.stage_id = video;
+        } else if (const int m = static_cast<int>(
+                       eval.resolve_param(scenario).as_int().value_or(0));
                    m == 1 || m == 2) {
-            r.kind = WaitReason::Kind::ScenarioTween;
-            r.mode = m;
+            // scenario=1 等逐字；=2 是清字瞬显，立即继续。
+            w.on_reveal_done = m == 1;
+            w.reveal_clear = m == 2;
         } else if (!se.empty()) {
-            r.kind = WaitReason::Kind::Se;
-            r.id = se;
+            w.stage = Wait::Stage::Se;
+            w.stage_id = se;
             if (ins.has("time")) {
-                r.milliseconds = time;
-                r.time_given = true; // counts from the SE play start
+                w.se_time_ms = time;
+                w.se_time_given = true; // counts from the SE play start
             }
+        } else {
+            w.timer_ms = int64_t(time);
+            if (input == 1) w.release |= Wait::OnClick | Wait::OnDecide;
         }
         out.kind = TagOutcomeKind::WaitEvent;
-        out.event = Event::wait(std::move(r));
+        out.event = Event::park_on(std::move(w));
         return out;
     }
     if (tag == "exkey") {
-        WaitReason r;
-        r.kind = WaitReason::Kind::KeyWait;
-        if (const std::string* b = ins.get("btn")) r.buttons.push_back(*b);
+        Wait w;
+        w.release = Wait::OnClick | Wait::OnDecide | Wait::OnSkip;
+        auto add_key = [&w](const std::string& btn) {
+            int code = 0;
+            try {
+                code = std::stoi(btn);
+            } catch (...) {
+                return;
+            }
+            w.keys.push_back(code);
+        };
+        if (const std::string* b = ins.get("btn")) add_key(*b);
         for (int i = 0; i < 10; ++i) {
-            if (const std::string* b = ins.get(std::to_string(i))) r.buttons.push_back(*b);
+            if (const std::string* b = ins.get(std::to_string(i))) add_key(*b);
         }
         out.kind = TagOutcomeKind::WaitEvent;
-        out.event = Event::wait(std::move(r));
+        out.event = Event::park_on(std::move(w));
         return out;
     }
     if (tag == "@") {
-        WaitReason r;
-        r.kind = WaitReason::Kind::Generic;
+        Wait w;
+        w.release = Wait::OnClick | Wait::OnDecide | Wait::OnSkip |
+                    Wait::OnAuto;
         out.kind = TagOutcomeKind::WaitEvent;
-        out.event = Event::wait(std::move(r));
+        out.event = Event::park_on(std::move(w));
         out.event.tag = tag;
         return out;
     }
@@ -2994,25 +3023,14 @@ bool Interpreter::fire_event(const std::string& event_name) {
 void Interpreter::note_wait_reason(const Event& event) {
     wait_reason_info_.clear();
     if (event.kind != Event::Kind::Wait_) return;
-    const WaitReason& r = event.reason;
-    switch (r.kind) {
-        case WaitReason::Kind::Timed:
-            if (r.milliseconds > 0) {
-                wait_reason_info_["time"] = std::to_string(now_ms() + r.milliseconds);
-            }
-            break;
-        case WaitReason::Kind::ScenarioTween:
-            wait_reason_info_[r.mode == 2 ? "textClearTween" : "textTween"] = "1";
-            break;
-        case WaitReason::Kind::Se:
-            wait_reason_info_["sound"] = r.id;
-            break;
-        case WaitReason::Kind::VideoLayer:
-            wait_reason_info_["video"] = r.id;
-            break;
-        default:
-            break;
+    const Wait& w = event.wait;
+    if (w.timed()) {
+        wait_reason_info_["time"] = std::to_string(now_ms() + uint64_t(w.timer_ms));
     }
+    if (w.on_reveal_done) wait_reason_info_["textTween"] = "1";
+    if (w.reveal_clear) wait_reason_info_["textClearTween"] = "1";
+    if (w.stage == Wait::Stage::Se) wait_reason_info_["sound"] = w.stage_id;
+    if (w.stage == Wait::Stage::VideoLayer) wait_reason_info_["video"] = w.stage_id;
 }
 
 // ---------------------------------------------------------------------------
@@ -3425,7 +3443,11 @@ std::optional<ExecutionResult> Interpreter::flush_tag_queue() {
                 // queue_hold_depth_): queued tags behind a queued [call] were
                 // enqueued by the caller and must resolve in the caller's
                 // script, not in the callee we just entered.
-                if (hooks_.queue_call_hold) {
+                // 空标签的 [call] = "从文件头开始跑"：框架用它执行脚本的初始化
+                // 段（system/msg.iet 的头里就是 ADV/backlog 字体）。这种 call
+                // 必须让被调方跑完，否则后面的队列标签会把位置挪走、初始化一句
+                // 都执行不到（test13 backlog 字体缺失就是这么来的）。
+                if (hooks_.queue_call_hold || outcome.label.empty()) {
                     queue_hold_depth_ = call_stack_.size();
                     return std::nullopt;
                 }
@@ -3471,33 +3493,13 @@ std::optional<ExecutionResult> Interpreter::flush_tag_queue() {
     return std::nullopt;
 }
 
-// --------------------------------------------------------------------------- Message-text segment tags a sync metric var may pre-execute.
-namespace {
-// tags a sync metric var must NOT flush past — in ordered (real-engine)
-// execution these pause/redirect the stream or re-enter Lua, so the var
-// behind them would not have been reached yet.
-bool is_var_barrier_stop_tag(const std::string& tag) {
-    static const char* kStop[] = {
-        "wait",    "call",    "jump",    "return",  "calllua",
-        "forcedcalllua", "exlabel", "label",
-        "macroadd","exkey",   "estag",   "/if",     "loop",
-        "/loop",   "exit",    "gotitle", "yesno",
-    };
-    for (const char* t : kStop)
-        if (tag == t) return true;
-    return false;
-}
-} // namespace
-
 void Interpreter::flush_pending_text_tags() {
     // A sync metric var evaluates at ITS position in the ordered tag
-    size_t ran = 0;
     for (size_t i = 0; i < tag_queue_.size();) {
         Instruction ins = std::move(tag_queue_[i]);
         tag_queue_.erase(tag_queue_.begin() + i);
         if (on_step) on_step(*current_script_name_, current_line_, ins);
         const TagOutcome outcome = execute_tag(*this, ins, false);
-        ++ran;
         switch (outcome.kind) {
             case TagOutcomeKind::Continue:
                 break;

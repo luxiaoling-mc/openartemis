@@ -12,6 +12,7 @@
 
 #include "core/fs/physfs_fs.h"
 #include "core/runtime/runtime_game.h"
+#include "host_input.h"
 
 namespace {
 int failures = 0;
@@ -26,23 +27,27 @@ void check(bool cond, const char* fmt, ...) {
         ++failures;
     }
 }
-const char* ws(const oa::runtime::WaitReason* w) {
-    using K = oa::runtime::WaitReason::Kind;
+const char* ws(const oa::runtime::Wait* w) {
     if (!w) return "none";
-    switch (w->kind) {
-        case K::Generic: return "generic";
-        case K::Generic0: return "wt0";
-        case K::Timed: return "timed";
-        case K::Stop: return "stop";
-        case K::Se: return "se";
-        case K::VideoLayer: return "video";
-        case K::ScenarioTween: return "stween";
-        case K::KeyWait: return "key";
+    using S = oa::runtime::Wait::Stage;
+    switch (w->stage) {
+        case S::Trans: return "trans";
+        case S::Video: return "video";
+        case S::VideoLayer: return "video-layer";
+        case S::Se: return "se";
+        case S::AllDelete: return "alldelete";
+        case S::Tween: return "tween";
+        case S::None: break;
     }
-    return "?";
+    if (w->timed()) return "timed";
+    if (w->on_reveal_done) return "reveal";
+    if (w->reveal_clear) return "reveal-clear";
+    if (!w->keys.empty()) return "key";
+    if (w->waiting_click()) return "click";
+    return "park";
 }
-const char* wsid(const oa::runtime::WaitReason* w) {
-    return (w && !w->id.empty()) ? w->id.c_str() : "-";
+const char* wsid(const oa::runtime::Wait* w) {
+    return (w && !w->stage_id.empty()) ? w->stage_id.c_str() : "-";
 }
 std::string stkstr(const oa::runtime::GameRuntime& rt) {
     std::string o;
@@ -59,11 +64,11 @@ std::string sample(oa::runtime::GameRuntime& rt, const std::string& id) {
         if (!u.data.empty()) return u.data.substr(0, 16);
     return "-";
 }
-bool is_story_wait(const oa::runtime::WaitReason* w) {
+bool is_story_wait(const oa::runtime::Wait* w) {
     if (!w) return false;
-    return w->kind == oa::runtime::WaitReason::Kind::Generic ||
-           w->kind == oa::runtime::WaitReason::Kind::Generic0 ||
-           w->kind == oa::runtime::WaitReason::Kind::Timed;
+    return w->waiting_click() ||
+           w->waiting_click() ||
+           w->timed();
 }
 } // namespace
 
@@ -102,10 +107,10 @@ int main() {
         };
         std::string target;
         for (size_t f = 0; f < 12000 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             if (!title) continue;
             const auto* w = rt.current_wait();
-            if (!(w && w->kind == oa::runtime::WaitReason::Kind::Stop && w->id.empty())) continue;
+            if (!(w && w->is_park() && w->stage_id.empty())) continue;
             for (const oa::render::Layer* l : rt.scene().draw_order()) {
                 const auto* h = rt.scene().find_event_handler(l->id, "click");
                 if (!h) continue;
@@ -127,7 +132,7 @@ int main() {
             in.mouse_x = cands[ci][0];
             in.mouse_y = cands[ci][1];
             for (size_t f = 0; f < 500 && !rt.exit_requested(); ++f) {
-                rt.tick(16, in);
+                oa::test::replay(rt, in);
                 in.left_click_edge = false;
                 in.left_down = false;
                 in.mouse_x = -1;
@@ -137,7 +142,7 @@ int main() {
         }
         bool body = false;
         for (size_t f = 0; f < 8000 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             if (rt.text().page_has_visible_text("1.80.mw.adv_adv")) {
                 body = true;
                 break;
@@ -166,11 +171,11 @@ int main() {
         //      wait machine (page sample changes within a bounded walk) ----
         auto fully_parked = [&](size_t budget) {
             for (size_t f = 0; f < budget && !rt.exit_requested(); ++f) {
-                rt.tick(16, idle);
+                oa::test::frame(rt);
                 const auto* w = rt.current_wait();
                 const oa::render::MessageLayer* ml = rt.text().layer("1.80.mw.adv_adv");
-                if (w && (w->kind == oa::runtime::WaitReason::Kind::Generic ||
-                          w->kind == oa::runtime::WaitReason::Kind::Generic0) &&
+                if (w && (w->waiting_click() ||
+                          w->waiting_click()) &&
                     ml && ml->reveal_index >= ml->char_count && !ml->reveal_pending)
                     return true;
             }
@@ -186,12 +191,12 @@ int main() {
             cl.left_down = true;
             cl.mouse_x = 640;
             cl.mouse_y = 600;
-            rt.tick(16, cl);
+            oa::test::replay(rt, cl);
             ++clicks;
             // 点击后推进可能跨若干帧/块；等下一个完整停驻并观察页内容变化
             bool moved = false;
             for (size_t f = 0; f < 2500 && !rt.exit_requested(); ++f) {
-                rt.tick(16, idle);
+                oa::test::frame(rt);
                 const std::string now = sample(rt, "1.80.mw.adv_adv");
                 if (now != last) {
                     last = now;
@@ -200,8 +205,8 @@ int main() {
                 }
                 const oa::render::MessageLayer* ml = rt.text().layer("1.80.mw.adv_adv");
                 const auto* w = rt.current_wait();
-                if (w && (w->kind == oa::runtime::WaitReason::Kind::Generic ||
-                          w->kind == oa::runtime::WaitReason::Kind::Generic0) &&
+                if (w && (w->waiting_click() ||
+                          w->waiting_click()) &&
                     ml && ml->reveal_index >= ml->char_count && !ml->reveal_pending &&
                     f > 4)
                     break;
@@ -231,7 +236,7 @@ int main() {
             if (std::getenv("OA_UX_TRACE")) {
                 std::string pv = sample(rt, "1.80.mw.adv_adv");
                 for (size_t f = 0; f < 1500; ++f) {
-                    rt.tick(16, idle);
+                    oa::test::frame(rt);
                     const std::string nv = sample(rt, "1.80.mw.adv_adv");
                     const oa::render::MessageLayer* ml = rt.text().layer("1.80.mw.adv_adv");
                     const auto* w = rt.current_wait();
@@ -251,7 +256,7 @@ int main() {
                 cl.left_down = true;
                 cl.mouse_x = 640;
                 cl.mouse_y = 600;
-                rt.tick(16, cl);
+                oa::test::replay(rt, cl);
                 (void)fully_parked(2500);
             }
             std::printf("[ux] pre-UI park wait=%s/%s script=%s:%zu layers=%zu stack=%s\n",
@@ -278,7 +283,7 @@ int main() {
             check(jumped, "UJ-6 backlog opened (layer count jumped)");
             if (jumped) {
                 for (size_t f = 0; f < 3000 && !rt.exit_requested(); ++f) {
-                    rt.tick(16, idle);
+                    oa::test::frame(rt);
                     if (rt.scene().find("sl.1") != nullptr ||
                         rt.scene().find("500.z.bt.tx.1.1") != nullptr)
                         break;
@@ -431,11 +436,11 @@ int main() {
             cl.left_down = true;
             cl.mouse_x = 640;
             cl.mouse_y = 600;
-            rt.tick(16, cl);
+            oa::test::replay(rt, cl);
             std::string cur = s0;
             bool moved = false;
             for (size_t f = 0; f < 2500 && !rt.exit_requested(); ++f) {
-                rt.tick(16, idle);
+                oa::test::frame(rt);
                 const std::string nv = sample(rt, "1.80.mw.adv_adv");
                 const auto* w = rt.current_wait();
                 const oa::render::MessageLayer* ml = rt.text().layer("1.80.mw.adv_adv");
@@ -444,8 +449,8 @@ int main() {
                     moved = true;
                     break;
                 }
-                if (w && (w->kind == oa::runtime::WaitReason::Kind::Generic ||
-                          w->kind == oa::runtime::WaitReason::Kind::Generic0) &&
+                if (w && (w->waiting_click() ||
+                          w->waiting_click()) &&
                     ml && ml->reveal_index >= ml->char_count && !ml->reveal_pending &&
                     f > 2)
                     break;

@@ -24,6 +24,7 @@ extern "C" {
 #include "core/fs/fs.h"
 #include "core/runtime/runtime_lua.h"
 #include "core/runtime/runtime_game.h"
+#include "fpm/host_input.h"
 #include "core/render/layer.h"
 
 namespace {
@@ -285,7 +286,7 @@ struct Harness {
         in.left_click_edge = click_edge;
         in.key_down_edges = keys;
         in.keys_down.insert(keys.begin(), keys.end());
-        rt->tick(16, in);
+        oa::test::replay(*rt, in);
     }
     size_t notes_of(oa::runtime::GameRuntime::PointerDispatch::Kind k) const {
         size_t n = 0;
@@ -467,7 +468,8 @@ void test_rt_layer_click_swallows_wait_click() {
     // warm ticks consumed registration and parked on the [wt]
     for (int i = 0; i < 3; ++i) h.tick(80, 80);
     check(h.rt->current_wait() != nullptr &&
-              h.rt->current_wait()->kind == oa::runtime::WaitReason::Kind::Timed,
+              h.rt->current_wait()->timed() &&
+              h.rt->current_wait()->can(oa::runtime::Wait::OnClick),
           "RT7 parked on the clickable wait");
     h.tick(80, 80, true, true); // click handled by the top layer
     check(h.rt->current_wait() != nullptr, "RT7 handled layer click swallows the wait click");
@@ -502,8 +504,7 @@ void test_rt_cancel_key_runs_push_row_in_queue_park() {
               "[stop]\n");
     h.warm(3);
     check(h.rt->current_wait() != nullptr &&
-              (h.rt->current_wait()->kind == oa::runtime::WaitReason::Kind::Generic ||
-               h.rt->current_wait()->kind == oa::runtime::WaitReason::Kind::Generic0),
+              h.rt->current_wait()->waiting_click(),
           "RT8 parked on the queue-armed click wait");
     check(h.rt->interpreter().last_wait_from_queue(), "RT8 park came from the tag queue");
     h.tick(-5, -5, false, false, {2}); // right button edge

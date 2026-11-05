@@ -115,6 +115,12 @@ public:
     /// isTimelinePlaying(label): the named timeline plays in any slot.
     bool is_timeline_playing(const std::string& label) const;
     void set_variable(const std::string& name, double value);
+    /// setVariable(label, value, time, easing): the authored fade. The variable
+    /// walks from its current composed value to `value` over `time` authored
+    /// frames (EmoteTween::set/emoteEase in the reference runner). time <= 0
+    /// collapses to set_variable().
+    void set_variable_faded(const std::string& name, double value, double time,
+                            double easing = 0);
     double get_variable(const std::string& name) const;
     /// Composer-side variable offset (setVariableDiff); value 0 clears it.
     /// Never folded into the domain; get_variable() excludes the offset.
@@ -231,6 +237,14 @@ private:
     EmotePhysics physics_;
     std::map<std::string, double> physics_vars_;
     void tick_physics(double frames);
+    /// Authored-fade variables (setVariable time/easing). Each entry owns one
+    /// variable until it lands; the clock is shared and in authored frames.
+    struct VarTween {
+        double from = 0, to = 0, start = 0, duration = 0, easing = 0;
+    };
+    std::map<std::string, VarTween> tweens_;
+    double tween_clock_ = 0; // authored frames since load
+    void advance_tweens(double frames);
     std::map<std::string, double> rendered_vars_; // snapshot at last render
 
     void push_frame_now();

@@ -119,6 +119,20 @@ if(NOT OA_TEST_TG3_PFS AND DEFINED ENV{OA_TEST_TG3_PFS})
   set(OA_TEST_TG3_PFS "$ENV{OA_TEST_TG3_PFS}" CACHE FILEPATH "" FORCE)
 endif()
 
+# test5 (B42): the opening recap montage + message-off input path. Guards the
+# "right click, then left click leaves the story stuck" regression
+# (t5_montage_input). Same rule as the other archives: -D, or the env var at
+# configure time; the test self-skips (exit 77) when unset.
+set(OA_TEST_T5_PFS "" CACHE FILEPATH "Path to the B42 (test5) root.pfs (or set the OA_TEST_T5_PFS env var at configure time)")
+if(NOT OA_TEST_T5_PFS AND DEFINED ENV{OA_TEST_T5_PFS})
+  set(OA_TEST_T5_PFS "$ENV{OA_TEST_T5_PFS}" CACHE FILEPATH "" FORCE)
+endif()
+
+set(OA_TEST_T13_PFS "" CACHE FILEPATH "Path to the test13 (Aiyoku no Eustia) root.pfs (or set the OA_TEST_T13_PFS env var at configure time)")
+if(NOT OA_TEST_T13_PFS AND DEFINED ENV{OA_TEST_T13_PFS})
+  set(OA_TEST_T13_PFS "$ENV{OA_TEST_T13_PFS}" CACHE FILEPATH "" FORCE)
+endif()
+
 # ---------------------------------------------------------------------------
 # Targets
 # ---------------------------------------------------------------------------

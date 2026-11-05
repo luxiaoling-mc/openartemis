@@ -44,6 +44,7 @@
 
 #include "core/fs/physfs_fs.h"
 #include "core/runtime/runtime_game.h"
+#include "host_input.h"
 #include "core/runtime/runtime_save.h"
 
 namespace {
@@ -59,29 +60,33 @@ void check(bool cond, const char* fmt, ...) {
         ++failures;
     }
 }
-const char* ws(const oa::runtime::WaitReason* w) {
-    using K = oa::runtime::WaitReason::Kind;
+const char* ws(const oa::runtime::Wait* w) {
     if (!w) return "none";
-    switch (w->kind) {
-        case K::Generic: return "generic";
-        case K::Generic0: return "wt0";
-        case K::Timed: return "timed";
-        case K::Stop: return "stop";
-        case K::Se: return "se";
-        case K::VideoLayer: return "video";
-        case K::ScenarioTween: return "stween";
-        case K::KeyWait: return "key";
+    using S = oa::runtime::Wait::Stage;
+    switch (w->stage) {
+        case S::Trans: return "trans";
+        case S::Video: return "video";
+        case S::VideoLayer: return "video-layer";
+        case S::Se: return "se";
+        case S::AllDelete: return "alldelete";
+        case S::Tween: return "tween";
+        case S::None: break;
     }
-    return "?";
+    if (w->timed()) return "timed";
+    if (w->on_reveal_done) return "reveal";
+    if (w->reveal_clear) return "reveal-clear";
+    if (!w->keys.empty()) return "key";
+    if (w->waiting_click()) return "click";
+    return "park";
 }
-bool is_page_wait(const oa::runtime::WaitReason* w) {
+bool is_page_wait(const oa::runtime::Wait* w) {
     // Story page-turn waits: Artemis parks text lines on Generic (@/wt0).
     // Timed waits gate fades/animation flows — a real player does not click
     // through those, and NekoMiko's select framework (cursor model) expects
     // clicks only on live rows.
     if (!w) return false;
-    return w->kind == oa::runtime::WaitReason::Kind::Generic ||
-           w->kind == oa::runtime::WaitReason::Kind::Generic0;
+    return w->waiting_click() ||
+           w->waiting_click();
 }
 std::string sample(oa::runtime::GameRuntime& rt) {
     // NekoMiko's active story message may be the engine-canonical adv slot
@@ -202,7 +207,7 @@ bool click_key(oa::runtime::GameRuntime& rt, const std::string& key) {
         cl.left_down = true;
         cl.mouse_x = int(x0 + rw / 2);
         cl.mouse_y = int(y0 + rh / 2);
-        rt.tick(16, cl);
+        oa::test::replay(rt, cl);
         return true;
     }
     return false;
@@ -241,13 +246,13 @@ void click_point(oa::runtime::GameRuntime& rt, int x, int y) {
     cl.left_down = true;
     cl.mouse_x = x;
     cl.mouse_y = y;
-    rt.tick(16, cl);
+    oa::test::replay(rt, cl);
 }
 void hover_point(oa::runtime::GameRuntime& rt, int x, int y, size_t frames) {
     oa::runtime::FrameInput mv;
     mv.mouse_x = x;
     mv.mouse_y = y;
-    for (size_t i = 0; i < frames; ++i) rt.tick(16, mv);
+    for (size_t i = 0; i < frames; ++i) oa::test::replay(rt, mv);
 }
 // ---- E15 (research/53) helpers -------------------------------------------
 // Framework button rows (csvbtn3/lyevent): click handlers with params
@@ -492,11 +497,11 @@ int main() {
             // select-[stop] area (position <=1) with a Stop wait — the
             // pre-crash state the user's trace shows.
             {
-                const oa::runtime::WaitReason* pw = rt.current_wait();
+                const oa::runtime::Wait* pw = rt.current_wait();
                 const char* cs = rt.interpreter().current_script()
                                      ? rt.interpreter().current_script()->c_str()
                                      : "";
-                if (pw && pw->kind == oa::runtime::WaitReason::Kind::Stop &&
+                if (pw && pw->is_park() &&
                     std::string(cs) == "system/script.asb" &&
                     rt.interpreter().current_line() <= 1) {
                     static bool park_logged = false;
@@ -510,7 +515,7 @@ int main() {
                         std::printf("[selback] ENGINE PARKED at select-[stop] "
                                     "pos=%s:%zu wait_id='%s' f=%zu stack[%s]\n",
                                     cs, rt.interpreter().current_line(),
-                                    pw->id.c_str(), t, cst.c_str());
+                                    pw->stage_id.c_str(), t, cst.c_str());
                     }
                 }
             }
@@ -518,7 +523,7 @@ int main() {
             // left click at the message area, then idle-watch for the 482).
             if (std::getenv("OA_SELBACK_RCLK")) {
                 if (g_sb.f % 25 == 0) {
-                    const oa::runtime::WaitReason* pw = rt.current_wait();
+                    const oa::runtime::Wait* pw = rt.current_wait();
                     std::string cs;
                     for (const auto& fr : rt.interpreter().call_stack()) {
                         cs += fr.script + ":" +
@@ -526,7 +531,7 @@ int main() {
                     }
                     std::printf("[selback] rclk-watch f=%zu wait=%s id='%s' "
                                 "pos=%s:%zu q=%d stack[%s] sample='%s'\n",
-                                t, ws(pw), pw ? pw->id.c_str() : "-",
+                                t, ws(pw), pw ? pw->stage_id.c_str() : "-",
                                 rt.interpreter().current_script()
                                     ? rt.interpreter().current_script()->c_str()
                                     : "?",
@@ -758,7 +763,7 @@ int main() {
                         // edge (Enter/CLICK) releases the stop and the inline
                         // stream falls into select_exit -> 482 (user crash).
                         if (g_sb.f == 20) {
-                            const oa::runtime::WaitReason* pw = rt.current_wait();
+                            const oa::runtime::Wait* pw = rt.current_wait();
                             std::string cs;
                             for (const auto& fr : rt.interpreter().call_stack()) {
                                 cs += fr.script + ":" +
@@ -767,7 +772,7 @@ int main() {
                             std::printf(
                                 "[selback] preEnter wait=%s id='%s' pos=%s:%zu "
                                 "queue=%d callstack[%s]\n",
-                                ws(pw), pw ? pw->id.c_str() : "-",
+                                ws(pw), pw ? pw->stage_id.c_str() : "-",
                                 rt.interpreter().current_script()
                                     ? rt.interpreter().current_script()->c_str()
                                     : "?",
@@ -852,7 +857,7 @@ int main() {
             static size_t last_clicks = 0;
             if (clicks == last_clicks) {
                 if (++stall == 1500) { // story not advancing after the stage
-                    const oa::runtime::WaitReason* pw = rt.current_wait();
+                    const oa::runtime::Wait* pw = rt.current_wait();
                     std::string cs;
                     for (const auto& fr : rt.interpreter().call_stack()) {
                         cs += fr.script + ":" + std::to_string(fr.return_line) + " ";
@@ -861,7 +866,7 @@ int main() {
                         "[selback] STALL ch='%s' wait=%s id='%s' pos=%s:%zu "
                         "queue=%d callstack[%s] sample='%s'\n",
                         chapter.c_str(), ws(pw),
-                        pw ? pw->id.c_str() : "-",
+                        pw ? pw->stage_id.c_str() : "-",
                         rt.interpreter().current_script()
                             ? rt.interpreter().current_script()->c_str()
                             : "?",
@@ -943,7 +948,7 @@ int main() {
         }
         const auto* w = rt.current_wait();
         const bool parked_title =
-            w && w->kind == oa::runtime::WaitReason::Kind::Stop && w->id.empty() &&
+            w && w->is_park() && w->stage_id.empty() &&
             has_key_handler(rt, "bt_start");
         if (parked_title && !title_clicked) {
             title_clicked = click_key(rt, "bt_start");

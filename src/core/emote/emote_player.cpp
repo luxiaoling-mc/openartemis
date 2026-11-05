@@ -254,6 +254,9 @@ double EmotePlayer::start_phase(const EmoteTimeline* tl) const {
 // (the reference's engine-level currStartTick resets every parallel track's
 // phase and is deliberately not copied).
 void EmotePlayer::step_slots(double frames) {
+    // Authored fades advance with the same clock step (reference:
+    // updateTimelineControl writes baseVariables from every live tween first).
+    advance_tweens(frames);
     auto step_one = [&](Slot& slot) {
         if (!slot.active) return false;
         const EmoteTimeline* tl = find_timeline(slot.label);
@@ -677,9 +680,63 @@ void EmotePlayer::set_coord(double x, double y) {
 
 void EmotePlayer::set_variable(const std::string& name, double value) {
     if (name.empty()) return;
+    tweens_.erase(name); // an instant write cancels the variable's fade
     explicit_[name] = value;
     compose();
     schedule_render(false);
+}
+
+/// Reference easing (emotephysics.h emoteEase): exponent = 1+ease for ease>=0,
+/// 1/(1-ease) for negative ease; t clamped to [0,1].
+static double emote_ease(double t, double easing) {
+    t = std::clamp(t, 0.0, 1.0);
+    if (!std::isfinite(easing)) return t;
+    const double exponent = easing >= 0 ? 1.0 + easing : 1.0 / (1.0 - easing);
+    return std::pow(t, exponent);
+}
+
+void EmotePlayer::set_variable_faded(const std::string& name, double value, double time,
+                                     double easing) {
+    if (name.empty()) return;
+    if (!(time > 0) || !std::isfinite(time)) {
+        set_variable(name, value);
+        return;
+    }
+    // Start from the composed value the current frame shows (the reference's
+    // emoteVariable::set(current, ...)) and drive the persistent domain from
+    // the tween until it lands.
+    const double current = get_variable(name);
+    explicit_.erase(name);
+    VarTween tw;
+    tw.from = current;
+    tw.to = value;
+    tw.start = tween_clock_;
+    tw.duration = time;
+    tw.easing = easing;
+    tweens_[name] = tw;
+    base_[name] = current;
+    compose();
+    schedule_render(false);
+}
+
+void EmotePlayer::advance_tweens(double frames) {
+    if (!(frames > 0)) return;
+    tween_clock_ += frames;
+    if (tweens_.empty()) return;
+    for (auto it = tweens_.begin(); it != tweens_.end();) {
+        const VarTween& tw = it->second;
+        const double t = tween_clock_ - tw.start;
+        const bool landed = tw.duration <= 0 || t >= tw.duration;
+        base_[it->first] =
+            landed ? tw.to
+                   : tw.from + (tw.to - tw.from) * emote_ease(t / tw.duration, tw.easing);
+        if (landed) {
+            explicit_.erase(it->first);
+            it = tweens_.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 void EmotePlayer::set_variable_diff(const std::string& name, double value) {

@@ -14,6 +14,7 @@
 
 #include "core/fs/fs.h"
 #include "core/runtime/runtime_game.h"
+#include "fpm/host_input.h"
 #include "ogg_fixture.h"
 
 namespace {
@@ -29,24 +30,29 @@ bool approx(double a, double b, double eps = 1e-3) {
     return d > -eps && d < eps;
 }
 
-const char* kind_str(oa::runtime::WaitReason::Kind k) {
-    using K = oa::runtime::WaitReason::Kind;
-    switch (k) {
-        case K::Generic: return "generic";
-        case K::Generic0: return "wt0";
-        case K::Timed: return "timed";
-        case K::Stop: return "stop";
-        case K::Se: return "se";
-        case K::VideoLayer: return "video";
-        case K::ScenarioTween: return "scenario-tween";
-        case K::KeyWait: return "key";
-    }
-    return "?";
-}
-std::string wait_str(const oa::runtime::WaitReason* w) {
+const char* kind_str(const oa::runtime::Wait* w) {
     if (!w) return "none";
-    std::string s = kind_str(w->kind);
-    if (!w->id.empty()) s += "('" + w->id + "')";
+    using S = oa::runtime::Wait::Stage;
+    switch (w->stage) {
+        case S::Trans: return "trans";
+        case S::Video: return "video";
+        case S::VideoLayer: return "video-layer";
+        case S::Se: return "se";
+        case S::AllDelete: return "alldelete";
+        case S::Tween: return "tween";
+        case S::None: break;
+    }
+    if (w->timed()) return "timed";
+    if (w->on_reveal_done) return "reveal";
+    if (w->reveal_clear) return "reveal-clear";
+    if (!w->keys.empty()) return "key";
+    if (w->waiting_click()) return "click";
+    return "park";
+}
+std::string wait_str(const oa::runtime::Wait* w) {
+    if (!w) return "none";
+    std::string s = kind_str(w);
+    if (!w->stage_id.empty()) s += "('" + w->stage_id + "')";
     return s;
 }
 
@@ -179,9 +185,9 @@ void test_se_wait_notify() {
     bool parked = false;
     size_t frame = 0;
     for (; frame < 300 && !b.rt->exit_requested(); ++frame) {
-        b.rt->tick(16, idle);
+        oa::test::frame(*b.rt);
         const auto* w = b.rt->current_wait();
-        if (w && w->kind == oa::runtime::WaitReason::Kind::Se && w->id == "s1") {
+        if (w && w->stage == oa::runtime::Wait::Stage::Se && w->stage_id == "s1") {
             parked = true;
             break;
         }
@@ -195,9 +201,9 @@ void test_se_wait_notify() {
           "R2 end-of-play report stops the tracked channel");
     bool reached = false;
     for (; frame < 400 && !b.rt->exit_requested(); ++frame) {
-        b.rt->tick(16, idle);
+        oa::test::frame(*b.rt);
         const auto* w = b.rt->current_wait();
-        if (w && w->kind == oa::runtime::WaitReason::Kind::Stop && w->id.empty()) {
+        if (w && w->is_park() && w->stage_id.empty()) {
             reached = true;
             break;
         }
@@ -223,9 +229,9 @@ void test_se_wait_time() {
     bool parked = false;
     size_t frame = 0;
     for (; frame < 300 && !b.rt->exit_requested(); ++frame) {
-        b.rt->tick(16, idle);
+        oa::test::frame(*b.rt);
         const auto* w = b.rt->current_wait();
-        if (w && w->kind == oa::runtime::WaitReason::Kind::Se && w->id == "s2") {
+        if (w && w->stage == oa::runtime::Wait::Stage::Se && w->stage_id == "s2") {
             parked = true;
             break;
         }
@@ -233,9 +239,9 @@ void test_se_wait_time() {
     check(parked, "R3 parked on the se wait");
     bool reached = false;
     for (; frame < 600 && !b.rt->exit_requested(); ++frame) {
-        b.rt->tick(16, idle);
+        oa::test::frame(*b.rt);
         const auto* w = b.rt->current_wait();
-        if (w && w->kind == oa::runtime::WaitReason::Kind::Stop && w->id.empty()) {
+        if (w && w->is_park() && w->stage_id.empty()) {
             reached = true;
             break;
         }
@@ -265,12 +271,12 @@ void test_se_wait_eof() {
     bool reached = false;
     size_t dispatched_at = 0;
     for (; frame < 400 && !b.rt->exit_requested(); ++frame) {
-        b.rt->tick(16, idle);
+        oa::test::frame(*b.rt);
         if (b.rt->media_handler_dispatches() == 1 && dispatched_at == 0) {
             dispatched_at = frame;
         }
         const auto* w = b.rt->current_wait();
-        if (w && w->kind == oa::runtime::WaitReason::Kind::Stop && w->id.empty()) {
+        if (w && w->is_park() && w->stage_id.empty()) {
             reached = true;
             break;
         }
@@ -292,17 +298,17 @@ void test_video_fullscreen_wait() {
     size_t frame = 0;
     std::string seen;
     for (; frame < 400 && !b.rt->exit_requested(); ++frame) {
-        b.rt->tick(16, idle);
+        oa::test::frame(*b.rt);
         const auto* w = b.rt->current_wait();
         if (seen != wait_str(w)) {
             seen = wait_str(w);
             std::printf("[R5] f=%zu wait=%s\n", frame, seen.c_str());
         }
-        if (w && w->kind == oa::runtime::WaitReason::Kind::Stop && w->id == "video") {
+        if (w && w->stage == oa::runtime::Wait::Stage::Video) {
             video_park = true;
         }
-        if (video_park && w && w->kind == oa::runtime::WaitReason::Kind::Stop &&
-            w->id.empty()) {
+        if (video_park && w && w->is_park() &&
+            w->stage_id.empty()) {
             break; // reached the trailing [stop]
         }
     }
@@ -325,13 +331,13 @@ void test_video_layer_wait() {
     bool reached = false;
     std::string seen;
     for (; frame < 400 && !b.rt->exit_requested(); ++frame) {
-        b.rt->tick(16, idle);
+        oa::test::frame(*b.rt);
         const auto* w = b.rt->current_wait();
         if (seen != wait_str(w)) {
             seen = wait_str(w);
             std::printf("[R6] f=%zu wait=%s\n", frame, seen.c_str());
         }
-        if (w && w->kind == oa::runtime::WaitReason::Kind::Stop && w->id.empty()) {
+        if (w && w->is_park() && w->stage_id.empty()) {
             reached = true;
             break;
         }
@@ -352,7 +358,7 @@ void test_video_layer_content_binding() {
            "[video id=\"mw\" file=\"mv.ogv\" loop=\"1\"]\n"
            "[stop]\n");
     oa::runtime::FrameInput idle;
-    b.rt->tick(16, idle); // 事件派发帧:[lyc] 物化 + [video] 绑定
+    oa::test::frame(*b.rt); // 事件派发帧:[lyc] 物化 + [video] 绑定
     const oa::render::Layer* mv = b.rt->scene().find("mw");
     check(mv != nullptr, "S5 video bind: carrier exists");
     if (mv) {
@@ -371,7 +377,7 @@ void test_video_layer_content_binding() {
     // 视频收尾(EOF 等价路径)→ 解绑:层回到空态,不回滚旧静态图(旧拼写绑定
     // 语义逐位保持)。
     b.rt->video().queue_finish("mw");
-    b.rt->tick(16, idle);
+    oa::test::frame(*b.rt);
     const oa::render::Layer* after = b.rt->scene().find("mw");
     check(after != nullptr && !after->host_bound,
           "S5 video finish: content unbound");
@@ -388,7 +394,7 @@ void test_system_volume_bridge() {
     Boot b("[var name=\"s.bgmvol\" data=\"500\"]\n"
            "[wait time=\"0\" input=\"0\"]\n");
     oa::runtime::FrameInput idle;
-    for (int i = 0; i < 3 && !b.rt->exit_requested(); ++i) b.rt->tick(16, idle);
+    for (int i = 0; i < 3 && !b.rt->exit_requested(); ++i) oa::test::frame(*b.rt);
     check(approx(b.rt->audio().state().bgm_volume, 0.5f),
           "R7 s.bgmvol=500 reaches the bgm volume bus");
     // default se volume untouched
@@ -415,7 +421,7 @@ void test_ab_loop_switch() {
     size_t frame = 0;
     bool channel_alive = false;
     for (; frame < 300 && !b.rt->exit_requested(); ++frame) {
-        b.rt->tick(16, idle);
+        oa::test::frame(*b.rt);
         if (b.rt->audio().is_bgm_playing()) channel_alive = true;
         for (const std::string& n : requested) {
             if (n == "bgm_b.ogg") saw_b = true;
@@ -459,7 +465,7 @@ void test_sound_extension_fallback() {
     oa::runtime::FrameInput idle;
     bool probed_ogg = false;
     for (size_t frame = 0; frame < 120; ++frame) {
-        b.rt->tick(16, idle);
+        oa::test::frame(*b.rt);
         if (seen("bgm/theme_a.ogg")) {
             probed_ogg = true;
             break;
@@ -477,7 +483,7 @@ void test_sound_extension_fallback() {
     b.rt->apply_media_event(
         tag_event("splay", {{"file", "bgm/explicit.ogg"}, {"loop", "0"}}));
     for (size_t frame = 0; frame < 60 && !seen("bgm/explicit.ogg"); ++frame)
-        b.rt->tick(16, idle);
+        oa::test::frame(*b.rt);
     check(!seen("bgm/explicit.ogg.ogg"),
           "R9 an already-qualified name is not probed again");
 }

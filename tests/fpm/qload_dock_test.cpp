@@ -35,6 +35,7 @@
 
 #include "core/fs/physfs_fs.h"
 #include "core/runtime/runtime_game.h"
+#include "host_input.h"
 #include "core/runtime/runtime_save.h"
 
 namespace {
@@ -45,24 +46,28 @@ void check(bool cond, const char* what) {
         ++failures;
     }
 }
-const char* ws(const oa::runtime::WaitReason* w) {
-    using K = oa::runtime::WaitReason::Kind;
+const char* ws(const oa::runtime::Wait* w) {
     if (!w) return "none";
-    switch (w->kind) {
-        case K::Generic: return "generic";
-        case K::Generic0: return "wt0";
-        case K::Timed: return "timed";
-        case K::Stop: return "stop";
-        case K::Se: return "se";
-        case K::VideoLayer: return "video";
-        case K::ScenarioTween: return "stween";
-        case K::KeyWait: return "key";
+    using S = oa::runtime::Wait::Stage;
+    switch (w->stage) {
+        case S::Trans: return "trans";
+        case S::Video: return "video";
+        case S::VideoLayer: return "video-layer";
+        case S::Se: return "se";
+        case S::AllDelete: return "alldelete";
+        case S::Tween: return "tween";
+        case S::None: break;
     }
-    return "?";
+    if (w->timed()) return "timed";
+    if (w->on_reveal_done) return "reveal";
+    if (w->reveal_clear) return "reveal-clear";
+    if (!w->keys.empty()) return "key";
+    if (w->waiting_click()) return "click";
+    return "park";
 }
-bool is_story_wait(const oa::runtime::WaitReason* w) {
-    return w && (w->kind == oa::runtime::WaitReason::Kind::Generic ||
-                 w->kind == oa::runtime::WaitReason::Kind::Generic0);
+bool is_story_wait(const oa::runtime::Wait* w) {
+    return w && (w->waiting_click() ||
+                 w->waiting_click());
 }
 std::string sample(oa::runtime::GameRuntime& rt) {
     const oa::render::MessageLayer* ml = rt.text().layer("1.80.mw.adv_adv");
@@ -76,9 +81,9 @@ bool has_push_row(oa::runtime::GameRuntime& rt, int key) {
 }
 bool reach_title(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idle) {
     for (size_t f = 0; f < 12000 && !rt.exit_requested(); ++f) {
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         const auto* w = rt.current_wait();
-        if (!(w && w->kind == oa::runtime::WaitReason::Kind::Stop && w->id.empty())) continue;
+        if (!(w && w->is_park() && w->stage_id.empty())) continue;
         for (const oa::render::Layer* l : rt.scene().draw_order()) {
             const auto* h = rt.scene().find_event_handler(l->id, "click");
             if (!h) continue;
@@ -97,7 +102,7 @@ void start_game(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idle) {
         in.mouse_x = cands[ci][0];
         in.mouse_y = cands[ci][1];
         for (size_t f = 0; f < 500 && !rt.exit_requested(); ++f) {
-            rt.tick(16, in);
+            oa::test::replay(rt, in);
             in.left_click_edge = false;
             in.left_down = false;
             in.mouse_x = -1;
@@ -109,7 +114,7 @@ void start_game(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idle) {
 bool park_story(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idle,
                 size_t budget = 3000) {
     for (size_t f = 0; f < budget && !rt.exit_requested(); ++f) {
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         const auto* w = rt.current_wait();
         const oa::render::MessageLayer* ml = rt.text().layer("1.80.mw.adv_adv");
         if (is_story_wait(w) && ml && ml->reveal_index >= ml->char_count && !ml->reveal_pending)
@@ -119,7 +124,7 @@ bool park_story(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idle,
 }
 bool reach_story_page(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idle) {
     for (size_t f = 0; f < 8000 && !rt.exit_requested(); ++f) {
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         if (rt.text().page_has_visible_text("1.80.mw.adv_adv")) break;
     }
     for (int t = 0; t < 6 && !rt.exit_requested(); ++t) {
@@ -129,7 +134,7 @@ bool reach_story_page(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idl
         cl.left_down = true;
         cl.mouse_x = 640;
         cl.mouse_y = 600;
-        rt.tick(16, cl);
+        oa::test::replay(rt, cl);
         (void)park_story(rt, idle, 2500);
     }
     return park_story(rt, idle, 2500);
@@ -138,8 +143,8 @@ void press_tick(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idle, int
     oa::runtime::FrameInput k;
     k.key_down_edges = {key};
     k.keys_down.insert(key);
-    rt.tick(16, k);
-    for (size_t f = 1; f < 40 && !rt.exit_requested(); ++f) rt.tick(16, idle);
+    oa::test::replay(rt, k);
+    for (size_t f = 1; f < 40 && !rt.exit_requested(); ++f) oa::test::frame(rt);
 }
 /// Yes/no dialog (node 600.1.bt.1.0 = YES) -> Enter. Returns true when the
 /// dialog appeared.
@@ -147,7 +152,7 @@ bool confirm_dialog(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idle)
     size_t held = 0;
     bool seen = false;
     for (size_t f = 0; f < 6000 && !rt.exit_requested(); ++f) {
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         if (rt.scene().find("600.1.bt.1.0") != nullptr) {
             seen = true;
             if (++held > 120) break;
@@ -166,7 +171,7 @@ bool confirm_dialog(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idle)
 std::string wait_story(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idle,
                        size_t budget) {
     for (size_t f = 0; f < budget && !rt.exit_requested(); ++f) {
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         const auto* w = rt.current_wait();
         const oa::render::MessageLayer* ml = rt.text().layer("1.80.mw.adv_adv");
         if (is_story_wait(w) && ml && ml->reveal_index >= ml->char_count && !ml->reveal_pending)
@@ -180,21 +185,21 @@ void hover_click(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idle, in
     oa::runtime::FrameInput mv;
     mv.mouse_x = x;
     mv.mouse_y = y;
-    for (size_t f = 0; f < 30; ++f) rt.tick(16, mv);
+    for (size_t f = 0; f < 30; ++f) oa::test::replay(rt, mv);
     oa::runtime::FrameInput cl;
     cl.mouse_x = x;
     cl.mouse_y = y;
     cl.left_click_edge = true;
     cl.left_down = true;
-    rt.tick(16, cl);
+    oa::test::replay(rt, cl);
     oa::runtime::FrameInput hold;
     hold.mouse_x = x;
     hold.mouse_y = y;
-    for (size_t f = 0; f < after && !rt.exit_requested(); ++f) rt.tick(16, hold);
+    for (size_t f = 0; f < after && !rt.exit_requested(); ++f) oa::test::replay(rt, hold);
     oa::runtime::FrameInput out;
     out.mouse_x = -1;
     out.mouse_y = -1;
-    for (size_t f = 0; f < 20 && !rt.exit_requested(); ++f) rt.tick(16, out);
+    for (size_t f = 0; f < 20 && !rt.exit_requested(); ++f) oa::test::replay(rt, out);
 }
 /// World center of the layer whose click row carries `key`.
 bool row_center(oa::runtime::GameRuntime& rt, const std::string& key, int* x, int* y) {
@@ -221,10 +226,10 @@ bool dock_opens(oa::runtime::GameRuntime& rt, oa::runtime::FrameInput& idle,
     const size_t base = rt.scene().size();
     hover_click(rt, idle, x, y, 200);
     for (size_t f = 0; f < 1200 && !rt.exit_requested(); ++f) {
-        rt.tick(16, idle);
+        oa::test::frame(rt);
         const auto* w = rt.current_wait();
         if (rt.scene().size() > base + 60 ||
-            (w && w->kind == oa::runtime::WaitReason::Kind::Stop) ||
+            (w && w->is_park()) ||
             rt.scene().find("500.bt.1.bg.0") != nullptr) {
             return true;
         }
@@ -295,7 +300,7 @@ int main() {
         (void)confirm_dialog(rt, idle);
         bool qsaved = false;
         for (size_t f = 0; f < 12000 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             if (count_saves() > saves_before && rt.scene().size() < 200) {
                 qsaved = true;
                 break;
@@ -314,7 +319,7 @@ int main() {
             cl.left_down = true;
             cl.mouse_x = 640;
             cl.mouse_y = 600;
-            rt.tick(16, cl);
+            oa::test::replay(rt, cl);
             const std::string nv = wait_story(rt, idle, 3000);
             if (nv != s0) {
                 advanced = true;
@@ -328,7 +333,7 @@ int main() {
         check(confirm_dialog(rt, idle), "C-10 quickload confirmation dialog appeared");
         bool restored = false;
         for (size_t f = 0; f < 20000 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             const auto* w = rt.current_wait();
             const oa::render::MessageLayer* ml = rt.text().layer("1.80.mw.adv_adv");
             if (sample(rt) == s0 && !ui_or_page_open(rt) && is_story_wait(w) && ml &&
@@ -355,7 +360,7 @@ int main() {
             press_tick(rt, idle, 117); // F6 = SAVE key path
             bool opened = false;
             for (size_t f = 0; f < 3000 && !rt.exit_requested(); ++f) {
-                rt.tick(16, idle);
+                oa::test::frame(rt);
                 if (ui_or_page_open(rt)) {
                     opened = true;
                     break;

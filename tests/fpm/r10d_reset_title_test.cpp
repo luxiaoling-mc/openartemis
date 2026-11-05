@@ -24,6 +24,7 @@
 
 #include "core/fs/physfs_fs.h"
 #include "core/runtime/runtime_game.h"
+#include "host_input.h"
 
 namespace {
 int failures = 0;
@@ -33,11 +34,10 @@ void check(bool cond, const char* what) {
         ++failures;
     }
 }
-bool is_clickable_wait(const oa::runtime::WaitReason* w) {
-    using K = oa::runtime::WaitReason::Kind;
+bool is_clickable_wait(const oa::runtime::Wait* w) {
     if (!w) return false;
-    return w->kind == K::Generic || w->kind == K::Generic0 ||
-           w->kind == K::Timed || w->kind == K::Se || w->kind == K::KeyWait;
+    return w->waiting_click() || w->timed() ||
+           w->stage == oa::runtime::Wait::Stage::Se || !w->keys.empty();
 }
 struct Key {
     std::string key;
@@ -64,7 +64,7 @@ bool find_key(oa::runtime::GameRuntime& rt, const std::string& key, Key* out) {
 }
 bool at_title(oa::runtime::GameRuntime& rt) {
     const auto* w = rt.current_wait();
-    if (!(w && w->kind == oa::runtime::WaitReason::Kind::Stop && w->id.empty()))
+    if (!(w && w->is_park() && w->stage_id.empty()))
         return false;
     Key k;
     return find_key(rt, "bt_start", &k);
@@ -93,7 +93,7 @@ int main() {
         };
         rt.boot_project();
         oa::runtime::FrameInput idle;
-        auto tick = [&](oa::runtime::FrameInput& in) { rt.tick(16, in); };
+        auto tick = [&](oa::runtime::FrameInput& in) { oa::test::replay(rt, in); };
         bool title_seen = false;
         rt.interpreter().on_step = [&](const std::string&, size_t,
                                        const oa::runtime::Instruction& i) {

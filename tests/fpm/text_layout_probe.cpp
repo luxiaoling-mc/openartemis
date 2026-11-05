@@ -10,6 +10,7 @@
 
 #include "core/fs/physfs_fs.h"
 #include "core/runtime/runtime_game.h"
+#include "host_input.h"
 #include "core/render/font.h"
 
 namespace {
@@ -24,20 +25,12 @@ bool approx(double a, double b, double eps = 1e-9) {
     const double d = a - b;
     return d > -eps && d < eps;
 }
-const char* wait_str(const oa::runtime::WaitReason* w) {
+const char* wait_str(const oa::runtime::Wait* w) {
     if (!w) return "none";
-    using K = oa::runtime::WaitReason::Kind;
-    switch (w->kind) {
-        case K::Generic: return "generic";
-        case K::Generic0: return "wt0";
-        case K::Timed: return "timed";
-        case K::Stop: return "stop";
-        case K::Se: return "se";
-        case K::VideoLayer: return "video";
-        case K::ScenarioTween: return "scenario-tween";
-        case K::KeyWait: return "key";
-    }
-    return "?";
+    if (w->waiting_click()) return "generic";
+    if (w->is_park()) return "stop";
+    if (w->timed()) return "timed";
+    return "other";
 }
 } // namespace
 
@@ -62,7 +55,7 @@ int main() {
         std::string target;
         // boot to title
         for (size_t f = 0; f < 12000 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             if ((f % 1200) == 0) {
                 std::printf("[probe] f=%zu title_init=%s wait=%s layers=%zu\n", f,
                             saw_title ? "yes" : "no", wait_str(rt.current_wait()),
@@ -70,7 +63,7 @@ int main() {
             }
             if (!saw_title) continue;
             const auto* w = rt.current_wait();
-            if (!(w && w->kind == oa::runtime::WaitReason::Kind::Stop && w->id.empty())) continue;
+            if (!(w && w->is_park() && w->stage_id.empty())) continue;
             for (const oa::render::Layer* l : rt.scene().draw_order()) {
                 const auto* h = rt.scene().find_event_handler(l->id, "click");
                 if (!h) continue;
@@ -105,9 +98,9 @@ int main() {
         double last_x = -1e9;
         size_t quiet = 0;
         for (size_t f = 0; f < 4000 && !rt.exit_requested(); ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             const auto* wq = rt.current_wait();
-            if (!(wq && wq->kind == oa::runtime::WaitReason::Kind::Stop && wq->id.empty())) continue;
+            if (!(wq && wq->is_park() && wq->stage_id.empty())) continue;
             if (rt.transition().is_in_progress(rt.now_ms())) continue;
             double x0 = 0, y0 = 0, rw = 0, rh = 0;
             if (!rt.scene().world_rect(target, w, h, &x0, &y0, &rw, &rh)) continue;
@@ -127,7 +120,7 @@ int main() {
                 in.left_down = true;
                 first = false;
             }
-            rt.tick(16, in);
+            oa::test::replay(rt, in);
             if (rt.scene().find("500") == nullptr) title_gone = true;
             if (title_gone) break;
         }
@@ -136,7 +129,7 @@ int main() {
         bool reached = false;
         std::string layer_id;
         for (size_t f = 0; f < 6000 && !rt.exit_requested() && !reached; ++f) {
-            rt.tick(16, idle);
+            oa::test::frame(rt);
             for (const std::string& id : rt.text().visible_content_layers()) {
                 if (!rt.text().page_has_visible_text(id)) continue;
                 // skip the name/measure layers: want the main adv layer

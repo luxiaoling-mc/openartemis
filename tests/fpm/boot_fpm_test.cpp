@@ -55,10 +55,14 @@ int main() {
 
         (void)0; // counters live at function scope so the catch can see them
 
-        it.on_step = [&](const std::string& script, size_t /*line*/,
+        it.on_step = [&](const std::string& script, size_t line,
                          const oa::runtime::Instruction& ins) {
-            (void)script;
             ++steps;
+            if (std::getenv("OA_BOOT_TRACE") && steps > 540) {
+                const std::string* fn = ins.get("function");
+                std::printf("[step %zu] %s:%zu [%s]%s%s\n", steps, script.c_str(), line,
+                            ins.tag.c_str(), fn ? " fn=" : "", fn ? fn->c_str() : "");
+            }
             if (const std::string* fn = ins.get("function")) {
                 if (*fn == "system_initlua") saw_initlua = true;
                 if (*fn == "system_starting") saw_starting = true;

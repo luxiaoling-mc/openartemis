@@ -24,9 +24,17 @@ static bool parse_u64s(std::string_view v, uint64_t* out) {
     const std::string s(v);
     char* end = nullptr;
     errno = 0;
-    const unsigned long long x = std::strtoull(s.c_str(), &end, 10);
-    if (errno == ERANGE || end != s.c_str() + s.size()) return false;
-    *out = (uint64_t)x;
+    const double d = std::strtod(s.c_str(), &end);
+    if (end != s.c_str() + s.size() || errno == ERANGE || !std::isfinite(d)) return false;
+    if (d <= 0.0) {
+        *out = 0;
+        return true;
+    }
+    if (d >= 1e12) {
+        *out = 1000000000000ull;
+        return true;
+    }
+    *out = uint64_t(std::llround(d));
     return true;
 }
 static bool parse_dbl(std::string_view v, double* out) {
@@ -171,6 +179,9 @@ static const char* kDefaultProhibitFoot = "([{「『（｛〔［【";
 static const char* kDefaultWordparts =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
+// 单帧最多推进的逐字时间（长帧不折算成批量出字）。
+static constexpr uint64_t kRevealMaxStepMs = 50;
+
 // UTF-8 iteration --------------------------------------------------------
 bool next_codepoint(std::string_view s, size_t* i, uint32_t* cp) {
     if (*i >= s.size()) return false;
@@ -224,6 +235,7 @@ void TextEngine::clear_scene() {
         l.reveal_index = 0;
         l.reveal_pending = false;
         l.reveal_clock_ms = 0;
+        l.reveal_fresh = false;
         l.char_count = 0;
         l.text_hidden = false;
         ++l.generation;
@@ -429,6 +441,7 @@ void TextEngine::push_text(const std::string& content) {
         l.reveal_pending = true;
         l.reveal_clock_ms = 0;
         l.reveal_index = 0;
+        l.reveal_fresh = true;
     }
     // 内容内换行（LF）语义归一。push_text 把 content 按 '\n' 切成
     auto push_segment = [&](const std::string& data) {
@@ -523,6 +536,7 @@ void TextEngine::page_break(std::optional<int> backlog_param) {
     l.reveal_index = 0;
     l.reveal_pending = false;
     l.reveal_clock_ms = 0;
+    l.reveal_fresh = false;
     l.char_count = 0;
     ruby_open_ = false;
     bump_revision();
@@ -585,7 +599,12 @@ void TextEngine::apply_scetween(const std::map<std::string, std::string>& p) {
     (void)parse_u64s(get("time"), &c.time_per_char);
     c.random_delay = get("randomdelay") == "1";
     MessageLayer& l = active_mut();
-    if (!c.set_add) l.scetween.clear();
+    if (!c.set_add) {
+        const ScetweenMode m = c.mode;
+        l.scetween.erase(std::remove_if(l.scetween.begin(), l.scetween.end(),
+                                        [m](const ScetweenConfig& x) { return x.mode == m; }),
+                         l.scetween.end());
+    }
     l.scetween.push_back(std::move(c));
     bump_revision();
 }
@@ -627,7 +646,6 @@ void TextEngine::reveal_next(uint64_t delta_ms) {
             l.reveal_pending = false; // empty push_text: nothing to reveal
             continue;
         }
-        l.reveal_clock_ms += delta_ms;
         const size_t count = l.char_count;
         // 无 scetween → 立即全量
         std::vector<ScetweenConfig> relevant;
@@ -649,10 +667,19 @@ void TextEngine::reveal_next(uint64_t delta_ms) {
                                      c.time_per_char);
         }
         if (max_delay == 0 && max_total == 0) {
+            l.reveal_clock_ms += delta_ms;
             l.reveal_index = count;
             l.reveal_pending = false;
             continue;
         }
+        // 首帧不推进；之后单帧最多 kRevealMaxStepMs。
+        uint64_t step = delta_ms;
+        if (l.reveal_fresh) {
+            l.reveal_fresh = false;
+            step = 0;
+        }
+        step = std::min<uint64_t>(step, kRevealMaxStepMs);
+        l.reveal_clock_ms += step;
         if (max_delay == 0) {
             l.reveal_index = count;
             if (l.reveal_clock_ms >= max_total) l.reveal_pending = false;
@@ -667,6 +694,18 @@ void TextEngine::reveal_next(uint64_t delta_ms) {
     }
     // 只有存在待揭示层时才视为画面变化（静态帧跳过不被逐字常驻破坏）
     if (any_pending) bump_revision();
+}
+
+bool TextEngine::is_reveal_paced() const {
+    for (const auto& [id, l] : layers_) {
+        (void)id;
+        if (!l.reveal_pending || l.char_count == 0) continue;
+        for (const ScetweenConfig& c : l.scetween) {
+            if (c.is_entrance() == l.text_hidden) continue;
+            if (c.delay_per_char > 0) return true;
+        }
+    }
+    return false;
 }
 
 void TextEngine::reveal_all() {

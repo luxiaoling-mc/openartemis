@@ -435,3 +435,23 @@ target_link_libraries(emote_vars_dump PRIVATE libopenartemis)
 # Story-walk emote state dump (report-only).
 add_executable(emote_state_probe emote_state_probe.cpp)
 target_link_libraries(emote_state_probe PRIVATE libopenartemis)
+
+add_executable(text_click_complete_test text_click_complete_test.cpp)
+target_link_libraries(text_click_complete_test PRIVATE libopenartemis)
+add_test(NAME text_click_complete COMMAND text_click_complete_test)
+set_tests_properties(text_click_complete PROPERTIES SKIP_RETURN_CODE 77)
+
+add_executable(t5_montage_input_test t5_montage_input_test.cpp)
+target_link_libraries(t5_montage_input_test PRIVATE libopenartemis)
+add_test(NAME t5_montage_input COMMAND t5_montage_input_test)
+set_tests_properties(t5_montage_input PROPERTIES
+  ENVIRONMENT "OA_TEST_T5_PFS=${OA_TEST_T5_PFS}" SKIP_RETURN_CODE 77)
+
+# test13 (穢翼のユースティア): opening the backlog and coming back must land in
+# the story again with a click-advanceable page (the script used to stay parked
+# on system/ui.asb's [stop] and the backlog rows drew nothing).
+add_executable(t13_backlog_test t13_backlog_test.cpp)
+target_link_libraries(t13_backlog_test PRIVATE libopenartemis)
+add_test(NAME t13_backlog COMMAND t13_backlog_test)
+set_tests_properties(t13_backlog PROPERTIES
+  ENVIRONMENT "OA_TEST_T13_PFS=${OA_TEST_T13_PFS}" SKIP_RETURN_CODE 77)

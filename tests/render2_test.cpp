@@ -11,6 +11,7 @@
 
 #include "core/fs/fs.h"
 #include "core/runtime/runtime_game.h"
+#include "fpm/host_input.h"
 #include "core/render/layer.h"
 // research/111: Compositor::advance_tweens/apply_lytweendel 按值返回
 // std::vector<TweenDone>，其元素类型定义在 render 内部头（公开头只前向声明）。
@@ -95,16 +96,16 @@ void test_lytween_sync_wait() {
         fs, "*main\n[lyc id=\"1\" file=\"a\"]\n"
             "[lytween id=\"1\" param=\"alpha\" from=\"0\" to=\"255\" time=\"120\" sync=\"1\"]\n");
     oa::runtime::FrameInput idle;
-    rt->tick(16, idle);
+    oa::test::frame(*rt);
     (void)rt->drain_events();
-    const oa::runtime::WaitReason* w = rt->current_wait();
+    const oa::runtime::Wait* w = rt->current_wait();
     check(w != nullptr, "R8 sync tween parks the script");
-    check(w && w->kind == oa::runtime::WaitReason::Kind::Stop && w->id == "tween:1",
-          "R8 sync wait is Stop{reason:tween:1}");
+    check(w && w->stage == oa::runtime::Wait::Stage::Tween && w->stage_id == "1",
+          "R8 sync wait parks on the layer tween");
     // wait survives while the tween runs (clock advances in ticks)
     bool released = false;
     for (int i = 0; i < 20 && !released; ++i) {
-        rt->tick(16, idle);
+        oa::test::frame(*rt);
         (void)rt->drain_events();
         if (!rt->current_wait()) released = true;
     }
@@ -125,19 +126,19 @@ void test_tween_handler_via_tag_queue() {
             "[lytween id=\"1\" param=\"alpha\" from=\"0\" to=\"255\" time=\"80\" "
             "handler=\"calllua\" function=\"notify_wait\" sys=\"1\"]\n[@]\n[stop]\n");
     oa::runtime::FrameInput idle;
-    rt->tick(16, idle); // run: lyc + lytween + park on [@]
+    oa::test::frame(*rt); // run: lyc + lytween + park on [@]
     (void)rt->drain_events();
     check(rt->current_wait() != nullptr, "R9 script parked on [@]");
     bool saw_queue = false;
     for (int i = 0; i < 8; ++i) {
-        rt->tick(16, idle);
+        oa::test::frame(*rt);
         (void)rt->drain_events();
         if (rt->interpreter().has_queued_tags()) saw_queue = true;
     }
     check(saw_queue, "R9 handler completion went through the interpreter tag queue");
     // parked-drain runs the queued calllua under the [@] wait (non-Stop gate)
     for (int i = 0; i < 4 && rt->interpreter().has_queued_tags(); ++i) {
-        rt->tick(16, idle);
+        oa::test::frame(*rt);
         (void)rt->drain_events();
     }
     check(!rt->interpreter().has_queued_tags(), "R9 queued handler drained while parked");
@@ -160,7 +161,7 @@ void test_runtime_typed_property_tweens() {
             "[lytween id=\"1\" param=\"anchory\" from=\"0\" to=\"20\" time=\"100\"]\n"
             "[wt 500 input=\"0\"]\n");
     oa::runtime::FrameInput idle;
-    rt->tick(16, idle); // runs all tweens + parks on [wt]
+    oa::test::frame(*rt); // runs all tweens + parks on [wt]
     (void)rt->drain_events();
     const Layer* l = rt->scene().find("1");
     check(l && approx(l->x_scale, 100.0) && approx(l->y_scale, 100.0),
@@ -168,7 +169,7 @@ void test_runtime_typed_property_tweens() {
     check(l && approx(l->rotate_deg, 0.0) && approx(l->anchor_x, 0.0) &&
               approx(l->anchor_y, 0.0),
           "R12 rotate/anchor at from");
-    for (int i = 0; i < 8; ++i) rt->tick(16, idle); // past 100ms midpoint range
+    for (int i = 0; i < 8; ++i) oa::test::frame(*rt); // past 100ms midpoint range
     (void)rt->drain_events();
     l = rt->scene().find("1");
     // 128ms elapsed > 100: tween finished -> settled at to (values written
@@ -195,7 +196,7 @@ void test_current_message_layer_published() {
                            "[print data=\"八田\"]\n"
                            "[/chgmsg]\n");
     oa::runtime::FrameInput idle;
-    rt->tick(16, idle);
+    oa::test::frame(*rt);
     (void)rt->drain_events();
     const auto v = rt->interpreter().variables().get("s.current_message_layer");
     check(v.has_value(), "MLP: s.current_message_layer is published");
@@ -215,7 +216,7 @@ void test_lyc2_reads_image_csv() {
     fs.files["image/gui/game/mw/mw.csv"] = "168,747\r\n";
     auto rt = make_runtime(fs, "*main\n[lyc2 id=\"80.0.0\" file=\"image/gui/game/mw/mw\"]\n");
     oa::runtime::FrameInput idle;
-    rt->tick(16, idle);
+    oa::test::frame(*rt);
     (void)rt->drain_events();
     const Layer* l = rt->scene().find("80.0.0");
     check(l != nullptr, "lyc2: the plate layer exists");
@@ -226,7 +227,7 @@ void test_lyc2_reads_image_csv() {
     fs2.files["image/gui/game/mw/mw.csv"] = "168,747\r\n";
     auto rt2 = make_runtime(
         fs2, "*main\n[lyc2 id=\"80.0.0\" file=\"image/gui/game/mw/mw\" left=\"10\" top=\"20\"]\n");
-    rt2->tick(16, idle);
+    oa::test::frame(*rt2);
     (void)rt2->drain_events();
     const Layer* l2 = rt2->scene().find("80.0.0");
     check(l2 && approx(l2->left, 10.0) && approx(l2->top, 20.0),

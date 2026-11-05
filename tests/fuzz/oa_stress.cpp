@@ -36,6 +36,7 @@
 #include <SDL3/SDL.h>
 
 #include "core/fs/physfs_fs.h"
+#include "core/fs/project.h"
 #include "core/media/video.h"
 #include "core/runtime/runtime_game.h"
 
@@ -400,10 +401,9 @@ void step_emote(oa::runtime::GameRuntime& rt, const Assets& assets, WorkerState&
     st.emote_due[slot] = frame + uint64_t(rand_int(st.rng, 120, 420));
 }
 
-void worker(const Args& args, const Assets& assets, int index, std::atomic<bool>* stop,
-            Stats* stats) {
+void worker(const Args& args, const Assets& assets, int index, SDL_Window* window,
+            std::atomic<bool>* stop, Stats* stats) {
     auto fs = std::make_shared<oa::fs::PhysFileSystem>(args.pfs, false);
-    SDL_Window* window = nullptr;
     size_t emote_layers = 0;
     size_t emote_events = 0;
     uint64_t frames_done = 0;
@@ -415,11 +415,6 @@ void worker(const Args& args, const Assets& assets, int index, std::atomic<bool>
     // 这里，是"worker 线程 vs 主线程"的主要来源之一。--decode-pool 0 关掉。
     rt.enable_decode_pool(args.decode_pool);
 
-    if (args.render) {
-        const int w = int(rt.project().config.stage_width);
-        const int h = int(rt.project().config.stage_height);
-        window = SDL_CreateWindow("oa-stress", w, h, SDL_WINDOW_HIDDEN);
-    }
     {
         // 多实例时 SDL_InitSubSystem 的引用计数不是线程安全的：attach_window
         // 与 MediaPlayers::init 都会去初始化音频子系统，串行起来。
@@ -428,10 +423,10 @@ void worker(const Args& args, const Assets& assets, int index, std::atomic<bool>
         const bool attached =
             window && rt.attach_window(static_cast<void*>(window), "sdl");
         if (window && !attached) {
+            // 窗口归主线程，这里只标记失败（销毁留给 main，SDL 的窗口生命周期
+            // 统一在主线程收尾）。
             std::printf("[stress] worker %d: renderer attach failed (%s), 继续无窗模式\n",
                         index, SDL_GetError());
-            SDL_DestroyWindow(window);
-            window = nullptr;
         }
         if (!attached) rt.media_players().init();
     }
@@ -487,7 +482,6 @@ void worker(const Args& args, const Assets& assets, int index, std::atomic<bool>
     emote_events = rt.emote_layer_events();
     frames_done = frame;
     } // rt 析构
-    if (window) SDL_DestroyWindow(window);
     std::printf("[stress] worker %d done: %llu frames, emote layers=%zu events=%zu\n", index,
                 (unsigned long long)frames_done, emote_layers, emote_events);
 }
@@ -512,9 +506,34 @@ int main(int argc, char** argv) {
     }
 
     Assets assets;
+    int stage_w = 1280, stage_h = 720;
     {
         auto fs = std::make_shared<oa::fs::PhysFileSystem>(args.pfs, false);
         assets = find_assets(*fs);
+        // 只为了拿 stage 尺寸（建窗口用）；system.ini 缺失时退回 1280x720。
+        try {
+            const oa::fs::Project project = oa::fs::Project::open(*fs, "windows");
+            if (project.config.stage_width > 0) stage_w = int(project.config.stage_width);
+            if (project.config.stage_height > 0) stage_h = int(project.config.stage_height);
+        } catch (const std::exception&) {
+        }
+    }
+
+    // SDL 窗口必须在**主线程**建：Windows 上多个 worker 并发 SDL_CreateWindow 会
+    // 在 WIN_GetWindowSizeInPixels 里踩空（夜里两发 access-violation 都是这个，
+    // 不是引擎）。这里一次性建好，worker 只负责 attach。
+    std::vector<SDL_Window*> windows;
+    if (args.render) {
+        for (int i = 0; i < args.threads; ++i) {
+            SDL_Window* w = SDL_CreateWindow("oa-stress", stage_w, stage_h,
+                                             SDL_WINDOW_HIDDEN);
+            if (!w) {
+                std::printf("[stress] window %d creation failed: %s\n", i, SDL_GetError());
+                break;
+            }
+            windows.push_back(w);
+        }
+        if (windows.empty()) std::printf("[stress] 没有可用窗口，退回无窗模式\n");
     }
     for (const auto& v : args.extra_videos) assets.videos.push_back(v);
     for (const auto& a : args.extra_audio) assets.se.push_back(a);
@@ -537,9 +556,12 @@ int main(int argc, char** argv) {
     std::atomic<bool> stop{false};
     Stats stats;
     std::vector<std::thread> pool;
-    for (int i = 0; i < args.threads; ++i)
-        pool.emplace_back(worker, std::cref(args), std::cref(assets), i, &stop, &stats);
+    for (int i = 0; i < args.threads; ++i) {
+        SDL_Window* w = size_t(i) < windows.size() ? windows[size_t(i)] : nullptr;
+        pool.emplace_back(worker, std::cref(args), std::cref(assets), i, w, &stop, &stats);
+    }
     for (auto& t : pool) t.join();
+    for (SDL_Window* w : windows) SDL_DestroyWindow(w);
 
     std::printf("[stress] done: frames=%llu video(play/stop)=%llu/%llu overlay_frames=%llu "
                 "audio_ops=%llu layers(+/-, emote included)=%llu/%llu emotes=%llu errors=%llu\n",

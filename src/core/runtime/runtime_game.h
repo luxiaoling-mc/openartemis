@@ -145,7 +145,7 @@ public:
     /// Is the interpreter parked in a [stop]-class wait (title etc.)?
     bool waiting_stop() const;
     /// Current wait reason when parked (nullptr when executing).
-    const oa::runtime::WaitReason* current_wait() const;
+    const oa::runtime::Wait* current_wait() const;
     /// Lua-side override status bits (e:overrideKey). Frame edge bookkeeping
     /// happens in tick; bits: 2 isPush 4 isDown 8 downEdge 16 upEdge 32 decide.
     void apply_override(int key, int status);
