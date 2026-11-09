@@ -881,6 +881,15 @@ void GameRuntime::RuntimeState::tick(uint64_t delta_ms, const FrameInput& in) {
     } else {
         clicked = input_state_.down_edges_.count(kKeyEnter) > 0 || input_state_.down_edges_.count(kKeySpace) > 0;
     }
+    // The script's own page wait ([@]) is released by the role-0 keys. A game
+    // that names them ([keyconfig role=0]) owns that release: both games give
+    // role 0 only the dummy key 124 and fire it from their push handler when
+    // the story should go on, so a press on a menu page drawn over the story
+    // reaches the page's buttons but not the wait under it. Queue parks keep
+    // the press rules above.
+    if (advance_keys_set() && wait_ && wait_->waiting_click() &&
+        wait_->can(oa::runtime::Wait::OnDecide) && !interpreter_->last_wait_from_queue())
+        clicked = false;
     clicked = clicked || pc.role_advance;
     // NB: only fresh PRESSES count — the host injects a mouse-left up-edge on
     // every frame the button is not held, which would disable the guard always.
@@ -2379,6 +2388,10 @@ void GameRuntime::RuntimeState::apply_keyconfig(const std::map<std::string, std:
 bool GameRuntime::RuntimeState::has_role(int role, int key) const {
     const auto it = control_.keymap_.find(role);
     return it != control_.keymap_.end() && it->second.count(key) > 0;
+}
+
+bool GameRuntime::RuntimeState::advance_keys_set() const {
+    return control_.keymap_.count(kRoleAdvance) > 0;
 }
 
 bool GameRuntime::RuntimeState::key_is_toggle(int key, int other_role) const {
