@@ -447,6 +447,7 @@ struct GameRuntime::RuntimeState {
     void reveal_all_text();
     bool key_is_toggle(int key, int role_out) const;
     bool has_role(int role, int key) const;
+    bool advance_keys_set() const; // the game named its role-0 keys
     bool handle_role_key_edge(int key);
     void apply_keyconfig(const std::map<std::string, std::string>& params);
     void apply_rclick_config(const std::map<std::string, std::string>& params);
