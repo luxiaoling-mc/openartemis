@@ -520,6 +520,9 @@ public:
     /// and tagged with one shared set id.
     void tweenset_start();
     void tweenset_end(uint64_t clock_ms);
+    /// Whether a [tweenset] group is currently collecting (a sync wait must be
+    /// armed after the group closes, not at the member tag).
+    bool tweenset_collecting() const;
 
     /// [anime] event (verbatim [anime] tag params). Modes init/add/end map to
     void apply_anime(const std::map<std::string, std::string>& params, uint64_t clock_ms);

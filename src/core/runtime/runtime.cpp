@@ -564,7 +564,7 @@ oa::runtime::CallbackResult GameRuntime::RuntimeState::dispatch_interpreter_even
     if (dispatch_engine_event(e, &result)) return result;
     if (dispatch_media_event(e, &result)) return result;
     if (apply_text_event(e)) return oa::runtime::CallbackResult::Continue;
-    if (apply_scene_event(e)) return oa::runtime::CallbackResult::Continue;
+    if (apply_scene_event(e)) return host_event_result(e);
     if (apply_control_event(e)) return oa::runtime::CallbackResult::Continue;
 
     pending_events_.push_back(e);
@@ -574,6 +574,12 @@ oa::runtime::CallbackResult GameRuntime::RuntimeState::dispatch_interpreter_even
 bool GameRuntime::RuntimeState::dispatch_engine_event(
     const oa::runtime::Event& e, oa::runtime::CallbackResult* out)
 {
+    if (e.tag == "trigger") {
+        const auto it = e.params.find("name");
+        if (it != e.params.end() && !it->second.empty()) pending_custom_ = it->second;
+        *out = oa::runtime::CallbackResult::Continue;
+        return true;
+    }
     if (e.tag != "alldelete") return false;
     // Whole-scene fade-out + clear; time==0 clears instantly and continues.
     uint64_t t = 0;
@@ -627,6 +633,25 @@ oa::runtime::CallbackResult GameRuntime::RuntimeState::host_event_result(
         }
         if (type != 0) return oa::runtime::CallbackResult::Pause;
     }
+    if (e.kind == K::LayerEventCmd && e.tag == "lytween" && !e.id.empty()) {
+        int sync = 0;
+        if (const auto it = e.params.find("sync"); it != e.params.end()) {
+            try {
+                sync = std::stoi(it->second);
+            } catch (...) {
+                sync = 0;
+            }
+        }
+        // A [tweenset] member is collected, not started: its park is armed at
+        // [/tweenset] after the group starts.
+        if (sync != 0 && !scene().tweenset_collecting())
+            return oa::runtime::CallbackResult::Pause;
+    }
+    // A closed [tweenset] carrying sync members is one Tween park for all of
+    // them.
+    if (e.kind == K::LayerEventCmd && e.tag == "/tweenset" &&
+        !pending_sync_tweens_.empty())
+        return oa::runtime::CallbackResult::Pause;
     return oa::runtime::CallbackResult::Continue;
 }
 
@@ -644,7 +669,6 @@ void GameRuntime::RuntimeState::reset_domains() {
     if (media_.media_players_) media_.media_players_->stop_all();
     media_.video_.stop_all_videos();
     // Aligned with reset_ephemeral_on_load: stale video EOF must not leak.
-    media_.video_finished_ = false;
     text().clear_scene();
     scene().clear_scene();
     drop_pending_tween_cancels(); // deferred timer rounds die with nodes
@@ -653,12 +677,16 @@ void GameRuntime::RuntimeState::reset_domains() {
     transition().clear();
     pointer_.hovered_.clear();
     pointer_.drag_layer_.clear();
-    pending_sync_tween_layer_.reset();
     inline_event_frame_.reset();
     save_.screenshot_.valid = false;
     save_.capture_pending_ = false;
     renderer_.stop_all_delete();
     wait_.reset();
+    pending_parks_.clear();
+    pending_custom_.clear();
+    pending_sync_tweens_.clear();
+    save_.autosaved_current_wait_ = false;
+    save_.autosave_last_seq_ = 0;
     exit_requested_ = false;
     control_.skip_active_ = false;
     control_.exskip_active_ = false; // e:debugSkip state dies with the domains
@@ -666,7 +694,6 @@ void GameRuntime::RuntimeState::reset_domains() {
     control_.skip_enabled_ = false;
     control_.automode_allowed_ = true;
     control_.automode_ = false;
-    control_.auto_elapsed_ms_ = 0;
     control_.control_skip_pressed_ = false;
     control_.control_skip_blocked_ = false;
     control_.last_control_skip_effective_ = false;
@@ -719,7 +746,6 @@ void GameRuntime::RuntimeState::finish_all_delete() {
     drop_pending_tween_cancels(); // deferred timer rounds die with nodes
     pointer_.hovered_.clear();
     pointer_.drag_layer_.clear();
-    pending_sync_tween_layer_.reset();
     save_.screenshot_.valid = false;
     save_.capture_pending_ = false;
     media_.emote_layers_.clear(); // static emote frames die with the scene
@@ -873,7 +899,8 @@ void GameRuntime::RuntimeState::tick(uint64_t delta_ms, const FrameInput& in) {
     bool clicked;
     if (in.left_click_edge) {
         // 等待点击的停驻不吃 push 映射：push 是键位转发，不是 UI 命中，
-        // 不该吞掉推进剧情的那一下。
+        // 不该吞掉推进剧情的那一下。Timed clickable waits ([wait input=1],
+        // eqwait) count too — the opening logo uses exactly this shape.
         const bool click_wait = wait_ && wait_->can(oa::runtime::Wait::OnClick);
         const bool push_absorbs = pc.left_push_handled && !click_wait;
         clicked = !pc.input_swallowed && !pc.layer_handled && !pc.drag_handled &&
@@ -888,12 +915,11 @@ void GameRuntime::RuntimeState::tick(uint64_t delta_ms, const FrameInput& in) {
     // reaches the page's buttons but not the wait under it. Queue parks keep
     // the press rules above.
     if (advance_keys_set() && wait_ && wait_->waiting_click() &&
-        wait_->can(oa::runtime::Wait::OnDecide) && !interpreter_->last_wait_from_queue())
+        wait_->can(oa::runtime::Wait::OnDecide) && wait_->script_owned)
         clicked = false;
     clicked = clicked || pc.role_advance;
     // NB: only fresh PRESSES count — the host injects a mouse-left up-edge on
     // every frame the button is not held, which would disable the guard always.
-    input_this_tick_ = clicked || input_state_.decide_edge_ || !input_state_.down_edges_.empty();
 
     // 一次物理按下 = 一个命令。同一次按下会给出多个信号（原始按下、图层
     // 命中、游戏 setexclick 派生的 decide 边缘），它们同属一条命令，只能被
@@ -925,12 +951,7 @@ void GameRuntime::RuntimeState::tick(uint64_t delta_ms, const FrameInput& in) {
             const bool was_ff = control_.exskip_active_;
             bool attempted_resolve = false;
             if (wait_) {
-                // Queue-armed click parks hold the rest of the queue.
-                const bool queue_click_park =
-                    interpreter_->last_wait_from_queue() && wait_->waiting_click();
-                if (interpreter_->has_queued_tags() && !queue_click_park) {
-                    drain_parked_queue();
-                }
+                if (interpreter_->has_queued_tags()) drain_parked_queue();
                 if (wait_) {
                     attempted_resolve = true;
                     if (resolve_wait(delta_ms, click_cmd, decide_cmd)) {
@@ -953,6 +974,8 @@ void GameRuntime::RuntimeState::tick(uint64_t delta_ms, const FrameInput& in) {
         }
     }
 
+    pending_custom_.clear();
+
     // Overrides are frame-local: a sticky decide bit 32 would swallow every
     // later click edge.
     input_state_.overrides_.clear();
@@ -967,85 +990,174 @@ void GameRuntime::RuntimeState::tick(uint64_t delta_ms, const FrameInput& in) {
     if (used_before) press_used_ = false;
 }
 
-void GameRuntime::RuntimeState::arm_stage(oa::runtime::Wait::Stage st, std::string id) {
-    oa::runtime::Wait w;
-    w.release = oa::runtime::Wait::OnDecide;
-    w.stage = st;
-    w.stage_id = std::move(id);
+void GameRuntime::RuntimeState::arm_park(oa::runtime::Wait w, bool script_owned) {
+    w.script_owned = script_owned;
+    w.seq = ++wait_seq_;
+    w.armed_tick = tick_count_;
+    w.auto_elapsed_ms = 0;
+    w.se_deadline_ms = 0;
+    normalize_wait(w);
     wait_ = std::move(w);
 }
+
+void GameRuntime::RuntimeState::normalize_wait(oa::runtime::Wait& w) {
+    using W = oa::runtime::Wait;
+    w.wakes = 0;
+    w.wake_id.clear();
+    if (w.can(W::OnClick)) w.wakes |= W::WakeClick;
+    if (w.can(W::OnDecide)) w.wakes |= W::WakeDecide;
+    if (w.can(W::OnSkip)) w.wakes |= W::WakeSkip;
+    if (w.can(W::OnAuto)) w.wakes |= W::WakeAuto;
+    if (w.timed()) {
+        w.wakes |= W::WakeTimer;
+        w.deadline_ms = now_ms_ + uint64_t(w.timer_ms);
+    }
+    if (!w.keys.empty()) w.wakes |= W::WakeKeys;
+    if (w.on_reveal_done) w.wakes |= W::WakeRevealDone;
+    if (w.reveal_clear) w.wakes |= W::WakeRevealClear;
+    if (w.ends_exskip) w.wakes |= W::WakeExskipEnd;
+    switch (w.stage) {
+        case W::Stage::Trans:
+            w.wakes |= W::WakeTrans;
+            w.wake_id = "trans";
+            break;
+        case W::Stage::Video:
+            w.wakes |= W::WakeVideo;
+            break;
+        case W::Stage::VideoLayer:
+            w.wakes |= W::WakeVideoLayer;
+            w.wake_id = w.stage_id;
+            break;
+        case W::Stage::Se:
+            w.wakes |= W::WakeSe;
+            w.wake_id = w.stage_id;
+            break;
+        case W::Stage::AllDelete:
+            w.wakes |= W::WakeAllDelete;
+            break;
+        case W::Stage::Tween:
+            w.wakes |= W::WakeTween;
+            w.wake_id = w.stage_id;
+            break;
+        case W::Stage::None:
+            break;
+    }
+    if (!w.custom_name.empty()) {
+        w.wakes |= W::WakeCustom;
+        w.wake_id = w.custom_name;
+    }
+    // a wait registered on a presentation also accepts the "advance"
+    // input; fire_click/fire_skip decide whether the presentation is actually
+    // skippable (video skippable flag / transition input policy). [wait se=]
+    // joins only when the tag asked for it (input/canskip).
+    if (w.stage == W::Stage::Trans || w.stage == W::Stage::Video ||
+        w.stage == W::Stage::VideoLayer || w.stage == W::Stage::Tween) {
+        // Keep the spec view as the tag declared it (a trans/video park stays a
+        // stop-class wait for probes and autosave); only the effective wakes
+        // gain the advance input.
+        w.wakes |= W::WakeClick | W::WakeDecide;
+    }
+}
+
+std::optional<oa::runtime::Wait> GameRuntime::RuntimeState::park_from_event(
+    const oa::runtime::Event* ev) {
+    using W = oa::runtime::Wait;
+    using K = oa::runtime::Event::Kind;
+    if (!ev) return std::nullopt;
+    if (ev->kind == K::Wait_) return ev->wait;
+    if (ev->kind == K::Trans) {
+        int type = 1;
+        if (const auto it = ev->params.find("type"); it != ev->params.end())
+            type = parse_i32(it->second, 1);
+        if (type == 0) return std::nullopt;
+        W w;
+        w.release = W::OnDecide | W::OnSkip;
+        w.stage = W::Stage::Trans;
+        w.stage_id = "trans";
+        return w;
+    }
+    if (ev->kind == K::LayerEventCmd) {
+        if (ev->tag == "video" && ev->id.empty()) {
+            W w;
+            w.release = W::OnDecide | W::OnSkip;
+            w.stage = W::Stage::Video;
+            return w;
+        }
+        if (ev->tag == "lytween" && !ev->id.empty()) {
+            int sync = 0;
+            if (const auto it = ev->params.find("sync"); it != ev->params.end())
+                sync = parse_i32(it->second, 0);
+            if (sync != 0 && !scene().tweenset_collecting()) {
+                W w;
+                w.release = W::OnDecide | W::OnSkip;
+                w.stage = W::Stage::Tween;
+                w.stage_id = ev->id;
+                return w;
+            }
+        }
+        if (ev->tag == "/tweenset" && !pending_sync_tweens_.empty()) {
+            W w;
+            w.release = W::OnDecide | W::OnSkip;
+            w.stage = W::Stage::Tween;
+            w.tween_ids = std::move(pending_sync_tweens_);
+            pending_sync_tweens_.clear();
+            return w;
+        }
+        return std::nullopt;
+    }
+    if (ev->kind == K::Custom && ev->tag == "alldelete") {
+        int64_t time = 0;
+        if (const auto it = ev->params.find("time"); it != ev->params.end())
+            time = parse_i32(it->second, 0);
+        if (time > 0) {
+            W w;
+            w.release = W::OnSkip;
+            w.stage = W::Stage::AllDelete;
+            w.stage_id = "alldelete";
+            return w;
+        }
+    }
+    return std::nullopt;
+}
+
+namespace {
+// A script [stop] with no click/timer/reveal/keys: the shape a UI flow may
+// legitimately take over (title/logo/menu boot parks).
+bool is_bare_stop(const oa::runtime::Wait& w) {
+    return w.stage == oa::runtime::Wait::Stage::None && !w.timed() && w.keys.empty() &&
+           !w.on_reveal_done && !w.reveal_clear && !w.waiting_click() &&
+           !w.can(oa::runtime::Wait::OnClick);
+}
+} // namespace
 
 void GameRuntime::RuntimeState::run_until_wait() {
     if (!interpreter_) return;
     const oa::runtime::ExecutionResult r = interpreter_->run();
     if (r == oa::runtime::ExecutionResult::Wait) {
-        const oa::runtime::Event* ev = interpreter_->last_wait_event();
-        // A real wait wins over a [lytween sync=1] seen earlier in this run.
-        pending_sync_tween_layer_.reset();
-        if (ev && ev->kind == oa::runtime::Event::Kind::Wait_) {
-            wait_ = ev->wait;
-            wait_armed_this_tick_ = true;
-        } else if (ev && ev->kind == oa::runtime::Event::Kind::Trans) {
-            // [trans] type!=0: script parks until the transition visually
-            // finishes (Wait(Trans) -> Stop{reason:"trans"}).
-            arm_stage(oa::runtime::Wait::Stage::Trans, "trans");
-        } else if (ev && ev->kind == oa::runtime::Event::Kind::LayerEventCmd &&
-                   ev->tag == "video" && ev->id.empty()) {
-            // Fullscreen [video]: Wait(Event::VideoPlay{id:None}) ->
-            // Stop{reason:"video"}. Layer videos
-            // never pause.
-            arm_stage(oa::runtime::Wait::Stage::Video, "video");
-        } else if (ev && ev->kind == oa::runtime::Event::Kind::Custom &&
-                   ev->tag == "alldelete") {
-            // [alldelete time>0] parks the script until the whole-scene
-            // fade-out + clear finished (Stop{id:"alldelete"}).
-            arm_stage(oa::runtime::Wait::Stage::AllDelete, "alldelete");
-        }
-    } else if (r == oa::runtime::ExecutionResult::BudgetExhausted) {
-        // Polling VM: resume next frame; do not clear the sync latch or arm a wait.
-    } else {
-        // Completed without parking: if the run saw a [lytween sync=1] whose
-        // layer tweens are still running, block frame progression until they
-        // finish (Event::LayerTween { sync: true } -> Stop{reason:"tween:<id>"}).
-        if (pending_sync_tween_layer_) {
-            arm_stage(oa::runtime::Wait::Stage::Tween, *pending_sync_tween_layer_);
-            pending_sync_tween_layer_.reset();
+        if (auto park = park_from_event(interpreter_->last_wait_event())) {
+            arm_park(std::move(*park), !interpreter_->last_wait_from_queue());
+            // A queued UI wait that arrived before this bare stop must take
+            // over now, or its click wake can never be reached (the opening
+            // logo's eqwait was exactly this shape).
+            if (wait_ && is_bare_stop(*wait_) && !pending_parks_.empty()) {
+                oa::runtime::Wait next = std::move(pending_parks_.front());
+                pending_parks_.pop_front();
+                arm_park(std::move(next), false);
+            }
         }
     }
+    // BudgetExhausted: resume next frame. Completed: the script is done; no
+    // presentation gate is latched behind its back (sync tweens park at the
+    // [lytween sync=1] tag itself).
 }
 
 void GameRuntime::RuntimeState::drain_parked_queue() {
     if (!interpreter_) return;
-    // Clock-driven parks (Timed / [trans] / fullscreen [video] / [alldelete])
-    // hold the pre-enqueued batch: a queued park would replace the running
-    // park and lose its remaining time (test2: the 2500 ms logo wait).
-    // Interactive parks ([@]/[stop]/[exkey]) keep draining for title input.
-    bool hold_drain = false;
-    if (wait_) {
-        // A fullscreen [video] park owns the click (the click is the skip
-        // input), so the queue holds until the skip/EOF finish.
-        // Draining first let queued [wait]/[trans] replace the movie park.
-        if (wait_->stage == oa::runtime::Wait::Stage::Video) {
-            const auto v = media_.video_.state();
-            hold_drain = v.overlay_video && v.overlay_video->playing;
-        } else if (!input_this_tick_) {
-            if (wait_->timed()) {
-                // Long pacing waits (the splash logo's 2500 ms) must not be
-                // replaced by the pre-enqueued rows; short ones (0..300 ms) are
-                // the framework's own animation steps — holding those would turn a
-                // UI entrance into stop-motion.
-                hold_drain = wait_->timer_ms > 300;
-            } else if (wait_->stage == oa::runtime::Wait::Stage::Trans) {
-                // Only while the park is genuinely running. An armed-but-dead
-                // park (transition the host never captured) keeps draining so
-                // the script can move on.
-                hold_drain = transition().is_in_progress(now_ms_);
-            } else if (wait_->stage == oa::runtime::Wait::Stage::AllDelete) {
-                hold_drain = renderer_.all_delete_active();
-            }
-        }
-    }
-    in_parked_drain_ = true;
+    // a queued park can never replace the running one. The tail
+    // still drains for UI responsiveness (non-wait tags apply); each wait it
+    // hits becomes the next pending park in FIFO order.
+    // (pending_parks_ intentionally does not hold the tail: real game UI
+    // flows enqueue close/cleanup tags behind a wait.)
     bool saw_call = false;
     bool saw_jump = false;
     bool paused = false;
@@ -1057,7 +1169,6 @@ void GameRuntime::RuntimeState::drain_parked_queue() {
     };
     int guard = 0;
     while (interpreter_->has_queued_tags() && guard++ < 64) {
-        if (hold_drain) break; // keep the batch for after the clock-driven park
         const std::string* script_before = interpreter_->current_script();
         const size_t line_before = interpreter_->current_line();
         const size_t stack_before = interpreter_->call_stack().size();
@@ -1067,40 +1178,40 @@ void GameRuntime::RuntimeState::drain_parked_queue() {
                            stack_before != interpreter_->call_stack().size();
         if (r == oa::runtime::ExecutionResult::Wait) {
             paused = true;
-            const oa::runtime::Event* ev = interpreter_->last_wait_event();
-            if (ev && ev->kind == oa::runtime::Event::Kind::Wait_) {
-                wait_ = ev->wait;
-                wait_armed_this_tick_ = true;
-            } else if (ev && ev->kind == oa::runtime::Event::Kind::Trans) {
-                arm_stage(oa::runtime::Wait::Stage::Trans, "trans");
-            } else if (ev && ev->kind == oa::runtime::Event::Kind::LayerEventCmd &&
-                       ev->tag == "video" && ev->id.empty()) {
-                arm_stage(oa::runtime::Wait::Stage::Video, "video");
-            } else if (ev && ev->kind == oa::runtime::Event::Kind::Custom &&
-                       ev->tag == "alldelete") {
-                // queued [alldelete time>0] pauses the parked drain the
-                // same way (fade-out runs on the tick clock; the parked wait
-                // above is replaced by the alldelete stop).
-                arm_stage(oa::runtime::Wait::Stage::AllDelete, "alldelete");
+            if (auto park = park_from_event(interpreter_->last_wait_event())) {
+                park->script_owned = false;
+                // A UI flow may take over a bare script stop (title/logo/menu
+                // parks). Story pacing parks (click/timed/reveal/keys) are
+                // protected: their waits go to pending_parks_ instead.
+                const bool stop_park = wait_ && is_bare_stop(*wait_);
+                if (wait_ && (!wait_->script_owned || stop_park)) {
+                    // Same UI flow, or a bare stop handing over: latest-wins.
+                    // Deferring behind the live park stalls opening logo /
+                    // config / preview loops (the click never reaches the
+                    // queued eqwait).
+                    pending_parks_.clear();
+                    arm_park(std::move(*park), false);
+                } else {
+                    park->seq = 0; // assigned by arm_park when it becomes current
+                    pending_parks_.push_back(std::move(*park));
+                }
             }
             settle();
-            in_parked_drain_ = false;
-            return; // a queued wait now governs; the caller resolves it
+            return; // tail stays queued; the running park still governs
         }
         if (moved) {
-            // queued jump/call/return changed position: clear the parked wait.
+            // queued jump/call/return changed position: the UI flow takes over.
             wait_.reset();
+            pending_parks_.clear();
+            pending_custom_.clear();
+            pending_sync_tweens_.clear();
             settle();
-            in_parked_drain_ = false;
             return;
         }
-        // Continue-type tags drained without a pause or position change
-        // (lyprop/lyc/... apply and keep draining).
         saw_call |= interpreter_->queued_saw_call();
         saw_jump |= interpreter_->queued_saw_jump();
     }
     settle();
-    in_parked_drain_ = false;
 }
 
 void GameRuntime::RuntimeState::dispatch_pending_events() {
@@ -1439,22 +1550,16 @@ bool GameRuntime::RuntimeState::apply_scene_event(const oa::runtime::Event& e) {
         if (e.tag == "lytween") {
             scene().apply_lytween(e.params, now_ms_);
             renderer_.note(RNote::Tween);
-            // [lytween sync=1]: first target of a run arms a tween park.
-            if (!in_parked_drain_) {
+            // Collect the group's sync targets; [/tweenset] turns them into
+            // one Tween park (wait every action).
+            if (scene().tweenset_collecting() && !e.id.empty()) {
                 int sync = 0;
-                const auto s = e.params.find("sync");
-                if (s != e.params.end()) {
-                    try {
-                        sync = std::stoi(s->second);
-                    } catch (...) {
-                        sync = 0;
-                    }
-                }
-                if (sync != 0 && !pending_sync_tween_layer_) {
-                    const auto id = e.params.find("id");
-                    if (id != e.params.end() && !id->second.empty()) {
-                        pending_sync_tween_layer_ = id->second;
-                    }
+                if (const auto it = e.params.find("sync"); it != e.params.end())
+                    sync = parse_i32(it->second, 0);
+                if (sync != 0 &&
+                    std::find(pending_sync_tweens_.begin(), pending_sync_tweens_.end(),
+                              e.id) == pending_sync_tweens_.end()) {
+                    pending_sync_tweens_.push_back(e.id);
                 }
             }
             return true;
@@ -1480,6 +1585,7 @@ bool GameRuntime::RuntimeState::apply_scene_event(const oa::runtime::Event& e) {
             return true;
         }
         if (e.tag == "tweenset") {
+            pending_sync_tweens_.clear();
             scene().tweenset_start();
             renderer_.note(RNote::Tween);
             return true;
@@ -1637,12 +1743,6 @@ void GameRuntime::RuntimeState::advance_scene_frame() {
             pending_tween_cancels_.push_back(std::move(pc));
         }
     }
-    // [lytween sync=1] release: clears the wait without advancing the line
-    // (the script never parked on the instruction itself).
-    if (wait_ && wait_->stage == oa::runtime::Wait::Stage::Tween &&
-        scene().layer_tweens_finished(wait_->stage_id)) {
-        wait_.reset();
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1723,122 +1823,224 @@ void GameRuntime::RuntimeState::end_debug_skip() {
     }
 }
 
+bool GameRuntime::RuntimeState::fire_skip(oa::runtime::Wait& w, bool force) {
+    using W = oa::runtime::Wait;
+    // skipMode / debug exskip always shows the page instantly before the
+    // presentation-specific stop action.
+    if (!text().is_reveal_complete()) text().reveal_all();
+    switch (w.stage) {
+        case W::Stage::Trans:
+            if (force) {
+                transition().clear();
+                return true;
+            }
+            return transition().skip_by_input(true);
+        case W::Stage::Video: {
+            const auto vsnap = media_.video_.state();
+            const auto& fsv = vsnap.overlay_video;
+            if (!fsv || !fsv->playing || !fsv->decoded) return true;
+            if (force) {
+                media_.video_.stop_overlay();
+                return true;
+            }
+            if (fsv->skippable) {
+                // Go through the finish handler: the game's onVideoFinish is
+                // what runs the transition after the logo movie.
+                if (!w.finish_requested) {
+                    media_.video_.queue_finish(std::string());
+                    w.finish_requested = true;
+                }
+            }
+            return false;
+        }
+        case W::Stage::VideoLayer: {
+            const auto vsnap = media_.video_.state();
+            const auto it = vsnap.video_layers.find(w.wake_id);
+            if (it == vsnap.video_layers.end() || !it->second.playing || !it->second.decoded)
+                return true;
+            if (force) {
+                media_.video_.stop_layer(w.wake_id);
+                return true;
+            }
+            if (it->second.skippable) {
+                if (!w.finish_requested) {
+                    media_.video_.queue_finish(w.wake_id);
+                    w.finish_requested = true;
+                }
+            }
+            return false;
+        }
+        case W::Stage::Se:
+            media_.audio_.stop_se(w.wake_id, 0);
+            return true;
+        case W::Stage::Tween:
+            if (!w.tween_ids.empty()) {
+                for (const auto& id : w.tween_ids) (void)scene().apply_lytweendel(id);
+            } else {
+                (void)scene().apply_lytweendel(w.wake_id);
+            }
+            return true;
+        case W::Stage::AllDelete:
+            finish_all_delete();
+            return true;
+        case W::Stage::None:
+            return true;
+    }
+    return true;
+}
+
+bool GameRuntime::RuntimeState::fire_click(oa::runtime::Wait& w, bool from_decide) {
+    using W = oa::runtime::Wait;
+    (void)from_decide; // a scripted decide is the framework's fake click
+    switch (w.stage) {
+        case W::Stage::Trans:
+            // input policy 0/2 still decides whether the transition may be cut
+            return transition().skip_by_input(false);
+        case W::Stage::Video: {
+            const auto vsnap = media_.video_.state();
+            const auto& fsv = vsnap.overlay_video;
+            if (!fsv || !fsv->playing || !fsv->decoded) return true;
+            if (fsv->skippable) {
+                if (!w.finish_requested) {
+                    media_.video_.queue_finish(std::string());
+                    w.finish_requested = true;
+                }
+            }
+            return false;
+        }
+        case W::Stage::VideoLayer: {
+            const auto vsnap = media_.video_.state();
+            const auto it = vsnap.video_layers.find(w.wake_id);
+            if (it == vsnap.video_layers.end() || !it->second.playing || !it->second.decoded)
+                return true;
+            if (it->second.skippable) {
+                if (!w.finish_requested) {
+                    media_.video_.queue_finish(w.wake_id);
+                    w.finish_requested = true;
+                }
+            }
+            return false;
+        }
+        case W::Stage::Se:
+            media_.audio_.stop_se(w.wake_id, 0);
+            return true;
+        case W::Stage::Tween:
+            if (!w.tween_ids.empty()) {
+                for (const auto& id : w.tween_ids) (void)scene().apply_lytweendel(id);
+            } else {
+                (void)scene().apply_lytweendel(w.wake_id);
+            }
+            return true;
+        case W::Stage::AllDelete:
+            return false; // the whole-scene fade is not click-skippable
+        case W::Stage::None:
+            return true;
+    }
+    return true;
+}
+
 bool GameRuntime::RuntimeState::resolve_wait(uint64_t delta_ms, bool click_cmd,
                                              bool decide_cmd) {
     if (!wait_) return true;
     oa::runtime::Wait& w = *wait_;
-    // A wait armed this tick resolves next tick (Artemis yields ≥1 frame).
-    const bool armed_now = wait_armed_this_tick_;
-    wait_armed_this_tick_ = false;
+    using W = oa::runtime::Wait;
+    const bool armed_now = (w.armed_tick == tick_count_);
+    const bool skipping = control_.skip_active_ || control_.exskip_active_;
+    const bool force_skip = control_.exskip_active_;
 
-    const bool click = click_cmd;
-    const bool decide = decide_cmd;
-    // 调试快进：除脚本停驻（[stop]）外一律通过。
-    // 快进（skip / 调试快进）穿过所有可跳过的停驻；[stop] 例外，只认脚本决定。
-    if (control_.exskip_active_ && w.can(oa::runtime::Wait::OnSkip)) return true;
-
-    // 全屏视频播完可以恢复任何停驻（视频可能晚于停驻开始）。
-    if (media_.video_finished_ && w.is_park()) {
-        media_.video_finished_ = false;
-        return true;
-    }
-
-    // ---- 演出 gate：完成后才继续 ----
-    switch (w.stage) {
-        case oa::runtime::Wait::Stage::Trans: {
-            if (click || control_.skip_active_) {
-                transition().skip_by_input(control_.skip_active_);
-            }
-            if (decide) return true;
-            return !transition().is_in_progress(now_ms_);
-        }
-        case oa::runtime::Wait::Stage::Video: {
-            const auto vsnap = media_.video_.state();
-            const auto& fsv = vsnap.overlay_video;
-            const bool phys_skip = input_state_.down_edges_.count(kKeyMouseLeft) ||
-                                   input_state_.down_edges_.count(kKeyMouseRight);
-            if (fsv && fsv->skippable && fsv->playing && (phys_skip || click)) {
-                media_.video_.queue_finish(std::string());
-                return false;
-            }
-            // While the overlay is still playing, never release the park.
-            if (fsv && fsv->playing) return false;
-            if (media_.video_finished_) {
-                media_.video_finished_ = false;
-                return true;
-            }
-            return false;
-        }
-        case oa::runtime::Wait::Stage::VideoLayer: {
-            if (control_.skip_active_) return true;
-            const bool phys_skip = input_state_.down_edges_.count(kKeyMouseLeft) ||
-                                   input_state_.down_edges_.count(kKeyMouseRight);
-            if (click || phys_skip) {
-                const auto vsnap = media_.video_.state();
-                const auto vit = vsnap.video_layers.find(w.stage_id);
-                if (vit != vsnap.video_layers.end() && vit->second.skippable &&
-                    vit->second.playing) {
-                    media_.video_.queue_finish(w.stage_id);
-                    return false;
-                }
-            }
-            return !media_.video_.is_layer_playing(w.stage_id);
-        }
-        case oa::runtime::Wait::Stage::Se:
-            if (control_.skip_active_) return true;
-            return media_se_wait_finished(w.stage_id, w.se_time_given, w.se_time_ms);
-        case oa::runtime::Wait::Stage::AllDelete:
-            return !renderer_.all_delete_active();
-        case oa::runtime::Wait::Stage::Tween:
-            return scene().layer_tweens_finished(w.stage_id);
-        case oa::runtime::Wait::Stage::None:
-            break;
-    }
-
-    // ---- 非演出停驻 ----
-    if (w.ends_exskip) { // [stop 0="exskip"]：放行并结束快进
+    // [stop 0="exskip"] ends the debug fast-forward at its boundary.
+    if (w.has(W::WakeExskipEnd)) {
         if (control_.exskip_active_) end_debug_skip();
         return true;
     }
-    if (w.reveal_clear) return true; // scenario=2：清字瞬显
-    if (w.on_reveal_done) {          // scenario=1：等逐字
-        if (control_.skip_active_) return true;
-        return text().is_reveal_complete();
-    }
-
-    // 计时：到点放行；可点击的计时等待也接受点击/决定。
-    if (w.timed()) {
-        if (armed_now) return false;
-        if (click && w.can(oa::runtime::Wait::OnClick)) return true;
-        if (decide && w.can(oa::runtime::Wait::OnDecide)) return true;
-        if (control_.skip_active_ && w.can(oa::runtime::Wait::OnSkip)) return true;
-        if (w.timer_ms <= int64_t(delta_ms)) return true;
-        w.timer_ms -= int64_t(delta_ms);
-        return false;
-    }
-
-    if (decide && w.can(oa::runtime::Wait::OnDecide)) return true;
-    if (click && w.can(oa::runtime::Wait::OnClick)) return true;
-    for (const int k : w.keys) {
-        if (input_state_.down_edges_.count(k)) return true;
-    }
-    if (control_.skip_active_ && w.can(oa::runtime::Wait::OnSkip)) {
-        if (!text().is_reveal_complete()) {
+    // skip wake: stop the presentation, then resume. A non-skippable
+    // video/transition stays parked (the completion/click wakes still apply).
+    // Artemis page rule: a skip on a still-revealing click page completes the
+    // text first and advances on the next tick, not both at once.
+    if (skipping && w.has(W::WakeSkip)) {
+        const bool page_click =
+            w.stage == W::Stage::None && !w.timed() && w.keys.empty() &&
+            !w.on_reveal_done && !w.reveal_clear && w.can(W::OnClick);
+        if (page_click && !text().is_reveal_complete()) {
             text().reveal_all();
-            return false;
+        } else if (fire_skip(w, force_skip)) {
+            return true;
         }
+    }
+    // One physical command: decide (scripted click) wins over the raw click.
+    // A raw mouse press must still skip a skippable video even when a UI
+    // layer/push row consumed the normalized click (the opening logo movie
+    // sets keyconfig role=1 ALL; the push row otherwise eats the click).
+    const bool phys_click = input_state_.down_edges_.count(kKeyMouseLeft) > 0 ||
+                            input_state_.down_edges_.count(kKeyMouseRight) > 0;
+    const bool video_stage =
+        w.stage == W::Stage::Video || w.stage == W::Stage::VideoLayer;
+    if (decide_cmd && w.has(W::WakeDecide)) {
+        if (fire_click(w, true)) return true;
+    } else if ((click_cmd || (phys_click && video_stage)) && w.has(W::WakeClick)) {
+        if (fire_click(w, false)) return true;
+    }
+    // [exkey]: these key edges release the park.
+    if (w.has(W::WakeKeys)) {
+        for (const int k : w.keys) {
+            if (input_state_.down_edges_.count(k)) return true;
+        }
+    }
+    // Text wakes.
+    if (w.has(W::WakeRevealClear)) {
+        text().reveal_all();
         return true;
     }
-    if (w.can(oa::runtime::Wait::OnAuto)) {
+    if (w.has(W::WakeRevealDone) && text().is_reveal_complete()) return true;
+    // Clock wakes never resolve on their arm tick (Artemis yields ≥1 frame).
+    if (w.has(W::WakeTimer) && !armed_now && now_ms_ >= w.deadline_ms) return true;
+    // Auto mode: per-park dwell; a manual click cannot leave a partial timer
+    // behind for the next page (KAG restarts the timeout on every wait).
+    if (w.has(W::WakeAuto)) {
         if (!control_.automode_) {
-            control_.auto_elapsed_ms_ = 0;
-            return false;
+            w.auto_elapsed_ms = 0;
+        } else {
+            w.auto_elapsed_ms += delta_ms;
+            if (w.auto_elapsed_ms >= automode_wait_ms() && !automode_sync_blocked())
+                return true;
         }
-        control_.auto_elapsed_ms_ += delta_ms;
-        if (control_.auto_elapsed_ms_ < automode_wait_ms()) return false;
-        if (automode_sync_blocked()) return false;
-        control_.auto_elapsed_ms_ = 0;
-        return true;
+    }
+    // [wait name=] / [trigger name=].
+    if (!pending_custom_.empty()) {
+        if (w.has(W::WakeCustom) && pending_custom_ == w.wake_id) {
+            pending_custom_.clear();
+            return true;
+        }
+        pending_custom_.clear(); // no waiter for this trigger
+    }
+    // Presentation completion wakes (state-polled; the wait owns identity).
+    switch (w.stage) {
+        case W::Stage::Trans:
+            return !transition().is_in_progress(now_ms_);
+        case W::Stage::Video: {
+            const auto vsnap = media_.video_.state();
+            const auto& fsv = vsnap.overlay_video;
+            return !fsv || !fsv->playing || !fsv->decoded;
+        }
+        case W::Stage::VideoLayer: {
+            const auto vsnap = media_.video_.state();
+            const auto it = vsnap.video_layers.find(w.wake_id);
+            return it == vsnap.video_layers.end() || !it->second.playing || !it->second.decoded;
+        }
+        case W::Stage::Se:
+            return se_wait_finished(w);
+        case W::Stage::AllDelete:
+            return !renderer_.all_delete_active();
+        case W::Stage::Tween:
+            if (!w.tween_ids.empty()) {
+                for (const auto& id : w.tween_ids) {
+                    if (!scene().layer_tweens_finished(id)) return false;
+                }
+                return true;
+            }
+            return scene().layer_tweens_finished(w.wake_id);
+        case W::Stage::None:
+            break;
     }
     return false;
 }
@@ -1850,12 +2052,20 @@ void GameRuntime::RuntimeState::advance_wait() {
     // reveal 冻结（NekoMiko 读档后"剧情推进但文字不动"）。
     // 在页面等待释放（一次翻页/一次 UI 交互的起点）时把活动层锚回内容层。
     const bool page_wait_release = wait_ && wait_->waiting_click();
+    const bool script_owned = wait_ && wait_->script_owned;
+    const bool has_pending = !pending_parks_.empty();
     wait_.reset();
     if (page_wait_release) text().anchor_active_to_content();
-    // If a Stop wait resolves while Lua queued a jump, the position change
-    // happens inside the next run; next_line only moves past inline wait
-    // instructions (queue-sourced waits no-op inside the interpreter).
-    interpreter_->next_line();
+    // when a queue park is waiting, it takes over without moving
+    // the script cursor (the queued tag was not an inline instruction). The
+    // same rule preserves the old behaviour when a queue park replaced a
+    // script park: the cursor stays on the script's original wait row.
+    interpreter_->release_park(script_owned && !has_pending);
+    if (has_pending) {
+        oa::runtime::Wait next = std::move(pending_parks_.front());
+        pending_parks_.pop_front();
+        arm_park(std::move(next), false);
+    }
 }
 
 // [glyph] click-wait icon: show/move while a click wait is fully revealed.
@@ -2581,7 +2791,6 @@ void GameRuntime::RuntimeState::set_skip_mode(bool enabled) {
     control_.skip_enabled_ = enabled;
     const bool now_active = skip_active();
     if (was_active == now_active) return;
-    control_.auto_elapsed_ms_ = 0;
     if (!now_active) {
         reveal_all_text(); // reveal on skip exit so new text is not stuck
     }
@@ -2594,7 +2803,6 @@ void GameRuntime::RuntimeState::set_automode_mode(bool enabled) {
     const bool was_active = automode_active();
     control_.automode_ = enabled;
     if (was_active == automode_active()) return;
-    control_.auto_elapsed_ms_ = 0;
     // leaving automode drops the voice-sync gate — the Lua side
     // (autoskip.lua) also clears it with [automode syncse=""], this makes the
     // native exec path symmetric so a later native re-entry starts ungated.
@@ -2611,7 +2819,6 @@ void GameRuntime::RuntimeState::update_control_skip_hold(const std::set<int>& ke
     control_.control_skip_pressed_ = held;
     const bool now_effective = control_skip_effective();
     if (was_effective == now_effective) return;
-    control_.auto_elapsed_ms_ = 0;
     if (!now_effective) reveal_all_text();
     dispatch_mode_input(now_effective ? "controlskipin" : "controlskipout");
 }

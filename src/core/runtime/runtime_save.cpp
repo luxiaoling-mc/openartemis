@@ -472,17 +472,6 @@ void restore_audio_snapshot(oa::media::AudioEngine* audio, const oa::runtime::Au
     }
 }
 
-/// 停驻的身份（不含计时进度），用于"同一次停驻只自动存档一次"。
-std::string wait_sig(const oa::runtime::Wait* w) {
-    if (!w) return {};
-    std::string s = std::to_string(w->release) + ":" + std::to_string(int(w->stage)) +
-                    ":" + w->stage_id;
-    if (w->on_reveal_done) s += ":reveal";
-    if (w->reveal_clear) s += ":clear";
-    for (const int k : w->keys) s += ":k" + std::to_string(k);
-    return s;
-}
-
 } // namespace
 
 bool GameRuntime::RuntimeState::save_game_to(const std::string& file) {
@@ -544,7 +533,6 @@ size_t GameRuntime::RuntimeState::reset_ephemeral_on_load() {
     media_.audio_.stop_all_sounds(); clr();
     if (media_.media_players_) { media_.media_players_->stop_all(); clr(); }
     media_.video_.stop_all_videos(); clr();
-    media_.video_finished_ = false; clr();
     media_.emote_layers_.clear(); clr();
     media_.emote_view_cache_.clear();
     media_.pending_emote_methods_.clear(); clr();
@@ -555,12 +543,16 @@ size_t GameRuntime::RuntimeState::reset_ephemeral_on_load() {
     drop_pending_tween_cancels(); clr();
     transition().clear(); clr();
     pointer_.hovered_.clear(); pointer_.drag_layer_.clear(); clr();
-    pending_sync_tween_layer_.reset(); clr();
     inline_event_frame_.reset(); clr();
     save_.screenshot_.valid = false; clr();
     save_.capture_pending_ = false; clr();
     renderer_.stop_all_delete();
     wait_.reset(); clr();
+    pending_parks_.clear(); clr();
+    pending_custom_.clear(); clr();
+    pending_sync_tweens_.clear(); clr();
+    save_.autosaved_current_wait_ = false;
+    save_.autosave_last_seq_ = 0;
 
     // ---- 控制域（模式闩；配置面 [* allow] 属 ② 保留，不在此）----
     control_.skip_active_ = false; clr();
@@ -571,7 +563,7 @@ size_t GameRuntime::RuntimeState::reset_ephemeral_on_load() {
     control_.control_skip_pressed_ = false; clr();
     control_.control_skip_blocked_ = false; clr();
     control_.last_control_skip_effective_ = false; clr();
-    control_.automode_ = false; control_.auto_elapsed_ms_ = 0; clr();
+    control_.automode_ = false; clr();
     control_.automode_syncse_.clear(); clr();
     control_.hide_active_ = false; clr();
     control_.hide_snapshot_.clear(); clr();
@@ -1085,12 +1077,12 @@ void GameRuntime::RuntimeState::handle_save_screenshot(const std::string& file, 
 }
 
 void GameRuntime::RuntimeState::maybe_autosave_for_wait() {
-    // Reset the once-per-wait latch whenever the parked wait identity changes
-    // or no input wait is parked ( maybe_autosave_on_input_wait runs
-    // only when a run establishes a new wait,  + ).
-    const std::string sig = wait_sig(wait_ ? &*wait_ : nullptr);
-    if (sig != save_.autosave_wait_sig_) {
-        save_.autosave_wait_sig_ = sig;
+    // Park identity is a monotonic sequence, not a value signature: two
+    // consecutive pages ending in an identical [click]/[@] are distinct parks
+    // and must each get their autosave.
+    const uint64_t seq = wait_ ? wait_->seq : 0;
+    if (seq != save_.autosave_last_seq_) {
+        save_.autosave_last_seq_ = seq;
         save_.autosaved_current_wait_ = false;
     }
     if (save_.autosave_allow_ == 2 && is_input_wait(wait_ ? &*wait_ : nullptr) &&

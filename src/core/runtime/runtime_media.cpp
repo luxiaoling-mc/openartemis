@@ -40,42 +40,46 @@ int64_t param_i64(const oa::runtime::Event& e, const char* key, int64_t dflt) {
 
 } // namespace
 
-bool GameRuntime::RuntimeState::media_se_wait_finished(const std::string& id, bool time_given,
-                                         uint64_t time_ms) const {
-    // SE and voice ids share the channel namespace.
-    const auto* state = &media_.audio_.state();
+bool GameRuntime::RuntimeState::se_wait_finished(oa::runtime::Wait& w) {
+    // SE and voice ids share the channel namespace. The deadline lives on the
+    // park itself: an abandoned wait can no longer leak a stale timer into a
+    // later [wait se=] on the same id.
+    const auto& state = media_.audio_.state();
     const oa::media::SoundChannel* channel = nullptr;
-    const auto it = state->se_channels.find(id);
-    if (it != state->se_channels.end()) {
+    const auto it = state.se_channels.find(w.wake_id);
+    if (it != state.se_channels.end()) {
         channel = &it->second;
     } else {
-        const auto jt = state->voice_channels.find(id);
-        if (jt != state->voice_channels.end()) channel = &jt->second;
+        const auto jt = state.voice_channels.find(w.wake_id);
+        if (jt != state.voice_channels.end()) channel = &jt->second;
     }
     // A non-playing channel still carries its play-start instant.
-    if (channel && time_given)
-        return state->clock_ms >= channel->started_at_ms + time_ms;
+    if (channel && w.se_time_given)
+        return state.clock_ms >= channel->started_at_ms + w.se_time_ms;
     if (!channel || !channel->playing) {
-        // No live sound: release at the requested offset via a deadline.
-        if (!time_given) return true;
-        const uint64_t now = state->clock_ms;
-        const auto d = se_wait_deadline_.find(id);
-        if (d == se_wait_deadline_.end()) {
-            se_wait_deadline_[id] = now + time_ms;
-            return time_ms == 0;
+        // No live sound: release at the requested offset via a park-local
+        // deadline (never a runtime-global map).
+        if (!w.se_time_given) return true;
+        if (w.se_deadline_ms == 0) {
+            w.se_deadline_ms = state.clock_ms + w.se_time_ms;
+            return w.se_time_ms == 0;
         }
-        if (now >= d->second) {
-            se_wait_deadline_.erase(d);
-            return true;
-        }
-        return false;
+        return state.clock_ms >= w.se_deadline_ms;
     }
-    se_wait_deadline_.erase(id);
-    if (time_given) {
+    if (w.se_time_given) {
         // time=N counts from the SE's play-start instant (channel clock).
-        return state->clock_ms >= channel->started_at_ms + time_ms;
+        return state.clock_ms >= channel->started_at_ms + w.se_time_ms;
     }
     // No time: hold until the channel stops (decoder EOF/notify).
+    return false;
+}
+
+bool GameRuntime::RuntimeState::se_is_playing(const std::string& id) const {
+    const auto& state = media_.audio_.state();
+    if (const auto it = state.se_channels.find(id); it != state.se_channels.end())
+        return it->second.playing;
+    if (const auto jt = state.voice_channels.find(id); jt != state.voice_channels.end())
+        return jt->second.playing;
     return false;
 }
 
@@ -103,8 +107,7 @@ bool GameRuntime::RuntimeState::automode_sync_blocked() const {
             tok.remove_prefix(1);
         while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\t'))
             tok.remove_suffix(1);
-        if (!tok.empty() && !media_se_wait_finished(std::string(tok), false, 0))
-            return true;
+        if (!tok.empty() && se_is_playing(std::string(tok))) return true;
         if (comma == std::string_view::npos) break;
         rest.remove_prefix(comma + 1);
     }
@@ -242,9 +245,6 @@ void GameRuntime::RuntimeState::finish_video(const std::string& id) {
         scene().unbind_video_layer(id);
     }
     (void)media_.video_.poll_finish_events();
-    if (id.empty()) {
-        media_.video_finished_ = true; // fullscreen completion resumes Stop-class waits
-    }
     if (handler && handler->any()) dispatch_media_handler(*handler);
 }
 

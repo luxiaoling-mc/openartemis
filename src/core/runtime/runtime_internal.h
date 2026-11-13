@@ -43,7 +43,6 @@ struct GameRuntime::RuntimeState {
         std::map<std::string, std::vector<PendingEmoteMethod>> pending_emote_methods_;
         size_t emote_layer_events_ = 0;
         uint64_t voice_serial_ = 0;
-        bool video_finished_ = false;
         std::optional<float> last_bgm_volume_;
         std::optional<float> last_se_volume_;
         size_t media_events_ = 0;
@@ -62,7 +61,7 @@ struct GameRuntime::RuntimeState {
         bool capture_pending_ = false;
         int autosave_allow_ = 0;
         bool autosaved_current_wait_ = false;
-        std::string autosave_wait_sig_;
+        uint64_t autosave_last_seq_ = 0;
     };
     struct PointerDomain {
         oa::render::Compositor::QuadSizeFn hit_size_;
@@ -90,7 +89,6 @@ struct GameRuntime::RuntimeState {
         bool automode_ = false;
         bool automode_allowed_ = true;
         std::string automode_syncse_;
-        uint64_t auto_elapsed_ms_ = 0;
         bool control_skip_pressed_ = false;
         bool control_skip_blocked_ = false;
         bool last_control_skip_effective_ = false;
@@ -260,10 +258,9 @@ struct GameRuntime::RuntimeState {
 
     void advance_media_frame(uint64_t delta_ms);
     void sound_finished(oa::media::SoundCategory cat, const std::string& id);
-    bool media_se_wait_finished(const std::string& id, bool time_given,
-                                uint64_t time_ms) const;
-    // [wait se=ID time=N] deadline when no live channel exists.
-    mutable std::map<std::string, uint64_t> se_wait_deadline_;
+    /// [wait se=] completion: the wait owns its deadline; no global map.
+    bool se_wait_finished(oa::runtime::Wait& w);
+    bool se_is_playing(const std::string& id) const;
 
     // Bucket annotations below; full ownership/load contract:
     // docs/RUNTIME_STATE.md. Keep declaration order stable (dtor order).
@@ -271,8 +268,20 @@ struct GameRuntime::RuntimeState {
     /// 输入已归一为两条命令：物理点击、脚本决定边沿。
     bool resolve_wait(uint64_t delta_ms, bool click_cmd, bool decide_cmd);
     void advance_wait();
-    /// Park on a Stop wait named by `id` and clear its timer.
-    void arm_stage(oa::runtime::Wait::Stage st, std::string id = {});
+    /// arm a park with its wake set (script tag or queue).
+    void arm_park(oa::runtime::Wait w, bool script_owned);
+    /// Build the park implied by a pausing interpreter event (trans/video/
+    /// alldelete/lytween sync); nullopt = the event does not park.
+    std::optional<oa::runtime::Wait> park_from_event(
+        const oa::runtime::Event* ev);
+    /// Fill `wakes`/deadline/wake_id from the spec view.
+    void normalize_wait(oa::runtime::Wait& w);
+    /// Fire a skip-class wake; returns true when the park may resume.
+    bool fire_skip(oa::runtime::Wait& w, bool force);
+    /// Fire a click/decide-class wake; returns true when the park may resume.
+    bool fire_click(oa::runtime::Wait& w, bool from_decide);
+    /// [trigger name=]: wake a Custom park. Returns true when consumed.
+    bool fire_custom(const std::string& name);
     /// Fixed order: engine → media → text → scene → control → host stream.
     oa::runtime::CallbackResult dispatch_interpreter_event(
         const oa::runtime::Event& e);
@@ -411,17 +420,22 @@ struct GameRuntime::RuntimeState {
     std::pair<double, double> bound_image_size(const oa::render::Layer& l);
     // [B] E: open_project 的平台串；[reset] 重启复用
     std::string platform_;
-    // [C] E: 本 tick 是否有新玩家输入（决定停驻队列是否放行）
-    bool input_this_tick_ = false;
     // [B] E+L: 宿主重建 VM（boot）；读档只 restore_position + Lua restore()
     std::unique_ptr<oa::runtime::Interpreter> interpreter_;
     // [B] E: 读档后由恢复位置的那一行重跑重导出
     std::optional<oa::runtime::Wait> wait_;
+    // [C] E: 队列 tag 产生的停驻，必须等当前停驻结束后按 FIFO 武装
+    // （KAG pendings 的等价物；绝不能替换当前停驻）。
+    std::deque<oa::runtime::Wait> pending_parks_;
+    // [C] E: [trigger name=] 在队列排空时投递的命名 wake
+    std::string pending_custom_;
+    // [C] E: [tweenset] 组内 sync=1 目标；组关闭时合成一个 Tween park
+    std::vector<std::string> pending_sync_tweens_;
+    // [C] E: 停驻身份自增；自动存档/探针用它，而不是可重复的语义签名
+    uint64_t wait_seq_ = 0;
     // [C] E: 帧号（e:getFrameNumber）
     uint64_t tick_count_ = 0;
 
-    // [C] E: 本 tick 已武装的 wait 至少存活一帧
-    bool wait_armed_this_tick_ = false;
     // [C] E: 一次物理按下 = 一个命令。
     //   press_live_ 本帧这条命令仍可动作（补字或释放停驻）；
     //   press_used_ 命令已用尽，只延续一帧以吞掉同一按下的 decide 余波。
@@ -462,17 +476,12 @@ struct GameRuntime::RuntimeState {
     void apply_hide_visibility(bool hidden);
     /// [glyph] click-wait icon per-frame driving; no-op unless configured.
     void advance_click_wait();
-
     // [C] H: 宿主事件泵队列（读档按入口快照迭代，不就地清）
     std::deque<oa::runtime::Event> pending_events_;
     // [B] H: 宿主捕获钩子；读档保留
     std::function<void()> transition_capture_cb_;
     // [B] E: 合成 CallFrame 标记（script/line/stack 快照）；读档 reset
     std::optional<InlineEventFrame> inline_event_frame_;
-    // [C] E: [lytween sync=1] 停驻目标层；读档 reset
-    std::optional<std::string> pending_sync_tween_layer_;
-    // [C] E: drain_parked_queue 重入闩（排空期间的 lytween 不武装停驻）
-    bool in_parked_drain_ = false;
     // [C] E: 宿主输入泵（边沿在每次 tick 后清）
     HostInput input_;
     // message-layer text domain lives in renderer_.text().

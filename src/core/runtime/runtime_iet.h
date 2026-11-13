@@ -231,8 +231,14 @@ struct ScriptError : std::runtime_error {
 // ---------------------------------------------------------------------------
 
 /// 一次脚本停驻。
+///
+/// 旧字段（release/stage/timer_ms/...）保留为 tag 构造与探针的"规格视图"；
+/// 真正决定放行的是武装时由 normalize_wait() 生成的 `wakes` 位集。一个停驻
+/// 可以同时注册多个 wake（例如 click + timeout、click + trans），任一 wake
+/// 先成立即结束停驻；需要清理演出的 wake（video/se/tween/trans）在放行前
+/// 执行自己的 stop 动作，然后才继续脚本。
 struct Wait {
-    /// 能释放这次停驻的条件，任一成立即继续（stage 未完成时除外）。
+    /// 能释放这次停驻的输入策略（规格视图）。
     enum Release : uint32_t {
         OnClick = 1u << 0,  // 物理点击
         OnDecide = 1u << 1, // 脚本 decide 边缘（setexclick / overrideKey）
@@ -251,8 +257,31 @@ struct Wait {
         Tween,      // [lytween sync=1]
     };
 
+    /// 实际 wake 集合。
+    /// click/decide/skip/auto/timeout/reveal/trans/movie/se/action/...
+    enum Wake : uint32_t {
+        WakeClick = 1u << 0,
+        WakeDecide = 1u << 1,
+        WakeSkip = 1u << 2,
+        WakeAuto = 1u << 3,
+        WakeTimer = 1u << 4,
+        WakeKeys = 1u << 5,
+        WakeRevealDone = 1u << 6,
+        WakeRevealClear = 1u << 7,
+        WakeTrans = 1u << 8,
+        WakeVideo = 1u << 9,
+        WakeVideoLayer = 1u << 10,
+        WakeSe = 1u << 11,
+        WakeAllDelete = 1u << 12,
+        WakeTween = 1u << 13,
+        WakeCustom = 1u << 14,
+        WakeExskipEnd = 1u << 15,
+    };
+
+    // ---- 规格视图（tag 构造 / 探针 / 存档身份）----
     uint32_t release = OnSkip;
-    /// 计时停驻的剩余毫秒；-1 表示"没有计时器"。0 是合法时长（下一帧放行）。
+    /// 请求的计时毫秒；-1 表示没有计时器。0 是合法时长（下一帧放行）。
+    /// 注意：这是**请求值**，不再在查询时递减；实际到点看 deadline_ms。
     int64_t timer_ms = -1;
     std::vector<int> keys;       // [exkey]：这些键可放行
     bool on_reveal_done = false; // [wait scenario=1]：等逐字完成
@@ -261,9 +290,25 @@ struct Wait {
 
     Stage stage = Stage::None;
     std::string stage_id;
+    std::string custom_name;     // [wait name=]：命名 wake（[trigger name=] 放行）
     bool se_time_given = false; // [wait se= time=]：从播放起算
     uint64_t se_time_ms = 0;
 
+    // ---- 运行态（武装时填充）----
+    uint32_t wakes = 0;
+    std::string wake_id;          // Se / VideoLayer / Tween / Custom 的目标
+    std::vector<std::string> tween_ids; // [tweenset] 组内多个 sync 目标
+    uint64_t deadline_ms = 0;     // WakeTimer 的绝对到点时刻
+    uint64_t armed_tick = 0;      // 本停驻武装时的帧号（时钟 wake 至少让一帧）
+    uint64_t seq = 0;             // 停驻身份（自动存档/探针）
+    uint64_t auto_elapsed_ms = 0; // 每个停驻独立的 auto 计时（不再跨页残留）
+    uint64_t se_deadline_ms = 0;  // 无活动 SE 时惰性建立的到点时刻
+    bool script_owned = true;     // false = 队列 tag 停驻（release 不推进脚本）
+    /// A video skip already queued its finish event (the finish handler runs
+    /// first and may enqueue the transition the skip should play).
+    bool finish_requested = false;
+
+    bool has(uint32_t w) const { return (wakes & w) != 0; }
     bool can(uint32_t r) const { return (release & r) != 0; }
     bool timed() const { return timer_ms >= 0; }
     /// 可以把输入事件标记挂在哪个停驻上：脚本停驻、点击停驻、
@@ -448,6 +493,9 @@ public:
     ExecutionResult run();
     /// Host call after a Wait resolved: advance past the wait instruction.
     void next_line();
+    /// Clear the wait bookkeeping and advance the cursor only when the park
+    /// was script-owned. Queue-sourced parks never move the cursor.
+    void release_park(bool advance_line);
 
     /// Restore the execution position from a save: script (loaded on
     /// demand), line and call stack. `script` empty keeps the interpreter

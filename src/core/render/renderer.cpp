@@ -1598,6 +1598,10 @@ struct Builder {
             for (const Layer* q : in.scene->draw_order()) {
                 if (q == &l) break; // anchor quads draw BEFORE the group
                 if (!textured_content(*q)) continue;
+                // 不可见的背板不能收紧裁剪窗：存档恢复会把消息窗口的
+                // 平板层（world 1280x120）一起建出来，父层仍隐藏；若参与
+                // 求交，标题组的全屏 clip 会被切成顶部 120px（标题下方全黑）。
+                if (!in.scene->is_effectively_visible(q->id)) continue;
                 if (q->id.size() > l.id.size() &&
                     q->id.compare(0, sub.size(), sub) == 0)
                     continue; // safety: no subtree quad qualifies

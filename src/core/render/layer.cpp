@@ -1453,6 +1453,8 @@ void Compositor::tweenset_start() {
     anim_->set_pending_.clear();
 }
 
+bool Compositor::tweenset_collecting() const { return anim_->collecting_set_; }
+
 void Compositor::tweenset_end(uint64_t clock_ms) {
     if (!anim_->collecting_set_) return;
     anim_->collecting_set_ = false;

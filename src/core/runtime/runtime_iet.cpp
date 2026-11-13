@@ -1764,13 +1764,15 @@ const std::string* Interpreter::current_script() const {
 }
 
 void Interpreter::next_line() {
+    const bool from_queue = last_wait_from_queue_;
+    release_park(!from_queue);
+}
+
+void Interpreter::release_park(bool advance_line) {
     wait_reason_info_.clear();
     last_wait_event_.reset();
-    if (last_wait_from_queue_) {
-        last_wait_from_queue_ = false;
-        return;
-    }
-    current_line_ += 1;
+    last_wait_from_queue_ = false;
+    if (advance_line) current_line_ += 1;
 }
 
 void Interpreter::enqueue_tag(std::string tag, std::map<std::string, std::string> params) {
@@ -2098,10 +2100,14 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
         Wait w;
         const uint64_t time =
             uint64_t(eval.resolve_param(resolve_or_empty("time")).as_int().value_or(0));
-        const int64_t input = eval.resolve_param(resolve_or_empty("input")).as_int().value_or(0);
         const std::string video = resolve_or_empty("video");
         const std::string scenario = resolve_or_empty("scenario");
         const std::string se = resolve_or_empty("se");
+        const std::string name = resolve_or_empty("name");
+        int64_t input = eval.resolve_param(resolve_or_empty("input")).as_int().value_or(0);
+        if (ins.has("canskip")) {
+            input = eval.resolve_param(resolve_or_empty("canskip")).as_int().value_or(1);
+        }
         w.release = Wait::OnSkip;
         if (!video.empty()) {
             w.stage = Wait::Stage::VideoLayer;
@@ -2119,12 +2125,22 @@ static TagOutcome execute_tag(Interpreter& it, const Instruction& ins, bool appl
                 w.se_time_ms = time;
                 w.se_time_given = true; // counts from the SE play start
             }
+            if (input == 1) w.release |= Wait::OnClick | Wait::OnDecide;
+        } else if (!name.empty()) {
+            w.custom_name = name;
+            if (time > 0) w.timer_ms = int64_t(time);
+            if (input == 1) w.release |= Wait::OnClick | Wait::OnDecide;
         } else {
             w.timer_ms = int64_t(time);
             if (input == 1) w.release |= Wait::OnClick | Wait::OnDecide;
         }
         out.kind = TagOutcomeKind::WaitEvent;
         out.event = Event::park_on(std::move(w));
+        return out;
+    }
+    if (tag == "trigger") {
+        out.kind = TagOutcomeKind::CustomEvent;
+        out.event = Event::custom("trigger", ins.params);
         return out;
     }
     if (tag == "exkey") {

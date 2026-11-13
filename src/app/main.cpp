@@ -8,6 +8,7 @@
 #include <SDL3/SDL_init.h>
 #include <SDL3/SDL_keycode.h>
 #include <SDL3/SDL_mouse.h>
+#include <SDL3/SDL_touch.h>
 #include <SDL3/SDL_video.h>
 
 #include <cerrno>
@@ -231,12 +232,28 @@ void touch_handle(HostState* host, const SDL_Event& ev)
         f.x = f.start_x = wx;
         f.y = f.start_y = wy;
         host->fingers[ev.tfinger.fingerID] = f;
-        if (host->fingers.size() == 1)
+        if (host->fingers.size() == 1) {
             host->touch_phase = TouchPhase::SingleFinger;
-        else if (host->fingers.size() == 2)
+            // 没有真实 hover：按下即把指针落到位，让"按住不动"等价于桌面端把鼠标停在该处。
+            host->app->mouse_move(wx, wy);
+        } else if (host->fingers.size() == 2) {
             host->touch_phase = TouchPhase::MultiFinger;
-        else
+        } else {
             host->touch_phase = TouchPhase::Idle;
+        }
+        return;
+    }
+
+    if (ev.type == SDL_EVENT_FINGER_CANCELED) {
+        // 手势被系统打断（返回手势/来电/切后台）：必须摘掉手指，否则残留
+        // 的 finger 会让下一次单指触摸被当成双指（右键）。
+        host->fingers.erase(ev.tfinger.fingerID);
+        if (host->fingers.empty())
+            host->touch_phase = TouchPhase::Idle;
+        else if (host->fingers.size() == 1)
+            host->touch_phase = TouchPhase::SingleFinger;
+        else
+            host->touch_phase = TouchPhase::MultiFinger;
         return;
     }
 
@@ -363,7 +380,7 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* ev)
     }
 
     if (ev->type == SDL_EVENT_FINGER_DOWN || ev->type == SDL_EVENT_FINGER_MOTION ||
-        ev->type == SDL_EVENT_FINGER_UP) {
+        ev->type == SDL_EVENT_FINGER_UP || ev->type == SDL_EVENT_FINGER_CANCELED) {
         touch_handle(host, *ev);
         return SDL_APP_CONTINUE;
     }
@@ -374,9 +391,15 @@ SDL_AppResult SDL_AppEvent(void* appstate, SDL_Event* ev)
     } else if (ev->type == SDL_EVENT_MOUSE_WHEEL) {
         host->app->mouse_wheel(ev->wheel.y > 0 ? 1 : (ev->wheel.y < 0 ? -1 : 0));
     } else if (ev->type == SDL_EVENT_MOUSE_MOTION) {
+        // SDL 会把触摸额外合成一套鼠标事件（which=SDL_TOUCH_MOUSEID）。
+        // 触屏已由 touch_handle 单独翻译，这套合成事件再进来就会让一次
+        // 点按变成两次点击（按下补字、抬起翻页）。真实鼠标/触控板事件
+        // 的 which 是鼠标实例 id，不受影响，照常进入引擎。
+        if (ev->motion.which == SDL_TOUCH_MOUSEID) return SDL_APP_CONTINUE;
         host->app->mouse_move(ev->motion.x, ev->motion.y);
     } else if (ev->type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
                ev->type == SDL_EVENT_MOUSE_BUTTON_UP) {
+        if (ev->button.which == SDL_TOUCH_MOUSEID) return SDL_APP_CONTINUE;
         const int vk = sdl_button_to_vk(ev->button.button);
         if (vk > 0)
             host->app->mouse_button(vk, ev->type == SDL_EVENT_MOUSE_BUTTON_DOWN);
